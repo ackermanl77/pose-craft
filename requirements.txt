@@ -1,0 +1,9 @@
+numpy
+scipy
+opencv-python
+mediapipe
+PySide6
+pyqtgraph
+PyOpenGL
+
+pytest
