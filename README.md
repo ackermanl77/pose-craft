@@ -1,76 +1,90 @@
 # PoseCraft
 
 A photo-to-pose desktop tool, built as an MVP inspired by [PoseForge](https://poseforge.gumroad.com/l/poseforge)
-(a commercial photo -> DAZ Studio pose tool). PoseCraft targets **Blender** instead
-of DAZ Studio: load a photo, click **Solve Pose**, preview the estimated 3D
-skeleton, and export a pose file that a companion Blender add-on applies to an
-armature's pose bones.
+(a commercial photo -> DAZ Studio pose tool). PoseCraft targets **Blender**
+instead of DAZ Studio: load a photo, click **Solve Pose**, click a person in
+the photo (or pick one from the dropdown) to preview their estimated 3D
+skeleton, then either export a pose file or send it straight to Blender over
+the Live Link.
 
-## Pipeline
+## Current Status
 
-```
-photo --[MediaPipe Pose Landmarker]--> 33 3D landmarks per person
-      --[retarget/skeleton.py]--------> per-bone local rotations (swing only)
-      --[export/blender_pose.py]------> pose_craft_pose .json (Blender Z-up)
-      --[Blender add-on]--------------> applied to an armature's pose bones
-```
+- MVP stage: the full pipeline (photo -> MediaPipe pose estimation -> bone
+  retargeting -> JSON export or live Blender link -> Blender add-on) is
+  implemented and the `.exe` builds and launches, but the Blender add-on and
+  the real-photo accuracy of the retargeting have not been verified end to
+  end -- see `docs/PROJECT_STATUS.md`'s "Verification" and "Known Issues".
+- `docs/PROJECT_STATUS.md` is the authoritative reference for architecture,
+  entry points, and known issues -- this README only covers day-to-day
+  commands.
 
-- `pose_craft/estimation/landmarker.py` -- wraps MediaPipe's `PoseLandmarker` task
-  (multi-person capable via `num_poses`), downloads the model weights to
-  `~/.cache/pose_craft/models` on first use, and converts MediaPipe's world
-  landmarks into this project's engine frame (Y-up, +X right, +Z toward camera).
-- `pose_craft/retarget/skeleton.py` -- a small humanoid bone hierarchy (spine,
-  neck, head, arms, legs) with a T-pose rest direction per bone. Each bone's
-  rotation is the shortest-arc quaternion from its rest direction to its current
-  (landmark-derived) direction, made parent-relative. This is the one module
-  with unit tests that don't require MediaPipe/Qt/Blender (`tests/test_retarget.py`).
-- `pose_craft/export/blender_pose.py` -- converts those rotations into Blender's
-  Z-up axis convention and writes/reads the JSON pose format.
-- `pose_craft/export/blender_addon/import_pose.py` -- a Blender add-on (install
-  it inside Blender itself, not with pip) that reads a PoseCraft JSON file and
-  applies it to the selected armature's pose bones, with a fallback for common
-  Rigify bone-name variants (`DEF-`, `ORG-`, `_fk`, `_ik`).
-- `pose_craft/gui/` -- the PySide6 desktop app: load a photo, run detection on a
-  background thread, pick a person when several are detected, preview the
-  skeleton in an OpenGL viewport (`pyqtgraph.opengl`), and export.
+## Install
 
-## Setup
-
-MediaPipe and PySide6 wheels lag behind the newest CPython releases, so use a
-3.10-3.12 interpreter for the venv (this machine's default `python` may be
-newer -- check with `py -0` on Windows and pick an older one if needed):
+MediaPipe and PySide6 ship wheels that can lag behind the newest CPython
+release; if `pip install` can't find a match for your interpreter, use a
+3.10-3.12 venv instead (`py -0` on Windows lists what's installed):
 
 ```bash
-py -3.12 -m venv .venv
+python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
+```
+
+`requirements.txt` is pinned to known-working versions; if you deliberately
+want the latest of everything instead, drop the `==` pins.
+
+## Run
+
+```bash
 python -m pose_craft.app
 ```
 
-Run the test suite (only needs numpy/scipy/pytest, not mediapipe/Qt):
+Load a photo, click **Solve Pose** (downloads the MediaPipe model to
+`~/.cache/pose_craft/models` on first run -- needs network access once, cached
+after that), then either click the person you want directly in the photo or
+pick them from the dropdown. From there:
+
+- **Export Pose JSON** / **Export All People...** (one JSON per detected
+  person, to a folder you choose), or
+- **Send to Blender (Live Link)** -- needs Blender running with the add-on's
+  Live Link started first (see below).
+
+Inside Blender, install `pose_craft/export/blender_addon/import_pose.py` as an
+add-on (Edit > Preferences > Add-ons > Install...), select an armature, and
+open the "PoseCraft" tab in the 3D viewport sidebar. From there either **Load
+Pose JSON** (pick an exported file) or **Start Live Link** once and then use
+PoseCraft's "Send to Blender" button for every pose after that, no file
+dialog needed. Bones the exporter flagged low-confidence (likely occluded in
+the photo) are called out separately from unmatched bone names in both paths.
+
+## Build the .exe
+
+```bash
+pyinstaller PoseCraft.spec
+```
+
+Produces `dist/PoseCraft/PoseCraft.exe` plus its `_internal/` dependency
+folder (~480 MB total) -- ship the whole `dist/PoseCraft/` folder, not just
+the `.exe`. See `docs/PROJECT_STATUS.md`'s "Release" section for why onedir
+was chosen over `--onefile`. Re-run `python scripts/generate_icon.py` first if
+you've changed `assets/icon.png`/`assets/icon.ico`.
+
+## Test
 
 ```bash
 pytest
 ```
 
-## Known limitations (read before relying on exported poses)
+Needs `requirements-test.txt` (numpy/scipy/opencv-python-headless/pytest, not
+the full mediapipe/Qt stack) -- covers the bone retargeting math, the Blender
+axis-conversion math, the atomic model-download logic, unicode-safe image
+loading, and the Live Link wire protocol. `.github/workflows/ci.yml` runs this
+same lightweight suite on every push/PR. See `docs/PROJECT_STATUS.md`'s
+"Verification" section for what is and isn't covered by an automated test
+today.
 
-- **Twist is not solved.** Only the direction a bone points (swing) is derived
-  from landmark positions; rotation around a bone's own long axis (forearm
-  pronation, wrist twist, etc.) is left at identity. Expect to hand-correct
-  forearms/hands/feet in Blender, the same category of fix PoseForge's own
-  "Before you buy" section warns about for DAZ.
-- **MediaPipe world-landmark axis convention is a best-effort guess**, isolated
-  in `_mediapipe_world_to_engine` in `landmarker.py`. If an exported pose comes
-  out upside-down or mirrored against a real photo, that's the one function to
-  adjust -- flip the sign there rather than anywhere else in the pipeline.
-- **Bone-name matching in the Blender add-on is heuristic.** It was written
-  against common Rigify naming patterns but not validated against a real
-  Rigify-generated rig (no Blender install in this dev environment). Check the
-  add-on's unmatched-bone warning after the first import on your own rig and
-  extend `NAME_CANDIDATES_TEMPLATES` if needed.
-- **Multi-person picking** uses MediaPipe's `num_poses` and sorts by horizontal
-  position in-frame; there's no click-to-select-in-photo UI yet (PoseForge lets
-  you click the person in the image itself).
-- No license/activation system, no "Open in Blender" live-apply (export is
-  file-based: run PoseCraft, export JSON, switch to Blender, import JSON).
+See [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) for architecture, and its
+"Known Issues" section before relying on an exported pose -- twist isn't
+solved, the MediaPipe axis convention is an unverified best guess, and the
+Blender add-on (including the new Live Link server) hasn't been checked
+against a real Blender install or rig.

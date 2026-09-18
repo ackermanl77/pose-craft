@@ -1,0 +1,13 @@
+# The lightweight subset needed to run `pytest` -- see README's "Test" section and
+# .github/workflows/ci.yml, which installs only this file rather than the full
+# requirements.txt. mediapipe/PySide6 are excluded: PySide6 in particular needs
+# system Qt platform libraries (libEGL, libxkbcommon-x11, ...) a plain Linux runner
+# doesn't have, and tests/test_main_window_helpers.py already guards its one PySide6
+# import with pytest.importorskip so it just skips here instead of failing.
+# opencv-python-headless (not the full opencv-python/opencv-contrib-python the app
+# uses) is included because tests/test_imaging.py exercises real cv2 encode/decode
+# and headless has no GUI/system-lib dependencies that would make it risky on CI.
+numpy==2.5.3
+scipy==1.18.1
+opencv-python-headless==5.0.0.93
+pytest==9.1.1

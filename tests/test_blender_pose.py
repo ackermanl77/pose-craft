@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pytest
 from scipy.spatial.transform import Rotation
 
 from pose_craft.export import blender_pose as bp
@@ -24,6 +25,22 @@ def test_engine_y_axis_becomes_blender_z_axis():
     blender_rotation = Rotation.from_quat([x, y, z, w])
     rotvec = blender_rotation.as_rotvec()
     assert np.allclose(rotvec, [0.0, 0.0, np.pi / 2], atol=1e-9)
+
+
+def test_low_confidence_flag_is_added_when_below_threshold():
+    doc = bp.build_pose_document(
+        {"upper_arm.L": Rotation.identity(), "thigh.R": Rotation.identity()},
+        bone_confidence={"upper_arm.L": 0.2, "thigh.R": 0.95},
+    )
+    assert doc["bones"]["upper_arm.L"]["low_confidence"] is True
+    assert doc["bones"]["upper_arm.L"]["confidence"] == pytest.approx(0.2)
+    assert doc["bones"]["thigh.R"]["low_confidence"] is False
+
+
+def test_no_confidence_keys_when_not_provided():
+    doc = bp.build_pose_document({"upper_arm.L": Rotation.identity()})
+    assert "confidence" not in doc["bones"]["upper_arm.L"]
+    assert "low_confidence" not in doc["bones"]["upper_arm.L"]
 
 
 def test_save_and_load_round_trip(tmp_path):

@@ -75,6 +75,24 @@ def test_rejects_wrong_shape():
         sk.solve_bone_rotations(np.zeros((10, 3)))
 
 
+def test_bone_confidence_takes_the_minimum_contributing_landmark():
+    visibility = np.full(sk.NUM_LANDMARKS, 0.9)
+    visibility[sk.LEFT_WRIST] = 0.1  # occluded hand
+
+    confidence = sk.bone_confidence(visibility)
+
+    assert set(confidence.keys()) == set(sk.BONE_NAMES)
+    assert confidence["forearm.L"] == pytest.approx(0.1)  # depends on LEFT_WRIST
+    assert confidence["hand.L"] == pytest.approx(0.1)  # depends on LEFT_WRIST
+    assert confidence["upper_arm.L"] == pytest.approx(0.9)  # does not depend on LEFT_WRIST
+    assert confidence["thigh.R"] == pytest.approx(0.9)  # unrelated side entirely
+
+
+def test_bone_confidence_rejects_wrong_shape():
+    with pytest.raises(ValueError):
+        sk.bone_confidence(np.zeros(10))
+
+
 def test_mirror_landmarks_swaps_left_and_right():
     landmarks = _t_pose_landmarks()
     mirrored = sk.mirror_landmarks(landmarks)
