@@ -11,47 +11,79 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QStatusBar,
     QVBoxLayout,
     QWidget,
 )
 
 from pose_craft.estimation.landmarker import DetectedPerson, PoseEstimator, ensure_model_downloaded
+from pose_craft.export import live_link
 from pose_craft.export.blender_pose import build_pose_document, save_pose_file
 from pose_craft.export.live_link import send_pose_document
 from pose_craft.gui.photo_view import PhotoView
 from pose_craft.gui.viewport_3d import SkeletonViewport
-from pose_craft.imaging import imread_unicode
+from pose_craft.imaging import PHOTO_GUIDANCE, assess_photo_quality, imread_unicode
 from pose_craft.retarget.skeleton import bone_confidence, joint_positions, mirror_landmarks, solve_bone_rotations
 
 
 class SolveWorker(QThread):
     """Runs model download + pose detection off the UI thread -- the first run in
     particular can take a while while the landmarker model downloads. Reuses an
-    already-created PoseEstimator when the caller has one (see MainWindow._estimator)
-    so the model only has to load once per app session, not once per click.
+    already-created PoseEstimator when the caller has one and its max_people
+    already matches (see MainWindow._estimator) so the model only has to load
+    once per app session, not once per click.
     """
 
     finished_ok = Signal(list, object)  # list[DetectedPerson], PoseEstimator
     failed = Signal(str)
+    progress = Signal(int, int)  # downloaded_bytes, total_bytes -- only during a real download
 
-    def __init__(self, image_bgr: np.ndarray, estimator: PoseEstimator | None, parent=None):
+    def __init__(self, image_bgr: np.ndarray, estimator: PoseEstimator | None, max_people: int, parent=None):
         super().__init__(parent)
         self._image_bgr = image_bgr
         self._estimator = estimator
+        self._max_people = max_people
 
     def run(self) -> None:
         try:
             estimator = self._estimator
             if estimator is None:
-                model_path = ensure_model_downloaded("full")
-                estimator = PoseEstimator(model_path)
+                model_path = ensure_model_downloaded(
+                    "full", on_progress=lambda downloaded, total: self.progress.emit(downloaded, total)
+                )
+                estimator = PoseEstimator(model_path, max_people=self._max_people)
             people = estimator.detect(self._image_bgr)
             self.finished_ok.emit(people, estimator)
         except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
+            self.failed.emit(str(exc))
+
+
+class SendToBlenderWorker(QThread):
+    """Runs the Live Link socket connection off the UI thread. A synchronous call
+    here would freeze the whole window for up to send_pose_document's timeout
+    (3s by default) whenever Blender's Live Link isn't running yet -- a likely
+    first-time scenario, not an edge case.
+    """
+
+    finished_ok = Signal()
+    failed = Signal(str)
+
+    def __init__(self, document: dict, host: str, port: int, parent=None):
+        super().__init__(parent)
+        self._document = document
+        self._host = host
+        self._port = port
+
+    def run(self) -> None:
+        try:
+            send_pose_document(self._document, host=self._host, port=self._port)
+            self.finished_ok.emit()
+        except OSError as exc:
             self.failed.emit(str(exc))
 
 
@@ -69,6 +101,7 @@ class MainWindow(QMainWindow):
         self._image_bgr: np.ndarray | None = None
         self._people: list[DetectedPerson] = []
         self._worker: SolveWorker | None = None
+        self._send_worker: SendToBlenderWorker | None = None
         self._estimator: PoseEstimator | None = None
 
         self._build_ui()
@@ -85,9 +118,26 @@ class MainWindow(QMainWindow):
         self.photo_view.clicked_normalized.connect(self._on_photo_clicked)
         left.addWidget(self.photo_view)
 
-        load_btn = QPushButton("Load Photo...")
-        load_btn.clicked.connect(self._on_load_photo)
-        left.addWidget(load_btn)
+        self.load_btn = QPushButton("Load Photo...")
+        self.load_btn.clicked.connect(self._on_load_photo)
+        left.addWidget(self.load_btn)
+
+        tips_label = QLabel("For best results:\n" + "\n".join(f"- {tip}" for tip in PHOTO_GUIDANCE))
+        tips_label.setWordWrap(True)
+        tips_label.setStyleSheet("color: #888; font-size: 11px;")
+        left.addWidget(tips_label)
+
+        max_people_row = QHBoxLayout()
+        max_people_row.addWidget(QLabel("Max people to detect:"))
+        self.max_people_spin = QSpinBox()
+        self.max_people_spin.setRange(1, 8)
+        self.max_people_spin.setValue(4)
+        self.max_people_spin.setToolTip(
+            "A person beyond this count in a group photo won't be detected at all. "
+            "Changing this after a solve rebuilds the pose model on the next Solve Pose."
+        )
+        max_people_row.addWidget(self.max_people_spin)
+        left.addLayout(max_people_row)
 
         self.solve_btn = QPushButton("Solve Pose")
         self.solve_btn.clicked.connect(self._on_solve_pose)
@@ -116,6 +166,18 @@ class MainWindow(QMainWindow):
         self.export_all_btn.setEnabled(False)
         left.addWidget(self.export_all_btn)
 
+        live_link_row = QHBoxLayout()
+        live_link_row.addWidget(QLabel("Blender host:"))
+        self.live_link_host_edit = QLineEdit(live_link.DEFAULT_HOST)
+        self.live_link_host_edit.setMaximumWidth(100)
+        live_link_row.addWidget(self.live_link_host_edit)
+        live_link_row.addWidget(QLabel("port:"))
+        self.live_link_port_spin = QSpinBox()
+        self.live_link_port_spin.setRange(1, 65535)
+        self.live_link_port_spin.setValue(live_link.DEFAULT_PORT)
+        live_link_row.addWidget(self.live_link_port_spin)
+        left.addLayout(live_link_row)
+
         self.send_to_blender_btn = QPushButton("Send to Blender (Live Link)")
         self.send_to_blender_btn.clicked.connect(self._on_send_to_blender)
         self.send_to_blender_btn.setEnabled(False)
@@ -133,11 +195,29 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Ready")
 
     def closeEvent(self, event) -> None:
+        # Closing the shared PoseEstimator while a background thread is still
+        # calling into it (or destroying a QThread object while it's still
+        # running) is unsafe -- block briefly and let any in-flight work finish
+        # first. Solves and Live Link sends are both short (seconds at most),
+        # so this is a bounded wait, not an indefinite freeze.
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.wait()
+        if self._send_worker is not None and self._send_worker.isRunning():
+            self._send_worker.wait()
         if self._estimator is not None:
             self._estimator.close()
         super().closeEvent(event)
 
     def _on_load_photo(self) -> None:
+        # Guards against the same race closeEvent guards against: loading a new
+        # photo while a solve for the OLD photo is still running would let that
+        # solve's results land on the new photo once it finishes, and risks two
+        # threads calling the shared PoseEstimator concurrently. load_btn is
+        # disabled for the duration of a solve (see _on_solve_pose) so this
+        # shouldn't be reachable from the UI, but checking here too costs nothing.
+        if self._worker is not None and self._worker.isRunning():
+            return
+
         path, _ = QFileDialog.getOpenFileName(self, "Load Photo", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
         if not path:
             return
@@ -158,6 +238,10 @@ class MainWindow(QMainWindow):
         self.viewport.clear_skeleton()
         self.statusBar().showMessage(f"Loaded {Path(path).name}")
 
+        quality_warnings = assess_photo_quality(image_bgr)
+        if quality_warnings:
+            QMessageBox.warning(self, "Photo Quality", "\n\n".join(quality_warnings))
+
     def _set_photo_preview(self, image_bgr: np.ndarray) -> None:
         rgb = np.ascontiguousarray(image_bgr[:, :, ::-1])
         h, w, _ = rgb.shape
@@ -167,18 +251,38 @@ class MainWindow(QMainWindow):
     def _on_solve_pose(self) -> None:
         if self._image_bgr is None:
             return
+        if self._worker is not None and self._worker.isRunning():
+            return  # defense in depth -- solve_btn being disabled should already prevent this
+
+        max_people = self.max_people_spin.value()
+        if self._estimator is not None and self._estimator.max_people != max_people:
+            # num_poses is baked into the MediaPipe graph at creation time -- changing
+            # the desired count means the cached estimator can't be reused as-is.
+            self._estimator.close()
+            self._estimator = None
 
         self.solve_btn.setEnabled(False)
+        self.load_btn.setEnabled(False)  # a new photo mid-solve would let this solve's results land on it
+        self.max_people_spin.setEnabled(False)
         first_run_note = "" if self._estimator is not None else " (downloading model on first run may take a moment)"
         self.statusBar().showMessage(f"Solving pose...{first_run_note}")
 
-        self._worker = SolveWorker(self._image_bgr, self._estimator)
+        self._worker = SolveWorker(self._image_bgr, self._estimator, max_people)
         self._worker.finished_ok.connect(self._on_solve_finished)
         self._worker.failed.connect(self._on_solve_failed)
+        self._worker.progress.connect(self._on_solve_progress)
         self._worker.start()
+
+    def _on_solve_progress(self, downloaded: int, total: int) -> None:
+        if total > 0:
+            self.statusBar().showMessage(f"Downloading pose model... {downloaded * 100 // total}%")
+        else:
+            self.statusBar().showMessage(f"Downloading pose model... {downloaded // 1024} KB")
 
     def _on_solve_finished(self, people: list[DetectedPerson], estimator: PoseEstimator) -> None:
         self.solve_btn.setEnabled(True)
+        self.load_btn.setEnabled(True)
+        self.max_people_spin.setEnabled(True)
         self._people = people
         self._estimator = estimator
 
@@ -200,6 +304,8 @@ class MainWindow(QMainWindow):
 
     def _on_solve_failed(self, message: str) -> None:
         self.solve_btn.setEnabled(True)
+        self.load_btn.setEnabled(True)
+        self.max_people_spin.setEnabled(True)
         self.statusBar().showMessage("Solve failed")
         QMessageBox.critical(self, "Solve Pose", f"Pose solving failed:\n{message}")
 
@@ -238,6 +344,13 @@ class MainWindow(QMainWindow):
         if landmarks is None:
             return None
         visibility = self._people[index].visibility
+        if self.mirror_checkbox.isChecked():
+            # mirror_landmarks just swaps left/right rows -- it doesn't care that this
+            # array holds a visibility score per landmark instead of a 3D position, and
+            # it needs to be swapped the same way `landmarks` already was above, or the
+            # confidence for e.g. a mirrored thigh.L would report the ORIGINAL left leg's
+            # visibility instead of the real (now swapped-in) right leg's.
+            visibility = mirror_landmarks(visibility)
         rotations = solve_bone_rotations(landmarks)
         confidence = bone_confidence(visibility)
         return rotations, confidence
@@ -263,31 +376,54 @@ class MainWindow(QMainWindow):
         if not directory:
             return
 
+        # Mirror is a property of the camera/photo orientation, not of one person, so
+        # it applies to every person in a group photo the same way single-person
+        # export already applies it via _selected_landmarks().
+        mirror = self.mirror_checkbox.isChecked()
+
         for index, person in enumerate(self._people):
-            rotations = solve_bone_rotations(person.landmarks)
-            confidence = bone_confidence(person.visibility)
+            landmarks = mirror_landmarks(person.landmarks) if mirror else person.landmarks
+            visibility = mirror_landmarks(person.visibility) if mirror else person.visibility
+            rotations = solve_bone_rotations(landmarks)
+            confidence = bone_confidence(visibility)
             path = Path(directory) / f"pose_person{index + 1}.json"
             save_pose_file(rotations, path, source_note="Exported from PoseCraft (batch)", bone_confidence=confidence)
 
         self.statusBar().showMessage(f"Exported {len(self._people)} pose(s) to {directory}")
 
     def _on_send_to_blender(self) -> None:
+        if self._send_worker is not None and self._send_worker.isRunning():
+            return
+
         inputs = self._current_person_document_inputs()
         if inputs is None:
             return
         rotations, confidence = inputs
         document = build_pose_document(rotations, source_note="Sent live from PoseCraft", bone_confidence=confidence)
-        try:
-            send_pose_document(document)
-        except OSError as exc:
-            QMessageBox.warning(
-                self,
-                "Send to Blender",
-                "Could not reach Blender's Live Link.\n\n"
-                "In Blender, open the PoseCraft sidebar tab and click 'Start Live Link', "
-                "then try again.\n\n"
-                f"Details: {exc}",
-            )
-            return
 
+        host = self.live_link_host_edit.text().strip() or live_link.DEFAULT_HOST
+        port = self.live_link_port_spin.value()
+
+        self.send_to_blender_btn.setEnabled(False)
+        self.statusBar().showMessage(f"Sending pose to Blender at {host}:{port}...")
+
+        self._send_worker = SendToBlenderWorker(document, host, port)
+        self._send_worker.finished_ok.connect(self._on_send_to_blender_finished)
+        self._send_worker.failed.connect(self._on_send_to_blender_failed)
+        self._send_worker.start()
+
+    def _on_send_to_blender_finished(self) -> None:
+        self.send_to_blender_btn.setEnabled(True)
         self.statusBar().showMessage("Pose sent to Blender")
+
+    def _on_send_to_blender_failed(self, message: str) -> None:
+        self.send_to_blender_btn.setEnabled(True)
+        self.statusBar().showMessage("Send to Blender failed")
+        QMessageBox.warning(
+            self,
+            "Send to Blender",
+            "Could not reach Blender's Live Link.\n\n"
+            "In Blender, open the PoseCraft sidebar tab and click 'Start Live Link', "
+            "then try again.\n\n"
+            f"Details: {message}",
+        )

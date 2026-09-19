@@ -39,15 +39,22 @@ want the latest of everything instead, drop the `==` pins.
 python -m pose_craft.app
 ```
 
-Load a photo, click **Solve Pose** (downloads the MediaPipe model to
+Load a photo (a resolution/framing warning pops up if it's likely to give a
+worse result -- see the tips under the Load Photo button), optionally raise
+"Max people to detect" above its default of 4 for a bigger group photo, then
+click **Solve Pose** (downloads the MediaPipe model to
 `~/.cache/pose_craft/models` on first run -- needs network access once, cached
-after that), then either click the person you want directly in the photo or
-pick them from the dropdown. From there:
+after that, with a live download percentage in the status bar). Either click
+the person you want directly in the photo or pick them from the dropdown.
+From there:
 
 - **Export Pose JSON** / **Export All People...** (one JSON per detected
-  person, to a folder you choose), or
+  person, to a folder you choose; the mirror checkbox, if used, applies to
+  everyone in a batch export the same way it applies to a single person), or
 - **Send to Blender (Live Link)** -- needs Blender running with the add-on's
-  Live Link started first (see below).
+  Live Link started first (see below). The host/port fields next to the
+  button default to `127.0.0.1:8642` and only need changing if that port is
+  already in use.
 
 Inside Blender, install `pose_craft/export/blender_addon/import_pose.py` as an
 add-on (Edit > Preferences > Add-ons > Install...), select an armature, and
@@ -84,7 +91,7 @@ same lightweight suite on every push/PR. See `docs/PROJECT_STATUS.md`'s
 today.
 
 See [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) for architecture, and its
-"Known Issues" section before relying on an exported pose -- twist isn't
-solved, the MediaPipe axis convention is an unverified best guess, and the
-Blender add-on (including the new Live Link server) hasn't been checked
-against a real Blender install or rig.
+"Known Issues" section before relying on an exported pose -- twist is only
+solved for the hands (everything else stays at identity), the MediaPipe axis
+convention is an unverified best guess, and the Blender add-on (including the
+new Live Link server) hasn't been checked against a real Blender install or rig.

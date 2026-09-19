@@ -67,3 +67,37 @@ def test_preexisting_truncated_file_is_redownloaded(monkeypatch, tmp_path):
 
     result = landmarker.ensure_model_downloaded("lite")
     assert result.read_bytes() == good_payload
+
+
+def test_progress_callback_receives_download_updates(monkeypatch, tmp_path):
+    payload = b"x" * (landmarker.MIN_MODEL_BYTES + 100)
+
+    def _retrieve(url, filename, reporthook=None):
+        total = len(payload)
+        if reporthook is not None:
+            reporthook(0, total, total)  # downloaded = 0
+            reporthook(1, total, total)  # downloaded = total, exact
+            reporthook(2, total, total)  # downloaded = 2*total, overshoots like a real final block can
+        with open(filename, "wb") as f:
+            f.write(payload)
+
+    monkeypatch.setattr(landmarker.urllib.request, "urlretrieve", _retrieve)
+
+    updates = []
+    landmarker.ensure_model_downloaded("lite", on_progress=lambda downloaded, total: updates.append((downloaded, total)))
+
+    assert len(updates) == 3
+    assert all(total == len(payload) for _downloaded, total in updates)
+    assert [downloaded for downloaded, _total in updates] == sorted(d for d, _ in updates)
+    # The overshooting last block is clamped to the real total, not reported past it.
+    assert updates[-1][0] == len(payload)
+
+
+def test_progress_callback_not_invoked_when_omitted(monkeypatch, tmp_path):
+    # Callers that stub urlretrieve with the plain (url, filename) signature -- like
+    # every other test in this file -- must keep working: ensure_model_downloaded
+    # must not pass a reporthook kwarg when on_progress is None.
+    payload = b"x" * (landmarker.MIN_MODEL_BYTES + 1)
+    monkeypatch.setattr(landmarker.urllib.request, "urlretrieve", _fake_urlretrieve(payload))
+
+    landmarker.ensure_model_downloaded("lite")  # no on_progress -- must not raise TypeError

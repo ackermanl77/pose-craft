@@ -13,6 +13,7 @@ import dataclasses
 import tempfile
 import urllib.request
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -31,7 +32,12 @@ MODEL_URLS = {
 MIN_MODEL_BYTES = 1_000_000
 
 
-def ensure_model_downloaded(variant: str = "full") -> Path:
+def ensure_model_downloaded(variant: str = "full", on_progress: Callable[[int, int], None] | None = None) -> Path:
+    """on_progress(downloaded_bytes, total_bytes) is called periodically during an
+    actual download (never for an already-cached model) so a caller on a UI thread
+    can show progress instead of an indefinite "please wait" -- total_bytes may be
+    0 if the server didn't send a Content-Length header.
+    """
     if variant not in MODEL_URLS:
         raise ValueError(f"unknown model variant {variant!r}, expected one of {list(MODEL_URLS)}")
 
@@ -50,7 +56,19 @@ def ensure_model_downloaded(variant: str = "full") -> Path:
         import os
 
         os.close(fd)
-        urllib.request.urlretrieve(MODEL_URLS[variant], tmp_path)
+
+        # urlretrieve's reporthook must be omitted entirely (not passed as None) when
+        # there's no callback, so callers/tests that stub out urlretrieve with a plain
+        # (url, filename) signature keep working unchanged.
+        retrieve_kwargs = {}
+        if on_progress is not None:
+            def _reporthook(block_num: int, block_size: int, total_size: int) -> None:
+                downloaded = block_num * block_size
+                on_progress(min(downloaded, total_size) if total_size > 0 else downloaded, total_size)
+
+            retrieve_kwargs["reporthook"] = _reporthook
+
+        urllib.request.urlretrieve(MODEL_URLS[variant], tmp_path, **retrieve_kwargs)
         if tmp_path.stat().st_size < MIN_MODEL_BYTES:
             raise OSError(f"downloaded model for variant {variant!r} looks truncated ({tmp_path.stat().st_size} bytes)")
         tmp_path.replace(dest)

@@ -28,13 +28,15 @@ def _t_pose_landmarks() -> np.ndarray:
 
     lm[sk.LEFT_ELBOW] = lm[sk.LEFT_SHOULDER] + [0.25, 0.0, 0.0]
     lm[sk.LEFT_WRIST] = lm[sk.LEFT_ELBOW] + [0.25, 0.0, 0.0]
-    lm[sk.LEFT_INDEX] = lm[sk.LEFT_WRIST] + [0.1, 0.0, 0.0]
-    lm[sk.LEFT_PINKY] = lm[sk.LEFT_WRIST] + [0.1, 0.0, 0.0]
+    # index/pinky spread proportional to (0, 0, 1) == skeleton._TWIST_REST_LATERAL,
+    # i.e. "zero twist" by this project's own convention -- see test_hand_twist_*.
+    lm[sk.LEFT_INDEX] = lm[sk.LEFT_WRIST] + [0.1, 0.0, 0.02]
+    lm[sk.LEFT_PINKY] = lm[sk.LEFT_WRIST] + [0.1, 0.0, -0.02]
 
     lm[sk.RIGHT_ELBOW] = lm[sk.RIGHT_SHOULDER] + [-0.25, 0.0, 0.0]
     lm[sk.RIGHT_WRIST] = lm[sk.RIGHT_ELBOW] + [-0.25, 0.0, 0.0]
-    lm[sk.RIGHT_INDEX] = lm[sk.RIGHT_WRIST] + [-0.1, 0.0, 0.0]
-    lm[sk.RIGHT_PINKY] = lm[sk.RIGHT_WRIST] + [-0.1, 0.0, 0.0]
+    lm[sk.RIGHT_INDEX] = lm[sk.RIGHT_WRIST] + [-0.1, 0.0, 0.02]
+    lm[sk.RIGHT_PINKY] = lm[sk.RIGHT_WRIST] + [-0.1, 0.0, -0.02]
 
     lm[sk.LEFT_KNEE] = lm[sk.LEFT_HIP] + [0.0, -0.5, 0.0]
     lm[sk.LEFT_ANKLE] = lm[sk.LEFT_KNEE] + [0.0, -0.5, 0.0]
@@ -68,6 +70,40 @@ def test_raised_arm_matches_expected_swing():
     # upper_arm.L's parent (spine) is untouched, so local == world here.
     relative = rotations["upper_arm.L"] * expected.inv()
     assert np.linalg.norm(relative.as_rotvec()) < 1e-6
+
+
+def test_hand_twist_is_solved_from_index_pinky_spread():
+    landmarks = _t_pose_landmarks()
+    # Rotate just the index/pinky spread by +90 degrees around the hand's own
+    # (unrotated, +X) axis -- (0, 0, 1) rest lateral -> (0, -1, 0) current lateral --
+    # simulating a wrist twisted 90 degrees with the rest of the arm unchanged.
+    landmarks[sk.LEFT_INDEX] = landmarks[sk.LEFT_WRIST] + [0.1, -0.02, 0.0]
+    landmarks[sk.LEFT_PINKY] = landmarks[sk.LEFT_WRIST] + [0.1, 0.02, 0.0]
+
+    rotations = sk.solve_bone_rotations(landmarks)
+    expected = Rotation.from_rotvec([np.pi / 2, 0.0, 0.0])
+
+    # forearm.L (hand.L's parent) is untouched, so local == world here.
+    relative = rotations["hand.L"] * expected.inv()
+    assert np.linalg.norm(relative.as_rotvec()) < 1e-6
+
+
+def test_hand_twist_is_identity_when_index_and_pinky_coincide():
+    landmarks = _t_pose_landmarks()
+    # Collapse both onto their own midpoint: zero lateral spread (degenerate twist
+    # reference) while keeping hand.L's tail -- and therefore its swing -- unchanged.
+    midpoint = (landmarks[sk.LEFT_INDEX] + landmarks[sk.LEFT_PINKY]) / 2.0
+    landmarks[sk.LEFT_INDEX] = midpoint
+    landmarks[sk.LEFT_PINKY] = midpoint
+
+    rotations = sk.solve_bone_rotations(landmarks)
+    assert np.linalg.norm(rotations["hand.L"].as_rotvec()) < 1e-9
+
+
+def test_other_bones_have_no_twist_solving():
+    assert "forearm.L" not in sk._TWIST_CURRENT_LATERAL_FN
+    assert "upper_arm.L" not in sk._TWIST_CURRENT_LATERAL_FN
+    assert "thigh.L" not in sk._TWIST_CURRENT_LATERAL_FN
 
 
 def test_rejects_wrong_shape():

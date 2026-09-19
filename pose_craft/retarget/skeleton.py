@@ -8,11 +8,17 @@ Landmark-space vectors must already be in this frame before reaching
 `solve_bone_rotations` -- see `estimation/landmarker.py` for the MediaPipe
 world-landmark conversion.
 
-This only solves the "swing" (the direction a bone points); twist around a
-bone's own axis is not recoverable from joint positions alone and is left at
-identity. This mirrors PoseForge's own disclaimer that a photo-derived pose is
-an estimate, not an exact copy -- fine limbs and hand/foot rotation will often
-need manual correction in the target application.
+This mostly only solves the "swing" (the direction a bone points); twist
+around a bone's own axis needs a second, independent landmark spanning that
+axis to measure at all, and MediaPipe's 33 points only provide one for the
+hands (the index/pinky knuckles, which straddle the wrist's own axis) -- see
+`_TWIST_CURRENT_LATERAL_FN`. Every other bone (forearm/upper-arm/thigh/shin
+rotation about their own length) has no such reference and stays at identity.
+This mirrors PoseForge's own disclaimer that a photo-derived pose is an
+estimate, not an exact copy -- fine limbs will often need manual correction in
+the target application, and the per-bone confidence score (see
+`bone_confidence`) doesn't help here since it's about landmark visibility, not
+about whether twist could be solved at all.
 """
 from __future__ import annotations
 
@@ -167,6 +173,52 @@ def _swing_rotation(rest_direction: np.ndarray, current_direction: np.ndarray) -
     return Rotation.from_rotvec(axis * angle)
 
 
+# Bones where MediaPipe happens to give a second landmark pair that spans the
+# bone's own axis, so roll/twist around that axis can actually be measured
+# instead of left unsolved: the hand, via the index/pinky knuckles either side
+# of the wrist. _TWIST_REST_LATERAL is this project's own zero-twist reference
+# (perpendicular to the bone's rest_direction; the exact direction is an
+# arbitrary convention, not an anatomical claim, as long as it's applied
+# consistently between the rest pose and every solved pose).
+_TWIST_REST_LATERAL = {
+    "hand.L": np.array([0.0, 0.0, 1.0]),
+    "hand.R": np.array([0.0, 0.0, 1.0]),
+}
+_TWIST_CURRENT_LATERAL_FN = {
+    "hand.L": lambda lm: lm[LEFT_INDEX] - lm[LEFT_PINKY],
+    "hand.R": lambda lm: lm[RIGHT_INDEX] - lm[RIGHT_PINKY],
+}
+
+
+def _twist_rotation(bone: BoneSpec, world_swing: Rotation, current_direction: np.ndarray, landmarks: np.ndarray) -> Rotation:
+    """Solves roll around `bone`'s own axis where possible (see
+    _TWIST_CURRENT_LATERAL_FN), by comparing the landmark-measured lateral
+    reference against where the already-solved swing rotation would have carried
+    the rest-pose lateral reference. Returns identity for every other bone, and
+    for degenerate geometry (near-zero lateral spread, e.g. index and pinky
+    landmarks coinciding) where a stable roll angle can't be measured.
+    """
+    lateral_fn = _TWIST_CURRENT_LATERAL_FN.get(bone.name)
+    if lateral_fn is None:
+        return Rotation.identity()
+
+    current_dir_hat = current_direction / np.linalg.norm(current_direction)
+    swung_lateral = world_swing.apply(_TWIST_REST_LATERAL[bone.name])
+
+    current_lateral_raw = lateral_fn(landmarks)
+    current_lateral = current_lateral_raw - current_dir_hat * np.dot(current_lateral_raw, current_dir_hat)
+    lateral_norm = np.linalg.norm(current_lateral)
+    if lateral_norm < 1e-6:
+        return Rotation.identity()
+    current_lateral /= lateral_norm
+
+    twist_angle = np.arctan2(
+        np.dot(np.cross(swung_lateral, current_lateral), current_dir_hat),
+        np.dot(swung_lateral, current_lateral),
+    )
+    return Rotation.from_rotvec(current_dir_hat * twist_angle)
+
+
 _LEFT_RIGHT_PAIRS = [
     (LEFT_EYE_INNER, RIGHT_EYE_INNER), (LEFT_EYE, RIGHT_EYE), (LEFT_EYE_OUTER, RIGHT_EYE_OUTER),
     (LEFT_EAR, RIGHT_EAR), (MOUTH_LEFT, MOUTH_RIGHT),
@@ -188,8 +240,10 @@ def mirror_landmarks(landmarks: np.ndarray) -> np.ndarray:
 
 
 def solve_bone_rotations(landmarks: np.ndarray) -> dict[str, Rotation]:
-    """Computes each bone's world-space swing rotation from a (33, 3) landmark array
-    in the engine frame (see module docstring). Returns bone name -> scipy Rotation.
+    """Computes each bone's world-space rotation from a (33, 3) landmark array in
+    the engine frame (see module docstring): swing for every bone, plus solved
+    twist for the few bones where that's actually measurable (see
+    _twist_rotation). Returns bone name -> scipy Rotation.
     """
     if landmarks.shape != (NUM_LANDMARKS, 3):
         raise ValueError(f"expected ({NUM_LANDMARKS}, 3) landmarks, got {landmarks.shape}")
@@ -203,7 +257,9 @@ def solve_bone_rotations(landmarks: np.ndarray) -> dict[str, Rotation]:
         if np.linalg.norm(direction) < 1e-6:
             world_rotations[bone.name] = Rotation.identity()
         else:
-            world_rotations[bone.name] = _swing_rotation(bone.rest_direction, direction)
+            swing = _swing_rotation(bone.rest_direction, direction)
+            twist = _twist_rotation(bone, swing, direction, landmarks)
+            world_rotations[bone.name] = twist * swing
 
         if bone.parent is None:
             local_rotations[bone.name] = world_rotations[bone.name]
