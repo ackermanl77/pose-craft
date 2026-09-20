@@ -44,9 +44,12 @@ worse result -- see the tips under the Load Photo button), optionally raise
 "Max people to detect" above its default of 4 for a bigger group photo, then
 click **Solve Pose** (downloads the MediaPipe model to
 `~/.cache/pose_craft/models` on first run -- needs network access once, cached
-after that, with a live download percentage in the status bar). Either click
-the person you want directly in the photo or pick them from the dropdown.
-From there:
+after that, with a live download percentage in the status bar). Every
+detected person's skeleton is drawn directly on the photo -- the selected
+person in a bright color (their low-confidence joints, likely occluded in
+the photo, shown in a distinct warning color), everyone else dimmed. Either
+click the person you want directly in the photo or pick them from the
+dropdown. From there:
 
 - **Export Pose JSON** / **Export All People...** (one JSON per detected
   person, to a folder you choose; the mirror checkbox, if used, applies to
@@ -63,6 +66,12 @@ Pose JSON** (pick an exported file) or **Start Live Link** once and then use
 PoseCraft's "Send to Blender" button for every pose after that, no file
 dialog needed. Bones the exporter flagged low-confidence (likely occluded in
 the photo) are called out separately from unmatched bone names in both paths.
+
+If your rig's bone names don't match PoseCraft's automatic guessing (a bone
+shows up as "unmatched"), use the panel's **Bone Mapping** box: click
+"Initialize/Refresh" for one row per PoseCraft bone name, then either "Auto-Guess
+Unset" to fill in what it can, or pick each target bone yourself from the
+searchable dropdown. Saved on the armature, so it's a one-time setup per rig.
 
 ## Build the .exe
 

@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -25,10 +26,16 @@ from pose_craft.estimation.landmarker import DetectedPerson, PoseEstimator, ensu
 from pose_craft.export import live_link
 from pose_craft.export.blender_pose import build_pose_document, save_pose_file
 from pose_craft.export.live_link import send_pose_document
-from pose_craft.gui.photo_view import PhotoView
+from pose_craft.gui.photo_view import PhotoOverlayPerson, PhotoView
 from pose_craft.gui.viewport_3d import SkeletonViewport
 from pose_craft.imaging import PHOTO_GUIDANCE, assess_photo_quality, imread_unicode
-from pose_craft.retarget.skeleton import bone_confidence, joint_positions, mirror_landmarks, solve_bone_rotations
+from pose_craft.retarget.skeleton import (
+    bone_confidence,
+    image_joint_positions_2d,
+    joint_positions,
+    mirror_landmarks,
+    solve_bone_rotations,
+)
 
 
 class SolveWorker(QThread):
@@ -118,14 +125,33 @@ class MainWindow(QMainWindow):
         self.photo_view.clicked_normalized.connect(self._on_photo_clicked)
         left.addWidget(self.photo_view)
 
+        left.addWidget(self._build_detect_group())
+        left.addWidget(self._build_person_group())
+        left.addWidget(self._build_export_group())
+        left.addWidget(self._build_live_link_group())
+        left.addStretch(1)
+
+        right = QVBoxLayout()
+        root.addLayout(right, stretch=2)
+        right.addWidget(QLabel("3D preview"))
+        self.viewport = SkeletonViewport()
+        right.addWidget(self.viewport, stretch=1)
+
+        self.setStatusBar(QStatusBar())
+        self.statusBar().showMessage("Ready")
+
+    def _build_detect_group(self) -> QGroupBox:
+        group = QGroupBox("1. Load && Detect")
+        layout = QVBoxLayout(group)
+
         self.load_btn = QPushButton("Load Photo...")
         self.load_btn.clicked.connect(self._on_load_photo)
-        left.addWidget(self.load_btn)
+        layout.addWidget(self.load_btn)
 
         tips_label = QLabel("For best results:\n" + "\n".join(f"- {tip}" for tip in PHOTO_GUIDANCE))
         tips_label.setWordWrap(True)
         tips_label.setStyleSheet("color: #888; font-size: 11px;")
-        left.addWidget(tips_label)
+        layout.addWidget(tips_label)
 
         max_people_row = QHBoxLayout()
         max_people_row.addWidget(QLabel("Max people to detect:"))
@@ -137,62 +163,79 @@ class MainWindow(QMainWindow):
             "Changing this after a solve rebuilds the pose model on the next Solve Pose."
         )
         max_people_row.addWidget(self.max_people_spin)
-        left.addLayout(max_people_row)
+        layout.addLayout(max_people_row)
 
         self.solve_btn = QPushButton("Solve Pose")
         self.solve_btn.clicked.connect(self._on_solve_pose)
         self.solve_btn.setEnabled(False)
-        left.addWidget(self.solve_btn)
+        layout.addWidget(self.solve_btn)
+
+        return group
+
+    def _build_person_group(self) -> QGroupBox:
+        group = QGroupBox("2. Select Person")
+        layout = QVBoxLayout(group)
 
         person_row = QHBoxLayout()
         person_row.addWidget(QLabel("Person:"))
         self.person_combo = QComboBox()
         self.person_combo.currentIndexChanged.connect(self._on_person_changed)
         person_row.addWidget(self.person_combo)
-        left.addLayout(person_row)
-        left.addWidget(QLabel("(or click the person directly in the photo)"))
+        layout.addLayout(person_row)
+        layout.addWidget(QLabel("(or click the person directly in the photo)"))
 
         self.mirror_checkbox = QCheckBox("Mirror left/right (body orientation fix)")
         self.mirror_checkbox.stateChanged.connect(self._on_person_changed)
-        left.addWidget(self.mirror_checkbox)
+        layout.addWidget(self.mirror_checkbox)
+
+        return group
+
+    def _build_export_group(self) -> QGroupBox:
+        group = QGroupBox("3. Export")
+        layout = QVBoxLayout(group)
 
         self.export_btn = QPushButton("Export Pose JSON...")
         self.export_btn.clicked.connect(self._on_export_pose)
         self.export_btn.setEnabled(False)
-        left.addWidget(self.export_btn)
+        layout.addWidget(self.export_btn)
 
         self.export_all_btn = QPushButton("Export All People...")
         self.export_all_btn.clicked.connect(self._on_export_all)
         self.export_all_btn.setEnabled(False)
-        left.addWidget(self.export_all_btn)
+        layout.addWidget(self.export_all_btn)
+
+        return group
+
+    def _build_live_link_group(self) -> QGroupBox:
+        group = QGroupBox("4. Blender Live Link")
+        layout = QVBoxLayout(group)
 
         live_link_row = QHBoxLayout()
         live_link_row.addWidget(QLabel("Blender host:"))
         self.live_link_host_edit = QLineEdit(live_link.DEFAULT_HOST)
         self.live_link_host_edit.setMaximumWidth(100)
+        self.live_link_host_edit.setToolTip(
+            "The Blender add-on only ever listens on 127.0.0.1 (localhost) -- change this "
+            "only if PoseCraft and Blender already talk over some other configured "
+            "loopback/tunnel, not to reach Blender on a different machine."
+        )
         live_link_row.addWidget(self.live_link_host_edit)
         live_link_row.addWidget(QLabel("port:"))
         self.live_link_port_spin = QSpinBox()
         self.live_link_port_spin.setRange(1, 65535)
         self.live_link_port_spin.setValue(live_link.DEFAULT_PORT)
+        self.live_link_port_spin.setToolTip(
+            "Must match the port set in Blender's PoseCraft panel before Live Link is started there."
+        )
         live_link_row.addWidget(self.live_link_port_spin)
-        left.addLayout(live_link_row)
+        layout.addLayout(live_link_row)
 
         self.send_to_blender_btn = QPushButton("Send to Blender (Live Link)")
         self.send_to_blender_btn.clicked.connect(self._on_send_to_blender)
         self.send_to_blender_btn.setEnabled(False)
-        left.addWidget(self.send_to_blender_btn)
+        layout.addWidget(self.send_to_blender_btn)
 
-        left.addStretch(1)
-
-        right = QVBoxLayout()
-        root.addLayout(right, stretch=2)
-        right.addWidget(QLabel("3D preview"))
-        self.viewport = SkeletonViewport()
-        right.addWidget(self.viewport, stretch=1)
-
-        self.setStatusBar(QStatusBar())
-        self.statusBar().showMessage("Ready")
+        return group
 
     def closeEvent(self, event) -> None:
         # Closing the shared PoseEstimator while a background thread is still
@@ -236,6 +279,7 @@ class MainWindow(QMainWindow):
         self.person_combo.clear()
         self._people = []
         self.viewport.clear_skeleton()
+        self.photo_view.set_skeleton_overlay([])
         self.statusBar().showMessage(f"Loaded {Path(path).name}")
 
         quality_warnings = assess_photo_quality(image_bgr)
@@ -332,11 +376,22 @@ class MainWindow(QMainWindow):
         if landmarks is None:
             self.export_btn.setEnabled(False)
             self.send_to_blender_btn.setEnabled(False)
+            self.photo_view.set_skeleton_overlay([])
             return
 
         self.viewport.show_skeleton(joint_positions(landmarks))
         self.export_btn.setEnabled(True)
         self.send_to_blender_btn.setEnabled(True)
+
+        selected_index = self.person_combo.currentIndex()
+        self.photo_view.set_skeleton_overlay([
+            PhotoOverlayPerson(
+                joints_2d=image_joint_positions_2d(person.image_landmarks_xy),
+                confidence=bone_confidence(person.visibility),
+                selected=(i == selected_index),
+            )
+            for i, person in enumerate(self._people)
+        ])
 
     def _current_person_document_inputs(self):
         index = self.person_combo.currentIndex()

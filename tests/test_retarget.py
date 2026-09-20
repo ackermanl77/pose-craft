@@ -72,6 +72,57 @@ def test_raised_arm_matches_expected_swing():
     assert np.linalg.norm(relative.as_rotvec()) < 1e-6
 
 
+def _sample_image_landmarks_2d() -> np.ndarray:
+    lm = np.zeros((sk.NUM_LANDMARKS, 2))
+    lm[sk.LEFT_HIP] = [0.55, 0.5]
+    lm[sk.RIGHT_HIP] = [0.45, 0.5]
+    lm[sk.LEFT_SHOULDER] = [0.6, 0.3]
+    lm[sk.RIGHT_SHOULDER] = [0.4, 0.3]
+    lm[sk.LEFT_EAR] = [0.52, 0.18]
+    lm[sk.RIGHT_EAR] = [0.48, 0.18]
+    lm[sk.NOSE] = [0.5, 0.2]
+    lm[sk.LEFT_ELBOW] = [0.7, 0.35]
+    lm[sk.RIGHT_ELBOW] = [0.3, 0.35]
+    lm[sk.LEFT_WRIST] = [0.8, 0.4]
+    lm[sk.RIGHT_WRIST] = [0.2, 0.4]
+    lm[sk.LEFT_INDEX] = [0.82, 0.42]
+    lm[sk.LEFT_PINKY] = [0.81, 0.41]
+    lm[sk.RIGHT_INDEX] = [0.18, 0.42]
+    lm[sk.RIGHT_PINKY] = [0.19, 0.41]
+    lm[sk.LEFT_KNEE] = [0.56, 0.7]
+    lm[sk.RIGHT_KNEE] = [0.44, 0.7]
+    lm[sk.LEFT_ANKLE] = [0.57, 0.9]
+    lm[sk.RIGHT_ANKLE] = [0.43, 0.9]
+    lm[sk.LEFT_FOOT_INDEX] = [0.6, 0.95]
+    lm[sk.RIGHT_FOOT_INDEX] = [0.4, 0.95]
+    return lm
+
+
+def test_image_joint_positions_2d_returns_every_bone_head_and_tail():
+    joints = sk.image_joint_positions_2d(_sample_image_landmarks_2d())
+
+    assert set(joints.keys()) == {f"{name}.{part}" for name in sk.BONE_NAMES for part in ("head", "tail")}
+    for value in joints.values():
+        assert value.shape == (2,)
+
+    # A plain indexed bone should read straight through, unlike the head bone.
+    landmarks = _sample_image_landmarks_2d()
+    assert np.array_equal(joints["upper_arm.L.head"], landmarks[sk.LEFT_SHOULDER])
+    assert np.array_equal(joints["upper_arm.L.tail"], landmarks[sk.LEFT_ELBOW])
+
+
+def test_image_joint_positions_2d_head_bone_does_not_crash():
+    # The one bone whose 3D tail_fn (_head_top) isn't dimension-agnostic -- this
+    # is the regression case _BONE_2D_TAIL_OVERRIDES exists for.
+    joints = sk.image_joint_positions_2d(_sample_image_landmarks_2d())
+    assert joints["head.tail"].shape == (2,)
+
+
+def test_image_joint_positions_2d_rejects_wrong_shape():
+    with pytest.raises(ValueError):
+        sk.image_joint_positions_2d(np.zeros((sk.NUM_LANDMARKS, 3)))
+
+
 def test_hand_twist_is_solved_from_index_pinky_spread():
     landmarks = _t_pose_landmarks()
     # Rotate just the index/pinky spread by +90 degrees around the hand's own

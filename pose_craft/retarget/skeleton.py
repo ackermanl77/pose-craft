@@ -138,6 +138,40 @@ def joint_positions(landmarks: np.ndarray) -> dict[str, np.ndarray]:
     return points
 
 
+def _head_top_2d(lm: np.ndarray) -> np.ndarray:
+    """2D-image-space analogue of _head_top, for image_joint_positions_2d below.
+    _head_top's offset is a 3-component vector (a small nudge along the engine
+    frame's +Y/"up"); image coordinates only have two axes, and image y
+    increases downward rather than up, so this can't just reuse that constant.
+    """
+    ear_center = _mid(lm, LEFT_EAR, RIGHT_EAR)
+    return ear_center + (ear_center - lm[NOSE]) * 0.6 + np.array([0.0, -0.05])
+
+
+# Bones whose 3D tail_fn isn't dimension-agnostic (only "head", via _head_top's
+# 3-component offset) need a 2D-specific override here for image_joint_positions_2d.
+_BONE_2D_TAIL_OVERRIDES = {"head": _head_top_2d}
+
+
+def image_joint_positions_2d(image_landmarks_xy: np.ndarray) -> dict[str, np.ndarray]:
+    """2D-image-space analogue of joint_positions(), for drawing the solved
+    skeleton directly on the source photo (gui/photo_view.py) rather than only
+    in the 3D viewport. Reuses BONES' head/tail landmark lookups where they're
+    dimension-agnostic (plain indexing or midpoint averaging, which work the
+    same regardless of how many columns `landmarks` has) -- only the head
+    bone's extrapolated top-of-skull point needs a 2D-specific version, since
+    the 3D one adds a 3-component offset.
+    """
+    if image_landmarks_xy.shape != (NUM_LANDMARKS, 2):
+        raise ValueError(f"expected ({NUM_LANDMARKS}, 2) landmarks, got {image_landmarks_xy.shape}")
+    points: dict[str, np.ndarray] = {}
+    for bone in BONES:
+        points[f"{bone.name}.head"] = bone.head_fn(image_landmarks_xy)
+        tail_fn = _BONE_2D_TAIL_OVERRIDES.get(bone.name, bone.tail_fn)
+        points[f"{bone.name}.tail"] = tail_fn(image_landmarks_xy)
+    return points
+
+
 def bone_confidence(visibility: np.ndarray) -> dict[str, float]:
     """Per-bone confidence from MediaPipe's per-landmark visibility scores: the
     lowest visibility among the raw landmarks a bone's position depends on.

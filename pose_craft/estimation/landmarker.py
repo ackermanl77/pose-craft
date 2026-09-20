@@ -148,13 +148,3 @@ class PoseEstimator:
 
         people.sort(key=lambda p: p.centroid_xy()[0])
         return people
-
-
-def detect_poses(image_bgr: np.ndarray, model_path: Path, max_people: int = 4) -> list[DetectedPerson]:
-    """Convenience one-shot call: creates a PoseEstimator, runs one detection, closes it.
-
-    Prefer `PoseEstimator` directly (see gui/main_window.py) when solving more than
-    once, so the model only has to load once.
-    """
-    with PoseEstimator(model_path, max_people) as estimator:
-        return estimator.detect(image_bgr)

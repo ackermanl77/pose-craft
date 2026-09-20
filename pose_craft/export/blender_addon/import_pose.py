@@ -6,18 +6,41 @@ Install: Blender > Edit > Preferences > Add-ons > Install..., pick this file, en
 Two ways to get a pose onto an armature:
 - **Load Pose JSON**: select an armature, click "Load Pose JSON", pick a .json
   file exported by the PoseCraft app.
-- **Live Link**: click "Start Live Link" once (keeps an armature selected as the
-  target), then in the PoseCraft app use "Send to Blender" after each solve --
-  no file dialog needed for repeated tries. Live Link listens on
-  127.0.0.1:8642 (see pose_craft/export/live_link.py on the app side, which
-  must agree on this port since the add-on can't import that package).
+- **Live Link**: set the port (must match the PoseCraft app's "Blender host/port"
+  fields -- the app defaults to 8642, same as this add-on's default), click
+  "Start Live Link" once (keeps an armature selected as the target), then in
+  the PoseCraft app use "Send to Blender" after each solve -- no file dialog
+  needed for repeated tries. Always listens on 127.0.0.1 (localhost) only --
+  there's no UI for binding to all interfaces, since that would expose a
+  socket that applies arbitrary bone rotations on request to the network with
+  no authentication, which needs to be a deliberate choice, not a default.
+  Change the app's "Blender host" field only if PoseCraft and Blender are
+  proven to already talk over some other configured loopback/tunnel; it does
+  not make this add-on listen on a different interface.
 
-Bone name matching is heuristic: for each bone name in the pose file, this tries
-an exact match against the armature's pose bones first, then common Rigify-style
-prefixes/suffixes (DEF-, ORG-, ".fk", ".ik"). Bones it can't match are reported
-in the Blender status bar / console rather than silently skipped, and bones the
-PoseCraft app flagged "low_confidence" (likely occluded in the source photo) are
-called out separately -- expect to need manual correction for those, the same
+Bone name matching, for either path above: PoseCraft's 15 bone names (spine,
+neck, head, upper_arm.L/R, forearm.L/R, hand.L/R, thigh.L/R, shin.L/R,
+foot.L/R -- see POSECRAFT_BONE_NAMES, which mirrors
+pose_craft/retarget/skeleton.py::BONE_NAMES) don't necessarily match your
+rig's own bone names. Two ways to bridge that, checked in this order:
+
+1. **Manual Bone Mapping** (the "PoseCraft" panel's "Bone Mapping" box):
+   click "Initialize/Refresh" once per armature to get one row per PoseCraft
+   bone name, then either click "Auto-Guess Unset" to fill blanks with the
+   heuristic below, or pick each target bone yourself from the searchable
+   dropdown. Saved on the armature object (persists with the .blend file).
+   An explicit row always wins, even if it points at a bone that's since been
+   renamed or deleted -- that's reported as unmatched rather than silently
+   falling back to a guess you didn't ask for.
+2. **Automatic name-guessing** (used for any PoseCraft bone name with no
+   manual mapping row, or a blank one): tries the exact name, then common
+   Rigify-style prefixes/suffixes (DEF-, ORG-, ".fk", ".ik") -- see
+   NAME_CANDIDATES_TEMPLATES.
+
+Bones that still can't be resolved either way are reported in the Blender
+status bar / console rather than silently skipped, and bones the PoseCraft
+app flagged "low_confidence" (likely occluded in the source photo) are called
+out separately -- expect to need manual correction for those, the same
 caveat PoseForge gives for DAZ.
 
 NOTE: this file has not been loaded into a real Blender instance or tested
@@ -35,12 +58,25 @@ from mathutils import Quaternion
 bl_info = {
     "name": "PoseCraft Pose Importer",
     "author": "PoseCraft",
-    "version": (0, 2, 0),
+    "version": (0, 3, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > PoseCraft",
     "description": "Applies a PoseCraft .json pose export (file or Live Link) to an armature's pose bones",
     "category": "Animation",
 }
+
+# Mirrors pose_craft/retarget/skeleton.py::BONE_NAMES -- kept as a plain literal
+# here since this add-on runs inside Blender's own Python and can't import that
+# package. If the app's bone list ever changes, update this list too;
+# "Initialize/Refresh" (POSECRAFT_OT_init_bone_mapping) will pick up the new
+# set on next use, dropping stale rows and adding blank ones for new names.
+POSECRAFT_BONE_NAMES = [
+    "spine", "neck", "head",
+    "upper_arm.L", "forearm.L", "hand.L",
+    "upper_arm.R", "forearm.R", "hand.R",
+    "thigh.L", "shin.L", "foot.L",
+    "thigh.R", "shin.R", "foot.R",
+]
 
 NAME_CANDIDATES_TEMPLATES = [
     "{name}",
@@ -53,7 +89,7 @@ NAME_CANDIDATES_TEMPLATES = [
 ]
 
 LIVE_LINK_HOST = "127.0.0.1"
-LIVE_LINK_PORT = 8642
+DEFAULT_LIVE_LINK_PORT = 8642
 _POLL_INTERVAL_SECONDS = 0.2
 
 # Live Link server state. Blender add-ons that need to survive across operator
@@ -62,12 +98,31 @@ _server_socket: socket.socket | None = None
 _live_link_status = "Not started"
 
 
-def _resolve_bone_name(pose_bones, exported_name: str) -> str | None:
+def _guess_bone_name(pose_bones, exported_name: str) -> str | None:
+    """Tries common Rigify-style naming patterns against the armature's actual
+    pose bones. This is the fallback `_resolve_bone_name` uses when no manual
+    mapping row exists (or its row's target bone is blank) for a given
+    PoseCraft bone name -- see POSECRAFT_BoneMapping.
+    """
     for template in NAME_CANDIDATES_TEMPLATES:
         candidate = template.format(name=exported_name)
         if candidate in pose_bones:
             return candidate
     return None
+
+
+def _resolve_bone_name(armature_obj: bpy.types.Object, exported_name: str) -> str | None:
+    pose_bones = armature_obj.pose.bones
+
+    for entry in armature_obj.posecraft_bone_mapping:
+        if entry.posecraft_name == exported_name and entry.target_bone:
+            # An explicit manual mapping exists -- honor it exactly. If the named
+            # bone no longer exists (renamed/deleted since the mapping was set),
+            # report unmatched rather than silently falling back to a guess the
+            # user didn't ask for.
+            return entry.target_bone if entry.target_bone in pose_bones else None
+
+    return _guess_bone_name(pose_bones, exported_name)
 
 
 def apply_pose_document(armature_obj: bpy.types.Object, document: dict) -> tuple[list[str], list[str], list[str]]:
@@ -79,7 +134,7 @@ def apply_pose_document(armature_obj: bpy.types.Object, document: dict) -> tuple
     applied, unmatched, low_confidence = [], [], []
 
     for exported_name, data in document["bones"].items():
-        bone_name = _resolve_bone_name(pose_bones, exported_name)
+        bone_name = _resolve_bone_name(armature_obj, exported_name)
         if bone_name is None:
             unmatched.append(exported_name)
             continue
@@ -141,6 +196,98 @@ class POSECRAFT_OT_load_pose(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
 
+class POSECRAFT_BoneMapping(bpy.types.PropertyGroup):
+    """One row of the manual bone-mapping list: a fixed PoseCraft bone name
+    (see POSECRAFT_BONE_NAMES) paired with the target bone the user picked on
+    their own armature. Stored on the armature Object itself (posecraft_bone_mapping,
+    registered in register() below) so it persists with the .blend file.
+    """
+
+    posecraft_name: bpy.props.StringProperty(name="PoseCraft Bone")
+    target_bone: bpy.props.StringProperty(name="Target Bone")
+
+
+class POSECRAFT_UL_bone_mapping(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.label(text=item.posecraft_name)
+        # `data` here is the armature Object passed to template_list() below, so
+        # data.data is its Armature datablock -- prop_search's standard "pick an
+        # existing bone by name, with autocomplete" idiom.
+        row.prop_search(item, "target_bone", data.data, "bones", text="", icon="BONE_DATA")
+
+
+class POSECRAFT_OT_init_bone_mapping(bpy.types.Operator):
+    bl_idname = "posecraft.init_bone_mapping"
+    bl_label = "Initialize/Refresh Bone Mapping"
+    bl_description = (
+        "Set up one row per PoseCraft bone name for this armature, keeping any bone "
+        "you've already assigned and adding blank rows for the rest"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        armature_obj = context.active_object
+        if armature_obj is None or armature_obj.type != "ARMATURE":
+            self.report({"ERROR"}, "Select an armature first")
+            return {"CANCELLED"}
+
+        existing = {entry.posecraft_name: entry.target_bone for entry in armature_obj.posecraft_bone_mapping}
+        armature_obj.posecraft_bone_mapping.clear()
+        for name in POSECRAFT_BONE_NAMES:
+            entry = armature_obj.posecraft_bone_mapping.add()
+            entry.posecraft_name = name
+            entry.target_bone = existing.get(name, "")
+
+        self.report({"INFO"}, f"{len(POSECRAFT_BONE_NAMES)} bone mapping row(s) ready")
+        return {"FINISHED"}
+
+
+class POSECRAFT_OT_auto_guess_bone_mapping(bpy.types.Operator):
+    bl_idname = "posecraft.auto_guess_bone_mapping"
+    bl_label = "Auto-Guess Unset Bone Mapping"
+    bl_description = "Fill in any blank mapping row using the same name-guessing Load Pose JSON falls back on"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        armature_obj = context.active_object
+        if armature_obj is None or armature_obj.type != "ARMATURE":
+            self.report({"ERROR"}, "Select an armature first")
+            return {"CANCELLED"}
+
+        pose_bones = armature_obj.pose.bones
+        filled = 0
+        for entry in armature_obj.posecraft_bone_mapping:
+            if entry.target_bone:
+                continue
+            guess = _guess_bone_name(pose_bones, entry.posecraft_name)
+            if guess is not None:
+                entry.target_bone = guess
+                filled += 1
+
+        self.report({"INFO"}, f"Filled {filled} row(s) from name-guessing")
+        return {"FINISHED"}
+
+
+class POSECRAFT_OT_clear_bone_mapping(bpy.types.Operator):
+    bl_idname = "posecraft.clear_bone_mapping"
+    bl_label = "Clear Bone Mapping"
+    bl_description = "Blank every assigned target bone (keeps the row list itself)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        armature_obj = context.active_object
+        if armature_obj is None or armature_obj.type != "ARMATURE":
+            self.report({"ERROR"}, "Select an armature first")
+            return {"CANCELLED"}
+
+        for entry in armature_obj.posecraft_bone_mapping:
+            entry.target_bone = ""
+
+        self.report({"INFO"}, "Cleared bone mapping")
+        return {"FINISHED"}
+
+
 def _recv_exact(conn: socket.socket, size: int) -> bytes:
     chunks = []
     remaining = size
@@ -193,22 +340,22 @@ def _poll_live_link_server():
     return _POLL_INTERVAL_SECONDS
 
 
-def _start_live_link_server() -> str | None:
+def _start_live_link_server(port: int) -> str | None:
     """Returns an error message on failure, or None on success."""
     global _server_socket, _live_link_status
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        server_socket.bind((LIVE_LINK_HOST, LIVE_LINK_PORT))
+        server_socket.bind((LIVE_LINK_HOST, port))
     except OSError as exc:
         server_socket.close()
-        return f"Could not bind {LIVE_LINK_HOST}:{LIVE_LINK_PORT}: {exc}"
+        return f"Could not bind {LIVE_LINK_HOST}:{port}: {exc}"
 
     server_socket.listen(1)
     server_socket.setblocking(False)
     _server_socket = server_socket
-    _live_link_status = f"Listening on {LIVE_LINK_HOST}:{LIVE_LINK_PORT}"
+    _live_link_status = f"Listening on {LIVE_LINK_HOST}:{port}"
     bpy.app.timers.register(_poll_live_link_server, first_interval=_POLL_INTERVAL_SECONDS, persistent=True)
     return None
 
@@ -228,7 +375,7 @@ class POSECRAFT_OT_toggle_live_link(bpy.types.Operator):
 
     def execute(self, context):
         if _server_socket is None:
-            error = _start_live_link_server()
+            error = _start_live_link_server(context.scene.posecraft_live_link_port)
             if error:
                 self.report({"ERROR"}, error)
                 return {"CANCELLED"}
@@ -253,9 +400,29 @@ class POSECRAFT_PT_panel(bpy.types.Panel):
         active = context.active_object
         if active is None or active.type != "ARMATURE":
             layout.label(text="Select an armature", icon="ERROR")
+        else:
+            box = layout.box()
+            box.label(text="Bone Mapping (optional)", icon="BONE_DATA")
+            row = box.row(align=True)
+            row.operator(POSECRAFT_OT_init_bone_mapping.bl_idname, text="Initialize/Refresh")
+            row.operator(POSECRAFT_OT_auto_guess_bone_mapping.bl_idname, text="Auto-Guess Unset")
+
+            if len(active.posecraft_bone_mapping) > 0:
+                box.template_list(
+                    "POSECRAFT_UL_bone_mapping", "",
+                    active, "posecraft_bone_mapping",
+                    active, "posecraft_bone_mapping_active_index",
+                    rows=6,
+                )
+                box.operator(POSECRAFT_OT_clear_bone_mapping.bl_idname, text="Clear All", icon="X")
+            else:
+                box.label(text="No manual mapping set -- using name-guessing only")
 
         layout.separator()
         is_running = _server_socket is not None
+        row = layout.row()
+        row.enabled = not is_running  # num_poses-style: the port is fixed once the socket is bound
+        row.prop(context.scene, "posecraft_live_link_port")
         layout.operator(
             POSECRAFT_OT_toggle_live_link.bl_idname,
             text="Stop Live Link" if is_running else "Start Live Link",
@@ -264,16 +431,37 @@ class POSECRAFT_PT_panel(bpy.types.Panel):
         layout.label(text=_live_link_status)
 
 
-CLASSES = (POSECRAFT_OT_load_pose, POSECRAFT_OT_toggle_live_link, POSECRAFT_PT_panel)
+CLASSES = (
+    POSECRAFT_OT_load_pose,
+    POSECRAFT_BoneMapping,
+    POSECRAFT_UL_bone_mapping,
+    POSECRAFT_OT_init_bone_mapping,
+    POSECRAFT_OT_auto_guess_bone_mapping,
+    POSECRAFT_OT_clear_bone_mapping,
+    POSECRAFT_OT_toggle_live_link,
+    POSECRAFT_PT_panel,
+)
 
 
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
+    bpy.types.Scene.posecraft_live_link_port = bpy.props.IntProperty(
+        name="Live Link Port",
+        description="Must match the PoseCraft app's 'port' field next to its Send to Blender button",
+        default=DEFAULT_LIVE_LINK_PORT,
+        min=1,
+        max=65535,
+    )
+    bpy.types.Object.posecraft_bone_mapping = bpy.props.CollectionProperty(type=POSECRAFT_BoneMapping)
+    bpy.types.Object.posecraft_bone_mapping_active_index = bpy.props.IntProperty()
 
 
 def unregister():
     _stop_live_link_server()
+    del bpy.types.Object.posecraft_bone_mapping_active_index
+    del bpy.types.Object.posecraft_bone_mapping
+    del bpy.types.Scene.posecraft_live_link_port
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
 

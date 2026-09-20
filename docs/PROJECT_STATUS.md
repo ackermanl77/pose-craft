@@ -30,6 +30,9 @@ pose_craft_pose .json file            export/live_link.py: length-prefixed
 export/blender_addon/import_pose.py (installed inside Blender)
   -- Load Pose JSON operator, or a Live Link server (bpy.app.timers-polled,
      non-blocking accept) that applies a received pose automatically
+  -- bone name resolution: an explicit per-armature manual mapping row
+     (POSECRAFT_BoneMapping, saved with the .blend file) wins if set, else
+     falls back to Rigify-style name-guessing (DEF-/ORG-/_fk/_ik)
   -- applies bone quaternions to the active armature's pose bones
 ```
 
@@ -61,12 +64,23 @@ instead of silently keeping the old limit. `gui/photo_view.py`'s
 rescale cleanly on window resize, and turns a click into a normalized
 image-space point that `main_window.py` matches against each detected
 person's 2D centroid (`_nearest_person_index`) to drive the person picker.
+`PhotoView` also draws every detected person's 2D skeleton directly on the
+photo in its `paintEvent` (`retarget.skeleton.image_joint_positions_2d()` --
+a 2D-image-space analogue of `joint_positions()`, with a 2D-safe override for
+the one bone, `head`, whose 3D version isn't dimension-agnostic), color-coded
+by confidence and with the selected person drawn on top of the others,
+dimmed -- deliberately independent of the mirror checkbox, since mirroring
+relabels which exported bone name a side's data feeds, it doesn't move
+anyone's arm in the photo (see `PhotoOverlayPerson`'s docstring).
 `gui/viewport_3d.py` is a thin wrapper around `pyqtgraph.opengl.GLViewWidget`
 that draws `retarget.skeleton.joint_positions()` as line segments + points and
 auto-frames the camera to the skeleton's own bounding box on every update
 (`_compute_camera_frame`) -- it has no other state of its own beyond the
 current skeleton, `main_window.py` always calls `clear_skeleton()` before
-`show_skeleton()` on every update rather than diffing.
+`show_skeleton()` on every update rather than diffing. The left control
+panel is split into four `QGroupBox` sections (`_build_detect_group`,
+`_build_person_group`, `_build_export_group`, `_build_live_link_group`)
+instead of one flat stack of ~15 controls.
 
 The retargeting math (`retarget/skeleton.py`), the axis-conversion math
 (`export/blender_pose.py`), the atomic-download logic and unicode-path
@@ -122,20 +136,25 @@ uploads the `.exe` itself) -- see "Known Issues".
 pytest
 ```
 
-covers `retarget/skeleton.py`, `export/blender_pose.py`,
-`estimation/landmarker.py` (atomic download logic and the progress-callback
-contract, with `urlretrieve` mocked), `imaging.py` (real cv2 encode/decode
-round trips, including a non-ASCII filename), and `export/live_link.py` (a
-real loopback TCP server standing in for the Blender add-on, checking the
-exact wire format both sides need to agree on) -- all pure numpy/scipy/stdlib/cv2,
-no PySide6/mediapipe/Blender needed to run them. `tests/test_main_window_helpers.py`
-additionally covers `main_window._nearest_person_index()` (the click-to-pick
-math) and the mirror/confidence consistency fix (see "Recently Fixed"), and
+covers `retarget/skeleton.py` (including `image_joint_positions_2d()`, the 2D
+overlay math), `export/blender_pose.py`, `estimation/landmarker.py` (atomic
+download logic and the progress-callback contract, with `urlretrieve`
+mocked), `imaging.py` (real cv2 encode/decode round trips, including a
+non-ASCII filename), `export/live_link.py` (a real loopback TCP server
+standing in for the Blender add-on, checking the exact wire format both sides
+need to agree on), and `export/blender_addon/import_pose.py`'s
+`POSECRAFT_BONE_NAMES` constant (`tests/test_blender_addon_source.py` parses
+the add-on's *source* with `ast` -- it can't be imported here, since it needs
+`bpy` -- to catch that list drifting out of sync with `skeleton.BONE_NAMES`)
+-- all pure numpy/scipy/stdlib/cv2/ast, no PySide6/mediapipe/Blender needed to
+run them. `tests/test_main_window_helpers.py` additionally covers
+`main_window._nearest_person_index()` (the click-to-pick math) and the
+mirror/confidence consistency fix (see "Recently Fixed"), and
 `tests/test_viewport_camera.py` covers the auto-framing math
 (`_compute_camera_frame`); both guard their PySide6 import with
 `pytest.importorskip`, so they run locally and skip cleanly in CI's lighter
 venv. Confirmed locally: installing only `requirements-test.txt` into a fresh
-venv reproduces CI's exact result (28 passed, 2 skipped).
+venv reproduces CI's exact result (33 passed, 2 skipped).
 
 Everything else has been checked manually rather than by automated test,
 since it needs a real display/GPU/Blender install that isn't available in
@@ -162,6 +181,15 @@ this dev environment:
   model was already cached from earlier manual testing in this session) with
   the custom `max_people=6`, with no crash -- a real, if incidental, live
   smoke test of the whole detection path, not just the mocked one.
+- The photo overlay (`PhotoView.paintEvent`, drawing each detected person's 2D
+  skeleton on the photo) was checked by constructing a real `MainWindow` with
+  fake `DetectedPerson` data, calling `.grab()` to force an actual Qt paint
+  pass (not just confirm the code compiles), and visually inspecting the
+  rendered output: the selected person's skeleton renders in the bright color
+  on top, an unselected person renders dimmed underneath, and a bone whose
+  landmarks were given deliberately low visibility renders in the low-confidence
+  color. Confirms the drawing code runs and looks right for that one
+  synthetic case; not a substitute for seeing it against a real photo.
 - The built `.exe` was launched and confirmed to stay running (no immediate
   missing-DLL crash) rather than close under it and left running.
 - The Blender add-on (`import_pose.py`), including its new Live Link server,
@@ -192,9 +220,9 @@ time each check ran, not guaranteed to stay true as the code changes.
   now has a `PoseEstimator` class that owns one live landmarker instance;
   `MainWindow` creates it once on the first solve and reuses it (via
   `SolveWorker`) for every later solve in the session, closing it in
-  `closeEvent`. `detect_poses()` (the old one-shot function) still exists as a
-  thin convenience wrapper around a throwaway `PoseEstimator` for callers that
-  really do only solve once.
+  `closeEvent`. (The old one-shot `detect_poses()` convenience wrapper this
+  superseded was later deleted once nothing called it anymore -- see the dead
+  code entry below.)
 - **Landmark visibility/confidence was discarded.** MediaPipe scores how
   visible each landmark is, but nothing carried that signal past detection --
   a hidden/occluded limb (PoseForge's own "hidden limb" caveat) failed
@@ -355,7 +383,31 @@ time each check ran, not guaranteed to stay true as the code changes.
   `127.0.0.1:8642` being unavailable. **Fixed**: added editable host/port
   fields in the UI, defaulting to `export.live_link.DEFAULT_HOST`/`DEFAULT_PORT`;
   `SendToBlenderWorker` now takes them as constructor arguments instead of
-  always using the module defaults.
+  always using the module defaults. (This was incomplete on its own -- see the
+  next entry.)
+- **The app-side Live Link port control above didn't work, because the
+  Blender add-on's listening port was still hardcoded.** Changing the port in
+  PoseCraft just pointed the client at a port Blender was never told to
+  listen on -- the send would silently fail with "could not reach Blender's
+  Live Link" for exactly the port-conflict scenario the app-side control was
+  built to solve. **Fixed**: `import_pose.py`'s `LIVE_LINK_PORT` constant
+  became `DEFAULT_LIVE_LINK_PORT`, and `_start_live_link_server()` now takes
+  a `port` argument read from a new `bpy.types.Scene.posecraft_live_link_port`
+  property, editable in the panel (locked while Live Link is already running,
+  since a bound socket's port can't change without restarting it) and
+  registered/unregistered alongside the add-on's operator classes. The host
+  stays fixed at `127.0.0.1` deliberately -- exposing this socket (arbitrary
+  bone rotations applied on request, no authentication) to other network
+  interfaces needs to be an explicit choice this add-on doesn't make for you,
+  not a side effect of a UI field. Not verified in a real Blender instance
+  (same caveat as the rest of this add-on, see "Known Issues") -- the fix is
+  a straightforward `bpy.props.IntProperty` plumbed through, but review it
+  there before trusting a non-default port works.
+- **`landmarker.detect_poses()` was dead code.** The one-shot convenience
+  wrapper it provided was fully superseded once `PoseEstimator` + `SolveWorker`
+  started handling caching directly in `main_window.py`; nothing in the app or
+  test suite called it anymore. **Fixed**: deleted it rather than leave an
+  untested, unused function as part of the module's API surface.
 - **The 3D viewport's camera was fixed** (`distance=3.0`, a fixed center),
   so an unusually large/small person or an extreme pose (crouching, arms flung
   wide) could render partially out of view. **Fixed**: `viewport_3d.py` now
@@ -363,6 +415,58 @@ time each check ran, not guaranteed to stay true as the code changes.
   call and reframes distance + center to it (`_compute_camera_frame`), while
   leaving elevation/azimuth alone so a manual camera rotation isn't reset on
   every solve. Verified with new tests in `test_viewport_camera.py`.
+- **Bone-name matching had no escape hatch when the auto-guess failed.**
+  Researching comparable Blender mocap add-ons (BlendArMocap, Open Mocap)
+  showed they all solve arbitrary custom rigs the same way: a saved manual
+  mapping, not just better name-guessing heuristics. `import_pose.py`'s
+  `NAME_CANDIDATES_TEMPLATES` guessing was the *only* option before this,
+  with no way to fix a mismatch other than renaming bones on your own rig.
+  **Fixed**: added a "Bone Mapping" section to the panel -- "Initialize/Refresh"
+  creates one row per PoseCraft bone name (`POSECRAFT_BONE_NAMES`, a
+  hand-maintained mirror of `retarget/skeleton.py::BONE_NAMES` since the
+  add-on can't import that package), each with a searchable target-bone
+  dropdown (`prop_search` against the armature's own bones); "Auto-Guess
+  Unset" pre-fills blank rows with the existing heuristic so only mismatches
+  need manual attention. Saved as a `CollectionProperty` on the armature
+  Object, so it persists with the .blend file. An explicit non-blank mapping
+  row always wins over the heuristic in `_resolve_bone_name()` -- even if the
+  named bone no longer exists (renamed/deleted since), in which case it's
+  reported unmatched rather than silently guessing something the user didn't
+  ask for. Verified: `tests/test_blender_addon_source.py` parses the add-on's
+  source with `ast` (rather than importing it, which needs `bpy`) to confirm
+  `POSECRAFT_BONE_NAMES` stays in sync with `skeleton.BONE_NAMES`, and that
+  the file is syntactically valid -- the actual Blender-side behavior (the
+  UI list, `prop_search`, property registration/persistence) is unverified in
+  a real Blender instance, same standing caveat as the rest of this add-on.
+- **Nothing was drawn on the photo, and the control panel had grown into one
+  flat, ungrouped stack of ~15 controls.** `DetectedPerson.image_landmarks_xy`
+  and `bone_confidence` were already computed but only used internally
+  (click-to-pick, JSON export flags) -- the photo panel showed the raw image
+  with no way to see detection quality in context, or which of several people
+  was currently selected, without looking at the separate 3D viewport.
+  Meanwhile every control from Load Photo through Send to Blender lived in
+  one undifferentiated `QVBoxLayout`. **Fixed**: added
+  `retarget/skeleton.py::image_joint_positions_2d()` (a 2D-image-space
+  analogue of `joint_positions()`, with a 2D-safe override for the `head`
+  bone's extrapolated top-of-skull point, since the 3D version's offset is a
+  3-component vector that doesn't apply to 2D coordinates) and wired it into
+  `PhotoView.paintEvent`: every detected person's skeleton now draws on the
+  photo, the selected person in a bright color on top (low-confidence bones
+  in a distinct warning color, reusing `blender_pose.LOW_CONFIDENCE_THRESHOLD`
+  so the photo view and the export agree on what counts as low-confidence),
+  everyone else dimmed underneath -- deliberately using each person's raw,
+  unmirrored landmarks and visibility regardless of the mirror checkbox,
+  since mirroring only relabels which exported bone name a side's data feeds,
+  it doesn't move anyone's arm in the photo (see `PhotoOverlayPerson`'s
+  docstring for why mirroring the overlay would actually be wrong, not just
+  unnecessary). Separately, the control panel is now four `QGroupBox`
+  sections ("1. Load & Detect", "2. Select Person", "3. Export", "4. Blender
+  Live Link") instead of one flat stack. Verified: `image_joint_positions_2d()`
+  has new tests in `test_retarget.py`; the overlay's actual drawing was
+  checked by grabbing a real rendered frame from a live `MainWindow` with
+  fake multi-person data (one person given deliberately low visibility) and
+  visually confirming the selected/unselected/low-confidence coloring all
+  render correctly (see "Verification").
 
 ## Known Issues
 
@@ -384,15 +488,19 @@ Ranked roughly by how much they affect whether an exported pose is usable:
   this has not been checked against real MediaPipe output in this dev
   environment (no working display was used to run the live solve loop
   end-to-end against a real photo).
-- **The Blender add-on -- both bone-name matching and the new Live Link
-  server -- is unverified against a real Blender install.**
+- **The Blender add-on -- bone-name matching, the manual Bone Mapping UI, and
+  the Live Link server -- is unverified against a real Blender install.**
   `NAME_CANDIDATES_TEMPLATES` in `import_pose.py` guesses at common Rigify
   naming patterns (`DEF-`, `ORG-`, `_fk`, `_ik`) but was never loaded into
-  Blender or run against an actual Rigify-generated armature; the Live Link
-  server's `bpy.app.timers`-based non-blocking accept loop is standard for
-  Blender add-ons but likewise only checked by code review, not a real run.
-  Check the add-on's unmatched-bone warning after your first real import and
-  extend the template list if your rig's names don't match.
+  Blender or run against an actual Rigify-generated armature; the manual
+  bone-mapping panel (`prop_search`, the `CollectionProperty` on `Object`,
+  the `UIList`) and the Live Link server's `bpy.app.timers`-based
+  non-blocking accept loop are likewise only checked by code review and a
+  source-level consistency test (`test_blender_addon_source.py`), not a real
+  run. Check the add-on's unmatched-bone warning after your first real import,
+  and use the Bone Mapping panel to fix any mismatch by hand -- that's the
+  whole reason it exists now, since extending the auto-guess template list is
+  a losing game against every possible rig's own naming convention.
 - **No code signing** on the built `.exe` -- expect SmartScreen to flag it as
   unrecognized on a machine other than the one it was built on.
 - **No automated release-build workflow** -- `.github/workflows/ci.yml` only
