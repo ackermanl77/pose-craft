@@ -396,22 +396,29 @@ class MainWindow(QMainWindow):
             for i, person in enumerate(self._people)
         ])
 
-    def _current_person_document_inputs(self):
-        index = self.person_combo.currentIndex()
-        landmarks = self._selected_landmarks()
-        if landmarks is None:
-            return None
-        visibility = self._people[index].visibility
-        if self.mirror_checkbox.isChecked():
-            # mirror_landmarks just swaps left/right rows -- it doesn't care that this
-            # array holds a visibility score per landmark instead of a 3D position, and
-            # it needs to be swapped the same way `landmarks` already was above, or the
-            # confidence for e.g. a mirrored thigh.L would report the ORIGINAL left leg's
-            # visibility instead of the real (now swapped-in) right leg's.
+    @staticmethod
+    def _document_inputs_for(landmarks: np.ndarray, visibility: np.ndarray, mirror: bool) -> tuple[dict, dict]:
+        """Shared by _current_person_document_inputs (the selected person) and
+        _on_export_all (every detected person): mirror_landmarks just swaps
+        left/right rows -- it doesn't care that `visibility` holds a score per
+        landmark instead of a 3D position, and it needs to be swapped the same
+        way `landmarks` is, or the confidence for e.g. a mirrored thigh.L would
+        report the ORIGINAL left leg's visibility instead of the real
+        (now swapped-in) right leg's.
+        """
+        if mirror:
+            landmarks = mirror_landmarks(landmarks)
             visibility = mirror_landmarks(visibility)
         rotations = solve_bone_rotations(landmarks)
         confidence = bone_confidence(visibility)
         return rotations, confidence
+
+    def _current_person_document_inputs(self):
+        index = self.person_combo.currentIndex()
+        if index < 0 or index >= len(self._people):
+            return None
+        person = self._people[index]
+        return self._document_inputs_for(person.landmarks, person.visibility, self.mirror_checkbox.isChecked())
 
     def _on_export_pose(self) -> None:
         inputs = self._current_person_document_inputs()
@@ -440,10 +447,7 @@ class MainWindow(QMainWindow):
         mirror = self.mirror_checkbox.isChecked()
 
         for index, person in enumerate(self._people):
-            landmarks = mirror_landmarks(person.landmarks) if mirror else person.landmarks
-            visibility = mirror_landmarks(person.visibility) if mirror else person.visibility
-            rotations = solve_bone_rotations(landmarks)
-            confidence = bone_confidence(visibility)
+            rotations, confidence = self._document_inputs_for(person.landmarks, person.visibility, mirror)
             path = Path(directory) / f"pose_person{index + 1}.json"
             save_pose_file(rotations, path, source_note="Exported from PoseCraft (batch)", bone_confidence=confidence)
 
