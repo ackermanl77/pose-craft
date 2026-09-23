@@ -72,6 +72,26 @@ def test_raised_arm_matches_expected_swing():
     assert np.linalg.norm(relative.as_rotvec()) < 1e-6
 
 
+def test_leaning_torso_keeps_thigh_local_rotation_near_identity():
+    """A whole-body rigid lean (torso and legs rotate together, no articulation
+    at the hip) should leave thigh.L/R's *local* (parent-relative) rotation near
+    identity -- it only changed because the parent (spine) did. Regression test
+    for thigh.L/R being parented to "spine" in BONES, matching upper_arm.L/R:
+    with parent=None instead, this local rotation incorrectly equaled the raw
+    world rotation, i.e. any torso lean falsely read as a hip kick on export.
+    """
+    landmarks = _t_pose_landmarks()
+    lean = Rotation.from_rotvec([np.pi / 6, 0.0, 0.0])  # 30 degree rigid lean
+    leaned = lean.apply(landmarks)
+
+    rotations = sk.solve_bone_rotations(leaned)
+
+    assert np.linalg.norm(rotations["spine"].as_rotvec()) > 0.1  # the lean itself is captured
+    for name in ("thigh.L", "thigh.R"):
+        angle = np.linalg.norm(rotations[name].as_rotvec())
+        assert angle < 1e-6, f"{name} expected ~identity local rotation, got rotvec angle {angle}"
+
+
 def _sample_image_landmarks_2d() -> np.ndarray:
     lm = np.zeros((sk.NUM_LANDMARKS, 2))
     lm[sk.LEFT_HIP] = [0.55, 0.5]
