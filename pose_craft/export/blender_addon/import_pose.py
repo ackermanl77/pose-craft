@@ -50,6 +50,7 @@ dev environment this was written in. See docs/PROJECT_STATUS.md's Known Issues.
 from __future__ import annotations
 
 import json
+import math
 import socket
 
 import bpy
@@ -78,6 +79,12 @@ POSECRAFT_BONE_NAMES = [
     "thigh.R", "shin.R", "foot.R",
 ]
 
+# Mirrors pose_craft/export/blender_pose.py::FORMAT_VERSION, for the same
+# reason POSECRAFT_BONE_NAMES mirrors BONE_NAMES above -- this add-on can't
+# import that package. A document whose version is newer than this add-on
+# understands is rejected rather than silently (mis)applied.
+MAX_SUPPORTED_FORMAT_VERSION = 1
+
 NAME_CANDIDATES_TEMPLATES = [
     "{name}",
     "DEF-{name}",
@@ -91,6 +98,9 @@ NAME_CANDIDATES_TEMPLATES = [
 LIVE_LINK_HOST = "127.0.0.1"
 DEFAULT_LIVE_LINK_PORT = 8642
 _POLL_INTERVAL_SECONDS = 0.2
+# Generous for a ~15-bone JSON document (a few KB); guards against a bogus or
+# hostile length header causing an unbounded read.
+MAX_LIVE_LINK_PAYLOAD_BYTES = 10 * 1024 * 1024
 
 # Live Link server state. Blender add-ons that need to survive across operator
 # calls conventionally keep this at module scope rather than on a class instance.
@@ -125,15 +135,45 @@ def _resolve_bone_name(armature_obj: bpy.types.Object, exported_name: str) -> st
     return _guess_bone_name(pose_bones, exported_name)
 
 
+def _validate_quaternion(exported_name: str, data: object) -> tuple[float, float, float, float]:
+    if not isinstance(data, dict):
+        raise ValueError(f"bone '{exported_name}': expected an object, got {type(data).__name__}")
+    values = data.get("quaternion_wxyz")
+    if not isinstance(values, (list, tuple)) or len(values) != 4:
+        raise ValueError(f"bone '{exported_name}': 'quaternion_wxyz' must be a 4-element list")
+    try:
+        w, x, y, z = (float(v) for v in values)
+    except (TypeError, ValueError):
+        raise ValueError(f"bone '{exported_name}': 'quaternion_wxyz' must contain 4 numbers") from None
+    if not all(math.isfinite(v) for v in (w, x, y, z)):
+        raise ValueError(f"bone '{exported_name}': 'quaternion_wxyz' must be finite, got {values}")
+    return w, x, y, z
+
+
 def apply_pose_document(armature_obj: bpy.types.Object, document: dict) -> tuple[list[str], list[str], list[str]]:
     """Returns (applied_bone_names, unmatched_bone_names, low_confidence_bone_names)."""
-    if document.get("format") != "pose_craft_pose":
+    if not isinstance(document, dict) or document.get("format") != "pose_craft_pose":
         raise ValueError("Not a PoseCraft pose file")
+
+    version = document.get("version")
+    if not isinstance(version, int) or version > MAX_SUPPORTED_FORMAT_VERSION:
+        raise ValueError(
+            f"Unsupported pose format version {version!r} (this add-on understands up to "
+            f"version {MAX_SUPPORTED_FORMAT_VERSION}); update the PoseCraft add-on."
+        )
+
+    bones = document.get("bones")
+    if not isinstance(bones, dict):
+        raise ValueError("Malformed pose file: 'bones' must be an object")
+
+    # Validate every bone's data before applying any of it, so a single bad
+    # entry aborts cleanly instead of leaving the armature half-posed.
+    quaternions = {name: _validate_quaternion(name, data) for name, data in bones.items()}
 
     pose_bones = armature_obj.pose.bones
     applied, unmatched, low_confidence = [], [], []
 
-    for exported_name, data in document["bones"].items():
+    for exported_name, (w, x, y, z) in quaternions.items():
         bone_name = _resolve_bone_name(armature_obj, exported_name)
         if bone_name is None:
             unmatched.append(exported_name)
@@ -141,10 +181,9 @@ def apply_pose_document(armature_obj: bpy.types.Object, document: dict) -> tuple
 
         pose_bone = pose_bones[bone_name]
         pose_bone.rotation_mode = "QUATERNION"
-        w, x, y, z = data["quaternion_wxyz"]
         pose_bone.rotation_quaternion = Quaternion((w, x, y, z))
         applied.append(bone_name)
-        if data.get("low_confidence"):
+        if bones[exported_name].get("low_confidence"):
             low_confidence.append(bone_name)
 
     return applied, unmatched, low_confidence
@@ -323,6 +362,8 @@ def _poll_live_link_server():
         conn.settimeout(2.0)
         header = _recv_exact(conn, 4)
         length = int.from_bytes(header, "big")
+        if length > MAX_LIVE_LINK_PAYLOAD_BYTES:
+            raise ValueError(f"payload length {length} exceeds max of {MAX_LIVE_LINK_PAYLOAD_BYTES} bytes")
         payload = _recv_exact(conn, length)
         document = json.loads(payload.decode("utf-8"))
 
@@ -332,7 +373,10 @@ def _poll_live_link_server():
         else:
             applied, unmatched, low_confidence = apply_pose_document(armature_obj, document)
             _live_link_status, _level = _summarize(applied, unmatched, low_confidence)
-    except (OSError, ValueError) as exc:
+    except Exception as exc:  # noqa: BLE001 - a bpy.app.timers callback must never
+        # raise: per Blender's contract an uncaught exception here silently
+        # unregisters the timer, so Live Link would stop accepting connections
+        # with no visible error while the panel still claims it's listening.
         _live_link_status = f"Error applying received pose: {exc}"
     finally:
         conn.close()

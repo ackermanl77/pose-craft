@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from pose_craft.export.blender_pose import FORMAT_VERSION
 from pose_craft.retarget.skeleton import BONE_NAMES
 
 ADDON_PATH = Path(__file__).resolve().parent.parent / "pose_craft" / "export" / "blender_addon" / "import_pose.py"
@@ -29,6 +30,15 @@ def test_addon_bone_names_match_skeleton_bone_names():
     would otherwise silently break the manual bone-mapping UI's row list.
     """
     assert _extract_top_level_constant("POSECRAFT_BONE_NAMES") == BONE_NAMES
+
+
+def test_addon_max_supported_format_version_matches_export_format_version():
+    """MAX_SUPPORTED_FORMAT_VERSION is a hand-maintained mirror of
+    blender_pose.FORMAT_VERSION, for the same reason POSECRAFT_BONE_NAMES
+    mirrors BONE_NAMES -- catches the add-on silently falling behind (and
+    rejecting every file/Live Link document) after a real format bump.
+    """
+    assert _extract_top_level_constant("MAX_SUPPORTED_FORMAT_VERSION") == FORMAT_VERSION
 
 
 def test_addon_source_is_syntactically_valid():
