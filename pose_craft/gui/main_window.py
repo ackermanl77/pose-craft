@@ -57,8 +57,9 @@ class SolveWorker(QThread):
         self._max_people = max_people
 
     def run(self) -> None:
+        estimator = self._estimator
+        newly_created = estimator is None
         try:
-            estimator = self._estimator
             if estimator is None:
                 model_path = ensure_model_downloaded(
                     "full", on_progress=lambda downloaded, total: self.progress.emit(downloaded, total)
@@ -67,6 +68,8 @@ class SolveWorker(QThread):
             people = estimator.detect(self._image_bgr)
             self.finished_ok.emit(people, estimator)
         except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
+            if newly_created and estimator is not None:
+                estimator.close()
             self.failed.emit(str(exc))
 
 
