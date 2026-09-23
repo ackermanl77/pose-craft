@@ -32,17 +32,25 @@ MODEL_URLS = {
 MIN_MODEL_BYTES = 1_000_000
 
 
+def model_cache_path(variant: str) -> Path:
+    """Where `variant`'s model file lives (or would be downloaded to), without
+    triggering a download -- lets a caller (e.g. the GUI, deciding whether a
+    cached PoseEstimator needs rebuilding for a newly-selected variant) check
+    which model a given variant name maps to without any network access.
+    """
+    if variant not in MODEL_URLS:
+        raise ValueError(f"unknown model variant {variant!r}, expected one of {list(MODEL_URLS)}")
+    return CACHE_DIR / f"pose_landmarker_{variant}.task"
+
+
 def ensure_model_downloaded(variant: str = "full", on_progress: Callable[[int, int], None] | None = None) -> Path:
     """on_progress(downloaded_bytes, total_bytes) is called periodically during an
     actual download (never for an already-cached model) so a caller on a UI thread
     can show progress instead of an indefinite "please wait" -- total_bytes may be
     0 if the server didn't send a Content-Length header.
     """
-    if variant not in MODEL_URLS:
-        raise ValueError(f"unknown model variant {variant!r}, expected one of {list(MODEL_URLS)}")
-
+    dest = model_cache_path(variant)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    dest = CACHE_DIR / f"pose_landmarker_{variant}.task"
     if dest.exists() and dest.stat().st_size >= MIN_MODEL_BYTES:
         return dest
 

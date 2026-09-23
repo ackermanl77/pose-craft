@@ -22,7 +22,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from pose_craft.estimation.landmarker import DetectedPerson, PoseEstimator, ensure_model_downloaded
+from pose_craft.estimation.landmarker import (
+    DetectedPerson,
+    PoseEstimator,
+    ensure_model_downloaded,
+    model_cache_path,
+)
 from pose_craft.export import live_link
 from pose_craft.export.blender_pose import build_pose_document, save_pose_file
 from pose_craft.export.live_link import send_pose_document
@@ -50,11 +55,19 @@ class SolveWorker(QThread):
     failed = Signal(str)
     progress = Signal(int, int)  # downloaded_bytes, total_bytes -- only during a real download
 
-    def __init__(self, image_bgr: np.ndarray, estimator: PoseEstimator | None, max_people: int, parent=None):
+    def __init__(
+        self,
+        image_bgr: np.ndarray,
+        estimator: PoseEstimator | None,
+        max_people: int,
+        model_variant: str,
+        parent=None,
+    ):
         super().__init__(parent)
         self._image_bgr = image_bgr
         self._estimator = estimator
         self._max_people = max_people
+        self._model_variant = model_variant
 
     def run(self) -> None:
         estimator = self._estimator
@@ -62,7 +75,7 @@ class SolveWorker(QThread):
         try:
             if estimator is None:
                 model_path = ensure_model_downloaded(
-                    "full", on_progress=lambda downloaded, total: self.progress.emit(downloaded, total)
+                    self._model_variant, on_progress=lambda downloaded, total: self.progress.emit(downloaded, total)
                 )
                 estimator = PoseEstimator(model_path, max_people=self._max_people)
             people = estimator.detect(self._image_bgr)
@@ -167,6 +180,19 @@ class MainWindow(QMainWindow):
         )
         max_people_row.addWidget(self.max_people_spin)
         layout.addLayout(max_people_row)
+
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("Model quality:"))
+        self.model_variant_combo = QComboBox()
+        self.model_variant_combo.addItems(["lite", "full", "heavy"])
+        self.model_variant_combo.setCurrentText("full")
+        self.model_variant_combo.setToolTip(
+            "lite is fastest and best for low-end machines; heavy is the most accurate "
+            "but slowest. Changing this after a solve rebuilds the pose model (and downloads "
+            "it on first use) on the next Solve Pose."
+        )
+        model_row.addWidget(self.model_variant_combo)
+        layout.addLayout(model_row)
 
         self.solve_btn = QPushButton("Solve Pose")
         self.solve_btn.clicked.connect(self._on_solve_pose)
@@ -302,19 +328,24 @@ class MainWindow(QMainWindow):
             return  # defense in depth -- solve_btn being disabled should already prevent this
 
         max_people = self.max_people_spin.value()
-        if self._estimator is not None and self._estimator.max_people != max_people:
-            # num_poses is baked into the MediaPipe graph at creation time -- changing
-            # the desired count means the cached estimator can't be reused as-is.
+        model_variant = self.model_variant_combo.currentText()
+        if self._estimator is not None and (
+            self._estimator.max_people != max_people or self._estimator.model_path != model_cache_path(model_variant)
+        ):
+            # num_poses and the model weights are both baked into the MediaPipe
+            # graph at creation time -- changing either means the cached
+            # estimator can't be reused as-is.
             self._estimator.close()
             self._estimator = None
 
         self.solve_btn.setEnabled(False)
         self.load_btn.setEnabled(False)  # a new photo mid-solve would let this solve's results land on it
         self.max_people_spin.setEnabled(False)
+        self.model_variant_combo.setEnabled(False)
         first_run_note = "" if self._estimator is not None else " (downloading model on first run may take a moment)"
         self.statusBar().showMessage(f"Solving pose...{first_run_note}")
 
-        self._worker = SolveWorker(self._image_bgr, self._estimator, max_people)
+        self._worker = SolveWorker(self._image_bgr, self._estimator, max_people, model_variant)
         self._worker.finished_ok.connect(self._on_solve_finished)
         self._worker.failed.connect(self._on_solve_failed)
         self._worker.progress.connect(self._on_solve_progress)
@@ -330,6 +361,7 @@ class MainWindow(QMainWindow):
         self.solve_btn.setEnabled(True)
         self.load_btn.setEnabled(True)
         self.max_people_spin.setEnabled(True)
+        self.model_variant_combo.setEnabled(True)
         self._people = people
         self._estimator = estimator
 
@@ -346,13 +378,20 @@ class MainWindow(QMainWindow):
         self.person_combo.setCurrentIndex(0)
 
         self.export_all_btn.setEnabled(True)
-        self.statusBar().showMessage(f"Solved {len(people)} pose(s)")
+        status = f"Solved {len(people)} pose(s)"
+        if len(people) >= estimator.max_people:
+            status += (
+                f" -- reached the max-people limit ({estimator.max_people}); "
+                "there may be more people in the photo than were detected"
+            )
+        self.statusBar().showMessage(status)
         self._update_preview_for_selected_person()
 
     def _on_solve_failed(self, message: str) -> None:
         self.solve_btn.setEnabled(True)
         self.load_btn.setEnabled(True)
         self.max_people_spin.setEnabled(True)
+        self.model_variant_combo.setEnabled(True)
         self.statusBar().showMessage("Solve failed")
         QMessageBox.critical(self, "Solve Pose", f"Pose solving failed:\n{message}")
 
