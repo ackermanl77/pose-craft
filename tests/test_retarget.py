@@ -208,3 +208,66 @@ def test_mirror_landmarks_swaps_left_and_right():
     assert np.array_equal(mirrored[sk.RIGHT_HIP], landmarks[sk.LEFT_HIP])
     # Mirroring twice returns the original.
     assert np.array_equal(sk.mirror_landmarks(mirrored), landmarks)
+
+
+def test_orientation_corrections_include_default_identity():
+    assert "Default" in sk.ORIENTATION_CORRECTIONS
+    assert np.linalg.norm(sk.ORIENTATION_CORRECTIONS["Default"].as_rotvec()) < 1e-9
+
+
+def test_apply_orientation_correction_only_changes_the_root_bone():
+    landmarks = _t_pose_landmarks()
+    rotations = sk.solve_bone_rotations(landmarks)
+
+    corrected = sk.apply_orientation_correction(rotations, sk.ORIENTATION_CORRECTIONS["Flip Upside-Down"])
+
+    # Every non-root bone's LOCAL (parent-relative) rotation is untouched -- a
+    # global re-orientation of the whole rigid skeleton doesn't change any
+    # joint's angle relative to its own parent.
+    for name in sk.BONE_NAMES:
+        if name == sk.ROOT_BONE:
+            continue
+        assert np.allclose(corrected[name].as_quat(), rotations[name].as_quat())
+
+    # The root bone's rotation is exactly the correction composed on top of
+    # the original solved root rotation.
+    expected_root = sk.ORIENTATION_CORRECTIONS["Flip Upside-Down"] * rotations[sk.ROOT_BONE]
+    relative = corrected[sk.ROOT_BONE] * expected_root.inv()
+    assert np.linalg.norm(relative.as_rotvec()) < 1e-9
+
+    # The original dict passed in is never mutated.
+    assert np.linalg.norm(rotations[sk.ROOT_BONE].as_rotvec()) < 1e-9
+
+
+def test_apply_orientation_correction_with_default_is_a_no_op():
+    landmarks = _t_pose_landmarks()
+    rotations = sk.solve_bone_rotations(landmarks)
+
+    corrected = sk.apply_orientation_correction(rotations, sk.ORIENTATION_CORRECTIONS["Default"])
+
+    for name in sk.BONE_NAMES:
+        assert np.allclose(corrected[name].as_quat(), rotations[name].as_quat())
+
+
+def test_apply_orientation_correction_rejects_unknown_root_bone():
+    with pytest.raises(KeyError):
+        sk.apply_orientation_correction({}, Rotation.identity(), root_bone="not_a_bone")
+
+
+def test_rotate_joint_positions_rotates_rigidly_about_the_pivot():
+    points = {
+        "spine.head": np.array([0.0, 0.0, 0.0]),
+        "spine.tail": np.array([0.0, 1.0, 0.0]),
+        "upper_arm.L.head": np.array([0.2, 0.5, 0.0]),
+    }
+    pivot = points["spine.head"]
+    correction = Rotation.from_euler("z", 180, degrees=True)  # "Flip Upside-Down"
+
+    rotated = sk.rotate_joint_positions(points, correction, pivot)
+
+    # The pivot itself never moves.
+    assert np.allclose(rotated["spine.head"], pivot)
+    # A point straight up from the pivot ends up straight down (180 about Z
+    # flips both X and Y).
+    assert np.allclose(rotated["spine.tail"], [0.0, -1.0, 0.0], atol=1e-9)
+    assert np.allclose(rotated["upper_arm.L.head"], [-0.2, -0.5, 0.0], atol=1e-9)

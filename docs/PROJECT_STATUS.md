@@ -98,6 +98,7 @@ differently.
 | Pose estimation, MediaPipe axis conversion, cached `PoseEstimator` | `pose_craft/estimation/landmarker.py` |
 | Bone retargeting math + per-bone confidence | `pose_craft/retarget/skeleton.py` |
 | Pose file format (write from the app, read by the add-on) | `pose_craft/export/blender_pose.py` |
+| Standard BVH export (own additive path, alongside the JSON/Live Link one) | `pose_craft/export/bvh_export.py` |
 | Live Blender link client (app side) | `pose_craft/export/live_link.py` |
 | Blender-side importer + Live Link server (install manually inside Blender, not via pip) | `pose_craft/export/blender_addon/import_pose.py` |
 | Unicode-safe image loading + pre-solve photo quality checks | `pose_craft/imaging.py` |
@@ -204,6 +205,82 @@ time each check ran, not guaranteed to stay true as the code changes.
 
 ## Recently Fixed
 
+- **The 3D viewport (the larger, primary preview checked right before
+  Export/Live Link) had no confidence indication at all**, unlike the 2D photo
+  overlay (`photo_view.py`), which already color-codes low-confidence bones but
+  has no on-screen legend explaining the colors, and the post-solve status
+  message never summarized how many bones came out low-confidence even though
+  `bone_confidence()` is computed right there. **Fixed**: `viewport_3d.py`'s
+  `show_skeleton()` gained an optional `confidence: dict[str, float] | None`
+  parameter (default `None` preserves the original single-`BONE_COLOR`
+  behavior exactly); when given, each bone segment below
+  `blender_pose.LOW_CONFIDENCE_THRESHOLD` is drawn in a new
+  `LOW_CONFIDENCE_BONE_COLOR` matching `photo_view.py`'s low-confidence color,
+  via a per-vertex color array on the single `GLLinePlotItem` (both endpoints
+  of a segment share a color, since GLLinePlotItem has no per-segment
+  primitive) -- the color math is pulled into a pure `_bone_line_colors()`
+  helper, the same pattern `_compute_camera_frame()` already used, so it's
+  testable without a real GL context. `main_window.py`'s
+  `_update_preview_for_selected_person()` passes the already-computed
+  `bone_confidence(person.visibility)` dict through. Added a muted-caption
+  `QLabel` legend under `photo_view` explaining the blue/orange color coding.
+  `_on_solve_finished()`'s status message now appends "-- N of M bones
+  low-confidence" (via a new pure `_low_confidence_status_suffix()` helper,
+  empty string when nothing is low) for the person selected right after a
+  solve, following the same append-onto-`status` pattern the max-people-limit
+  warning already used. Verified with new tests in `test_viewport_camera.py`
+  (`_bone_line_colors()`: with vs. without confidence data, threshold
+  boundary, missing-bone default) and `test_main_window_helpers.py`
+  (`_low_confidence_bone_count()`/`_low_confidence_status_suffix()`) --
+  `_update_preview_for_selected_person()`'s actual GL rendering call remains
+  untested by `pytest`, consistent with this project's existing convention of
+  keeping real OpenGL calls out of the automated suite (see "Verification").
+- **No user-facing way to fix an upside-down or wrong-facing pose, only
+  left/right mirroring.** "Known Issues" already flagged
+  `_mediapipe_world_to_engine()`'s axis convention as an unverified guess that
+  could come out upside-down or mirrored, but the mirror checkbox only ever
+  covered the left/right case. **Fixed**: `retarget/skeleton.py` gained
+  `ORIENTATION_CORRECTIONS` (Default / Flip Upside-Down / Rotate 90° Left /
+  Rotate 90° Right, engine-frame rotations) plus `apply_orientation_correction()`
+  (composes the chosen correction onto the solved root/"spine" bone's local
+  rotation -- the one bone whose local rotation is also its world rotation, so
+  this rigidly re-orients the whole skeleton without touching any other bone's
+  parent-relative angle) and `rotate_joint_positions()` (the position-space
+  equivalent, since the 3D viewport draws `joint_positions()` -- raw landmark
+  positions -- rather than anything forward-kinematics-derived from the
+  rotations dict). `gui/main_window.py` adds an "orientation_combo" next to the
+  mirror checkbox, live in the 3D preview (`_update_preview_for_selected_person`)
+  and composed into every export path (`_document_inputs_for`, now taking an
+  `orientation_correction` argument used by `_current_person_document_inputs`
+  and `_on_export_all` alike, so JSON/BVH/Live Link all agree with what's shown
+  on screen). Defaults to "Default" (identity), so existing behavior/exports
+  are unaffected until a user actually picks a correction. Verified with new
+  tests in `test_retarget.py` (the root-only-change guarantee, the pivot-based
+  position rotation) and `test_main_window_helpers.py` (the combo reaching the
+  exported rotations dict).
+- **No standard-interchange export, JSON/Live Link only.** Any tool other than
+  the companion Blender add-on (motion-capture viewers, game engines, other DCC
+  apps) had no way to consume a solved pose. **Fixed**: added
+  `export/bvh_export.py` (`build_bvh_document()`/`save_bvh_file()`), an
+  additive path alongside the existing JSON/Live Link one -- same 15-bone
+  hierarchy and rest directions as `retarget/skeleton.py`'s `BONES` table, a
+  new `BONE_LENGTHS_CM` table for BVH's required static joint OFFSETs (lengths
+  skeleton.py itself has no notion of, since it only ever compares directions
+  against real photo-derived positions), and a single-frame MOTION block with
+  each bone's local rotation converted to intrinsic Z/X/Y Euler angles
+  (`BVH_ROTATION_ORDER = "ZXY"`, matching the "Zrotation Xrotation Yrotation"
+  channel order it always writes). Documents its own explicit (currently
+  identity, since it targets the same Y-up/+X-right/+Z-forward convention as
+  the engine frame) axis conversion the same way `blender_pose.py`'s
+  `_ENGINE_TO_BLENDER_AXES` does, for the same reason: BVH has no single
+  universal up-axis convention across tools, unlike this project's Blender
+  target. Wired into `gui/main_window.py` as a new "Export BVH..." button next
+  to "Export Pose JSON...", reusing `_current_person_document_inputs()` so
+  mirroring and the new orientation-correction control above apply to it too.
+  Verified with new tests in `test_bvh_export.py`: HIERARCHY nesting (1 ROOT +
+  14 JOINT + 5 End Site, one per leaf bone, balanced braces), the MOTION
+  block's exact channel count (6 root + 14×3), and a known rotation surviving
+  a round trip through the written Euler values back into a `Rotation`.
 - **Model download wasn't atomic.** `ensure_model_downloaded()` only checked
   `dest.exists()`, so an interrupted first-run download left a corrupt file
   that got silently reused as "already downloaded" forever after. **Fixed**:
@@ -487,7 +564,12 @@ Ranked roughly by how much they affect whether an exported pose is usable:
   exported pose comes out upside-down or mirrored against the source photo --
   this has not been checked against real MediaPipe output in this dev
   environment (no working display was used to run the live solve loop
-  end-to-end against a real photo).
+  end-to-end against a real photo). The GUI now has a user-facing mitigation
+  for this specific failure mode (see "Recently Fixed" -- the orientation
+  combo next to the mirror checkbox), so an upside-down/wrong-facing result no
+  longer requires a code fix to work around, only picking the right dropdown
+  entry; it doesn't make the underlying axis-convention guess itself any more
+  verified.
 - **The Blender add-on -- bone-name matching, the manual Bone Mapping UI, and
   the Live Link server -- is unverified against a real Blender install.**
   `NAME_CANDIDATES_TEMPLATES` in `import_pose.py` guesses at common Rigify

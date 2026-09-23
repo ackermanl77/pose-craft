@@ -6,7 +6,13 @@ import pytest
 pytest.importorskip("PySide6")  # this module needs a real Qt install; CI's lightweight venv skips it
 
 from pose_craft.estimation.landmarker import DetectedPerson  # noqa: E402
-from pose_craft.gui.main_window import MainWindow, _nearest_person_index  # noqa: E402
+from pose_craft.export.blender_pose import LOW_CONFIDENCE_THRESHOLD  # noqa: E402
+from pose_craft.gui.main_window import (  # noqa: E402
+    MainWindow,
+    _low_confidence_bone_count,
+    _low_confidence_status_suffix,
+    _nearest_person_index,
+)
 from pose_craft.retarget import skeleton as sk  # noqa: E402
 
 
@@ -24,6 +30,44 @@ def test_nearest_person_index_picks_closest_centroid():
     assert _nearest_person_index(people, 0.12, 0.48) == 0
     assert _nearest_person_index(people, 0.85, 0.5) == 1
     assert _nearest_person_index(people, 0.5, 0.05) == 2
+
+
+def test_low_confidence_bone_count_counts_only_bones_below_threshold():
+    confidence = {name: 1.0 for name in sk.BONE_NAMES}
+    confidence["hand.L"] = LOW_CONFIDENCE_THRESHOLD - 0.01
+    confidence["foot.R"] = LOW_CONFIDENCE_THRESHOLD - 0.01
+
+    assert _low_confidence_bone_count(confidence) == 2
+
+
+def test_low_confidence_bone_count_is_zero_when_every_bone_is_confident():
+    confidence = {name: 1.0 for name in sk.BONE_NAMES}
+    assert _low_confidence_bone_count(confidence) == 0
+
+
+def test_low_confidence_bone_count_boundary_is_exclusive():
+    """bone_confidence scores strictly below the threshold count as low -- a score
+    exactly at the threshold does not (matches photo_view.py's `< LOW_CONFIDENCE_THRESHOLD`
+    and blender_pose.py's own low_confidence flag, both strict-less-than).
+    """
+    confidence = {name: 1.0 for name in sk.BONE_NAMES}
+    confidence["spine"] = LOW_CONFIDENCE_THRESHOLD
+    assert _low_confidence_bone_count(confidence) == 0
+
+
+def test_low_confidence_status_suffix_empty_when_nothing_is_low():
+    confidence = {name: 1.0 for name in sk.BONE_NAMES}
+    assert _low_confidence_status_suffix(confidence) == ""
+
+
+def test_low_confidence_status_suffix_reports_count_and_total():
+    confidence = {name: 1.0 for name in sk.BONE_NAMES}
+    confidence["hand.L"] = 0.1
+    confidence["foot.R"] = 0.1
+
+    suffix = _low_confidence_status_suffix(confidence)
+
+    assert suffix == f" -- 2 of {len(sk.BONE_NAMES)} bones low-confidence"
 
 
 @pytest.fixture(scope="module")
@@ -63,5 +107,59 @@ def test_mirrored_confidence_matches_the_landmark_data_actually_used(qapp):
         # original left leg's (high) visibility.
         assert confidence["thigh.L"] == pytest.approx(0.05)
         assert confidence["thigh.R"] == pytest.approx(1.0)
+    finally:
+        window.close()
+
+
+def test_orientation_combo_defaults_to_no_change(qapp):
+    """The "Default" entry must be identity so existing behavior (and every
+    other test/export path) is unaffected by the new control out of the box.
+    """
+    window = MainWindow()
+    try:
+        assert window.orientation_combo.currentText() == "Default"
+        assert np.linalg.norm(window._orientation_correction().as_rotvec()) < 1e-9
+    finally:
+        window.close()
+
+
+def test_orientation_correction_is_applied_to_the_exported_rotations(qapp):
+    """Selecting a body-orientation fix must reach the rotations dict used for
+    JSON/BVH/Live Link export -- the same composed-onto-root-bone effect
+    skeleton.apply_orientation_correction documents.
+    """
+    landmarks = np.zeros((sk.NUM_LANDMARKS, 3))
+    landmarks[sk.LEFT_HIP], landmarks[sk.RIGHT_HIP] = [0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]
+    landmarks[sk.LEFT_SHOULDER], landmarks[sk.RIGHT_SHOULDER] = [0.2, 0.5, 0.0], [-0.2, 0.5, 0.0]
+
+    person = DetectedPerson(
+        landmarks=landmarks,
+        image_landmarks_xy=np.zeros((sk.NUM_LANDMARKS, 2)),
+        visibility=np.ones(sk.NUM_LANDMARKS),
+    )
+
+    window = MainWindow()
+    try:
+        window._people = [person]
+        window.person_combo.addItem("Person 1")
+
+        baseline_rotations, _ = window._current_person_document_inputs()
+
+        index = window.orientation_combo.findText("Flip Upside-Down")
+        assert index >= 0
+        window.orientation_combo.setCurrentIndex(index)
+
+        corrected_rotations, _ = window._current_person_document_inputs()
+
+        expected_spine = sk.ORIENTATION_CORRECTIONS["Flip Upside-Down"] * baseline_rotations["spine"]
+        relative = corrected_rotations["spine"] * expected_spine.inv()
+        assert np.linalg.norm(relative.as_rotvec()) < 1e-6
+
+        # Every other bone's local rotation is unaffected, same as
+        # apply_orientation_correction's own guarantee.
+        for name in sk.BONE_NAMES:
+            if name == "spine":
+                continue
+            assert np.allclose(corrected_rotations[name].as_quat(), baseline_rotations[name].as_quat())
     finally:
         window.close()

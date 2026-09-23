@@ -29,16 +29,20 @@ from pose_craft.estimation.landmarker import (
     model_cache_path,
 )
 from pose_craft.export import live_link
-from pose_craft.export.blender_pose import build_pose_document, save_pose_file
+from pose_craft.export.blender_pose import LOW_CONFIDENCE_THRESHOLD, build_pose_document, save_pose_file
+from pose_craft.export.bvh_export import save_bvh_file
 from pose_craft.export.live_link import send_pose_document
 from pose_craft.gui.photo_view import PhotoOverlayPerson, PhotoView
 from pose_craft.gui.viewport_3d import SkeletonViewport
 from pose_craft.imaging import PHOTO_GUIDANCE, assess_photo_quality, imread_unicode
 from pose_craft.retarget.skeleton import (
+    ORIENTATION_CORRECTIONS,
+    apply_orientation_correction,
     bone_confidence,
     image_joint_positions_2d,
     joint_positions,
     mirror_landmarks,
+    rotate_joint_positions,
     solve_bone_rotations,
 )
 
@@ -115,6 +119,29 @@ def _nearest_person_index(people: list[DetectedPerson], x: float, y: float) -> i
     return int(np.argmin(distances))
 
 
+def _low_confidence_bone_count(confidence: dict[str, float]) -> int:
+    """How many bones in a bone_confidence() dict fall below
+    blender_pose.LOW_CONFIDENCE_THRESHOLD -- the same threshold the photo overlay and the
+    3D viewport use to color a bone as low-confidence. A plain function (rather than a
+    method) so the post-solve status message logic can be exercised directly without a
+    real solve or Qt widgets.
+    """
+    return sum(1 for score in confidence.values() if score < LOW_CONFIDENCE_THRESHOLD)
+
+
+def _low_confidence_status_suffix(confidence: dict[str, float]) -> str:
+    """The post-solve status message's low-confidence note (appended to "Solved N
+    pose(s)" the same way the max-people-limit warning already is), pulled out as its
+    own pure function -- like _low_confidence_bone_count above -- so the exact wording
+    is testable without a real solve or Qt widgets. "" (nothing appended) when no bone
+    is low-confidence.
+    """
+    low_count = _low_confidence_bone_count(confidence)
+    if low_count == 0:
+        return ""
+    return f" -- {low_count} of {len(confidence)} bones low-confidence"
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -140,6 +167,10 @@ class MainWindow(QMainWindow):
         self.photo_view = PhotoView()
         self.photo_view.clicked_normalized.connect(self._on_photo_clicked)
         left.addWidget(self.photo_view)
+
+        legend_label = QLabel("\U0001F535 Normal confidence   \U0001F7E0 Low confidence — may need manual correction")
+        legend_label.setStyleSheet("color: #888; font-size: 11px;")
+        left.addWidget(legend_label)
 
         left.addWidget(self._build_detect_group())
         left.addWidget(self._build_person_group())
@@ -217,6 +248,20 @@ class MainWindow(QMainWindow):
         self.mirror_checkbox.stateChanged.connect(self._on_person_changed)
         layout.addWidget(self.mirror_checkbox)
 
+        orientation_row = QHBoxLayout()
+        orientation_row.addWidget(QLabel("Body orientation fix:"))
+        self.orientation_combo = QComboBox()
+        self.orientation_combo.addItems(list(ORIENTATION_CORRECTIONS.keys()))
+        self.orientation_combo.setToolTip(
+            "If the solved pose comes out upside-down or facing the wrong way -- see "
+            "_mediapipe_world_to_engine()'s axis-convention caveat -- pick the correction "
+            "that fixes it. Applied as an extra rotation on top of the solved pose, live in "
+            "the 3D preview and in every export."
+        )
+        self.orientation_combo.currentIndexChanged.connect(self._on_person_changed)
+        orientation_row.addWidget(self.orientation_combo)
+        layout.addLayout(orientation_row)
+
         return group
 
     def _build_export_group(self) -> QGroupBox:
@@ -232,6 +277,11 @@ class MainWindow(QMainWindow):
         self.export_all_btn.clicked.connect(self._on_export_all)
         self.export_all_btn.setEnabled(False)
         layout.addWidget(self.export_all_btn)
+
+        self.export_bvh_btn = QPushButton("Export BVH...")
+        self.export_bvh_btn.clicked.connect(self._on_export_bvh)
+        self.export_bvh_btn.setEnabled(False)
+        layout.addWidget(self.export_bvh_btn)
 
         return group
 
@@ -304,6 +354,7 @@ class MainWindow(QMainWindow):
         self.solve_btn.setEnabled(True)
         self.export_btn.setEnabled(False)
         self.export_all_btn.setEnabled(False)
+        self.export_bvh_btn.setEnabled(False)
         self.send_to_blender_btn.setEnabled(False)
         self.person_combo.clear()
         self._people = []
@@ -384,6 +435,11 @@ class MainWindow(QMainWindow):
                 f" -- reached the max-people limit ({estimator.max_people}); "
                 "there may be more people in the photo than were detected"
             )
+        # person_combo.setCurrentIndex(0) above selects the previewed person; summarize
+        # that person's bone confidence here too, next to it, following the same
+        # append-onto-`status` pattern the max-people warning above already uses.
+        previewed_confidence = bone_confidence(people[self.person_combo.currentIndex()].visibility)
+        status += _low_confidence_status_suffix(previewed_confidence)
         self.statusBar().showMessage(status)
         self._update_preview_for_selected_person()
 
@@ -413,19 +469,31 @@ class MainWindow(QMainWindow):
             landmarks = mirror_landmarks(landmarks)
         return landmarks
 
+    def _orientation_correction(self):
+        return ORIENTATION_CORRECTIONS[self.orientation_combo.currentText()]
+
     def _update_preview_for_selected_person(self) -> None:
         landmarks = self._selected_landmarks()
         if landmarks is None:
             self.export_btn.setEnabled(False)
+            self.export_bvh_btn.setEnabled(False)
             self.send_to_blender_btn.setEnabled(False)
             self.photo_view.set_skeleton_overlay([])
             return
 
-        self.viewport.show_skeleton(joint_positions(landmarks))
+        positions = joint_positions(landmarks)
+        # Same body-orientation fix applied to the exported rotations below, kept
+        # live in the 3D preview -- joint_positions() works directly off raw
+        # landmark positions (not a rotations dict), so the correction has to be
+        # applied as a position-space rotation here rather than reused as-is.
+        positions = rotate_joint_positions(positions, self._orientation_correction(), pivot=positions["spine.head"])
+        selected_index = self.person_combo.currentIndex()
+        selected_confidence = bone_confidence(self._people[selected_index].visibility) if selected_index >= 0 else None
+        self.viewport.show_skeleton(positions, confidence=selected_confidence)
         self.export_btn.setEnabled(True)
+        self.export_bvh_btn.setEnabled(True)
         self.send_to_blender_btn.setEnabled(True)
 
-        selected_index = self.person_combo.currentIndex()
         self.photo_view.set_skeleton_overlay([
             PhotoOverlayPerson(
                 joints_2d=image_joint_positions_2d(person.image_landmarks_xy),
@@ -436,7 +504,9 @@ class MainWindow(QMainWindow):
         ])
 
     @staticmethod
-    def _document_inputs_for(landmarks: np.ndarray, visibility: np.ndarray, mirror: bool) -> tuple[dict, dict]:
+    def _document_inputs_for(
+        landmarks: np.ndarray, visibility: np.ndarray, mirror: bool, orientation_correction=None
+    ) -> tuple[dict, dict]:
         """Shared by _current_person_document_inputs (the selected person) and
         _on_export_all (every detected person): mirror_landmarks just swaps
         left/right rows -- it doesn't care that `visibility` holds a score per
@@ -444,11 +514,19 @@ class MainWindow(QMainWindow):
         way `landmarks` is, or the confidence for e.g. a mirrored thigh.L would
         report the ORIGINAL left leg's visibility instead of the real
         (now swapped-in) right leg's.
+
+        orientation_correction (a scipy Rotation, or None for no change) is the
+        same body-orientation fix applied live in the 3D preview -- see
+        skeleton.apply_orientation_correction -- composed onto the root bone's
+        rotation so every export (JSON, BVH, Live Link) agrees with what's shown
+        on screen.
         """
         if mirror:
             landmarks = mirror_landmarks(landmarks)
             visibility = mirror_landmarks(visibility)
         rotations = solve_bone_rotations(landmarks)
+        if orientation_correction is not None:
+            rotations = apply_orientation_correction(rotations, orientation_correction)
         confidence = bone_confidence(visibility)
         return rotations, confidence
 
@@ -457,7 +535,9 @@ class MainWindow(QMainWindow):
         if index < 0 or index >= len(self._people):
             return None
         person = self._people[index]
-        return self._document_inputs_for(person.landmarks, person.visibility, self.mirror_checkbox.isChecked())
+        return self._document_inputs_for(
+            person.landmarks, person.visibility, self.mirror_checkbox.isChecked(), self._orientation_correction()
+        )
 
     def _on_export_pose(self) -> None:
         inputs = self._current_person_document_inputs()
@@ -480,17 +560,34 @@ class MainWindow(QMainWindow):
         if not directory:
             return
 
-        # Mirror is a property of the camera/photo orientation, not of one person, so
-        # it applies to every person in a group photo the same way single-person
-        # export already applies it via _selected_landmarks().
+        # Mirror and the orientation fix are both properties of the camera/photo,
+        # not of one person, so they apply to every person in a group photo the
+        # same way single-person export already applies them via
+        # _current_person_document_inputs().
         mirror = self.mirror_checkbox.isChecked()
+        orientation_correction = self._orientation_correction()
 
         for index, person in enumerate(self._people):
-            rotations, confidence = self._document_inputs_for(person.landmarks, person.visibility, mirror)
+            rotations, confidence = self._document_inputs_for(
+                person.landmarks, person.visibility, mirror, orientation_correction
+            )
             path = Path(directory) / f"pose_person{index + 1}.json"
             save_pose_file(rotations, path, source_note="Exported from PoseCraft (batch)", bone_confidence=confidence)
 
         self.statusBar().showMessage(f"Exported {len(self._people)} pose(s) to {directory}")
+
+    def _on_export_bvh(self) -> None:
+        inputs = self._current_person_document_inputs()
+        if inputs is None:
+            return
+        rotations, _confidence = inputs
+
+        path, _ = QFileDialog.getSaveFileName(self, "Export BVH", "pose.bvh", "BVH (*.bvh)")
+        if not path:
+            return
+
+        save_bvh_file(rotations, path)
+        self.statusBar().showMessage(f"Exported BVH to {path}")
 
     def _on_send_to_blender(self) -> None:
         if self._send_worker is not None and self._send_worker.isRunning():

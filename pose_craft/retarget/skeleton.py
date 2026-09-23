@@ -273,6 +273,66 @@ def mirror_landmarks(landmarks: np.ndarray) -> np.ndarray:
     return mirrored
 
 
+# The one bone with parent=None -- see apply_orientation_correction.
+ROOT_BONE = BONES[0].name
+
+# Global orientation-correction candidates for the "body orientation / floor
+# contact" GUI control (gui/main_window.py's orientation_combo, next to the
+# mirror checkbox). _mediapipe_world_to_engine() in estimation/landmarker.py
+# documents its axis convention as an unverified guess -- these cover the
+# plausible ways that guess could be wrong (upside-down, or facing 90 degrees
+# off) as one-click fixes, the same "small, live-preview" shape the mirror
+# checkbox already provides for a left/right swap. All rotations are in the
+# engine frame (Y-up, +X right, +Z toward camera).
+ORIENTATION_CORRECTIONS: dict[str, Rotation] = {
+    "Default": Rotation.identity(),
+    "Flip Upside-Down": Rotation.from_euler("z", 180, degrees=True),
+    "Rotate 90° Left": Rotation.from_euler("y", 90, degrees=True),
+    "Rotate 90° Right": Rotation.from_euler("y", -90, degrees=True),
+}
+
+
+def apply_orientation_correction(
+    local_rotations: dict[str, Rotation], correction: Rotation, root_bone: str = ROOT_BONE
+) -> dict[str, Rotation]:
+    """Composes a global re-orientation `correction` onto the already-solved
+    root bone's LOCAL rotation.
+
+    `root_bone` (parent=None in BONES) has no parent to be relative to, so its
+    local rotation already IS its world rotation -- left-multiplying just that
+    one entry by `correction` rigidly re-orients the whole solved skeleton
+    without touching any other bone's parent-relative angle (a global rotation
+    of a rigid hierarchy leaves every child's relative-to-parent angle
+    unchanged; only the root's absolute orientation changes). Returns a new
+    dict; `local_rotations` is left untouched. Meant to be applied right after
+    solve_bone_rotations(), before the result reaches the 3D viewport preview
+    or build_pose_document()/save_pose_file() -- see gui/main_window.py.
+    """
+    if root_bone not in local_rotations:
+        raise KeyError(f"unknown root bone {root_bone!r}")
+    corrected = dict(local_rotations)
+    corrected[root_bone] = correction * local_rotations[root_bone]
+    return corrected
+
+
+def rotate_joint_positions(
+    points: dict[str, np.ndarray], correction: Rotation, pivot: np.ndarray
+) -> dict[str, np.ndarray]:
+    """Rigidly rotates every point in a joint_positions()-style dict about
+    `pivot` by `correction` -- the position-space equivalent of
+    apply_orientation_correction, for the 3D viewport preview.
+
+    joint_positions() derives every point directly from raw landmark
+    positions rather than by forward-kinematics from solved rotations, so
+    there is no rotations dict for the viewport to consume in the first
+    place; rotating the already-computed positions about a fixed pivot (the
+    hip center, i.e. points["spine.head"]) produces the same rigid
+    re-orientation visually that apply_orientation_correction produces for
+    the exported rotations.
+    """
+    return {name: pivot + correction.apply(point - pivot) for name, point in points.items()}
+
+
 def solve_bone_rotations(landmarks: np.ndarray) -> dict[str, Rotation]:
     """Computes each bone's world-space rotation from a (33, 3) landmark array in
     the engine frame (see module docstring): swing for every bone, plus solved
