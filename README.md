@@ -17,6 +17,9 @@ the Live Link.
 - `docs/PROJECT_STATUS.md` is the authoritative reference for architecture,
   entry points, and known issues -- this README only covers day-to-day
   commands.
+- New to the app itself? [docs/USER_GUIDE.md](docs/USER_GUIDE.md) walks
+  through every screen and control, feature by feature, for both the desktop
+  app and the Blender add-on.
 
 ## Install
 
