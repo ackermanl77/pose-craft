@@ -432,6 +432,16 @@ class MainWindow(QMainWindow):
         self._estimator = estimator
 
         if not people:
+            # Clear everything the previous solve left behind -- the person list,
+            # photo overlay, 3D skeleton and export buttons all still referred to
+            # people from the last solve, which no longer exist.
+            self.person_combo.blockSignals(True)
+            self.person_combo.clear()
+            self.person_combo.blockSignals(False)
+            self.viewport.clear_skeleton()
+            self.photo_view.set_skeleton_overlay([])
+            for button in (self.export_btn, self.export_all_btn, self.export_bvh_btn, self.send_to_blender_btn):
+                button.setEnabled(False)
             self.statusBar().showMessage(f"No person detected in this photo (ran on {estimator.device})")
             QMessageBox.information(self, "Solve Pose", "No person was detected in this photo.")
             return

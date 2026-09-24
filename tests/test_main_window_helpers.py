@@ -163,3 +163,49 @@ def test_orientation_correction_is_applied_to_the_exported_rotations(qapp):
             assert np.allclose(corrected_rotations[name].as_quat(), baseline_rotations[name].as_quat())
     finally:
         window.close()
+
+
+class _FakeEstimator:
+    device = "CPU"
+    max_people = 4
+
+    def close(self) -> None:
+        pass
+
+
+def _standing_person() -> DetectedPerson:
+    landmarks = np.zeros((sk.NUM_LANDMARKS, 3))
+    landmarks[sk.LEFT_HIP], landmarks[sk.RIGHT_HIP] = [0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]
+    landmarks[sk.LEFT_SHOULDER], landmarks[sk.RIGHT_SHOULDER] = [0.2, 0.5, 0.0], [-0.2, 0.5, 0.0]
+    return DetectedPerson(
+        landmarks=landmarks,
+        image_landmarks_xy=np.full((sk.NUM_LANDMARKS, 2), 0.5),
+        visibility=np.ones(sk.NUM_LANDMARKS),
+    )
+
+
+def test_resolve_that_finds_nobody_clears_the_previous_result(qapp, monkeypatch):
+    """Regression test: a re-solve that detected nobody used to return early
+    with the previous solve's person list, photo overlay and 3D skeleton still
+    showing, and every export button still enabled for those stale people."""
+    from pose_craft.gui import main_window as mw
+
+    monkeypatch.setattr(mw.QMessageBox, "information", lambda *args, **kwargs: None)
+    window = MainWindow()
+    try:
+        window._on_solve_finished([_standing_person()], _FakeEstimator())
+        assert window.person_combo.count() == 1
+        assert window.export_btn.isEnabled() and window.export_all_btn.isEnabled()
+        assert window.viewport._bone_lines is not None
+        assert window.photo_view._overlay_people
+
+        window._on_solve_finished([], _FakeEstimator())
+
+        assert window.person_combo.count() == 0
+        assert window._people == []
+        assert window.viewport._bone_lines is None and window.viewport._joints is None
+        assert window.photo_view._overlay_people == []
+        for button in (window.export_btn, window.export_all_btn, window.export_bvh_btn, window.send_to_blender_btn):
+            assert not button.isEnabled()
+    finally:
+        window.close()
