@@ -9,7 +9,8 @@ the Live Link.
 
 ## Current Status
 
-- MVP stage: the full pipeline (photo -> MediaPipe pose estimation -> bone
+- MVP stage: the full pipeline (photo -> pose estimation (MediaPipe's BlazePose
+  models on ONNX Runtime, GPU-accelerated on NVIDIA cards) -> bone
   retargeting -> JSON export or live Blender link -> Blender add-on) is
   implemented and the `.exe` builds and launches, but the Blender add-on and
   the real-photo accuracy of the retargeting have not been verified end to
@@ -23,7 +24,7 @@ the Live Link.
 
 ## Install
 
-MediaPipe and PySide6 ship wheels that can lag behind the newest CPython
+PySide6 and ONNX Runtime ship wheels that can lag behind the newest CPython
 release; if `pip install` can't find a match for your interpreter, use a
 3.10-3.12 venv instead (`py -0` on Windows lists what's installed):
 
@@ -31,7 +32,14 @@ release; if `pip install` can't find a match for your interpreter, use a
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
+pip install -r requirements-gpu.txt   # optional: NVIDIA GPU acceleration
 ```
+
+`requirements-gpu.txt` adds the CUDA 13 runtime and cuDNN as pip packages, so
+an NVIDIA GPU (RTX 20-series or newer, including RTX 40/50) only needs a
+current driver -- no CUDA Toolkit install. Without it everything still works,
+on the CPU. The **Use GPU** checkbox under Solve Pose toggles it, and the
+status bar says which device each solve actually ran on.
 
 `requirements.txt` is pinned to known-working versions; if you deliberately
 want the latest of everything instead, drop the `==` pins.
@@ -45,8 +53,8 @@ python -m pose_craft.app
 Load a photo (a resolution/framing warning pops up if it's likely to give a
 worse result -- see the tips under the Load Photo button), optionally raise
 "Max people to detect" above its default of 4 for a bigger group photo, then
-click **Solve Pose** (downloads the MediaPipe model to
-`~/.cache/pose_craft/models` on first run -- needs network access once, cached
+click **Solve Pose** (downloads MediaPipe's pose model to
+`~/.cache/pose_craft/models` on first run and converts it to ONNX next to it -- needs network access once, cached
 after that, with a live download percentage in the status bar). Every
 detected person's skeleton is drawn directly on the photo -- the selected
 person in a bright color (their low-confidence joints, likely occluded in
@@ -94,16 +102,17 @@ you've changed `assets/icon.png`/`assets/icon.ico`.
 pytest
 ```
 
-Needs `requirements-test.txt` (numpy/scipy/opencv-python-headless/pytest, not
-the full mediapipe/Qt stack) -- covers the bone retargeting math, the Blender
-axis-conversion math, the atomic model-download logic, unicode-safe image
-loading, and the Live Link wire protocol. `.github/workflows/ci.yml` runs this
+Needs `requirements-test.txt` (numpy/scipy/opencv-python-headless/pytest plus
+CPU onnxruntime/onnx/tflite, not the Qt stack or the GPU runtime) -- covers the
+bone retargeting math, the Blender axis-conversion math, the atomic
+model-download logic, the pose pipeline's pre/post-processing and the model
+converter, unicode-safe image loading, and the Live Link wire protocol. `.github/workflows/ci.yml` runs this
 same lightweight suite on every push/PR. See `docs/PROJECT_STATUS.md`'s
 "Verification" section for what is and isn't covered by an automated test
 today.
 
 See [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) for architecture, and its
 "Known Issues" section before relying on an exported pose -- twist is only
-solved for the hands (everything else stays at identity), the MediaPipe axis
+solved for the hands (everything else stays at identity), the world-landmark axis
 convention is an unverified best guess, and the Blender add-on (including the
 new Live Link server) hasn't been checked against a real Blender install or rig.

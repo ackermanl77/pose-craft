@@ -1,11 +1,17 @@
-"""Wraps MediaPipe's Pose Landmarker task: photo -> one 33-landmark 3D skeleton per
-detected person, converted into the engine's Y-up coordinate frame (see
-retarget/skeleton.py's module docstring).
+"""Photo -> one 33-landmark 3D skeleton per detected person, converted into the
+engine's Y-up coordinate frame (see retarget/skeleton.py's module docstring).
+
+Uses MediaPipe's Pose Landmarker models (BlazePose), run on ONNX Runtime rather
+than the mediapipe package: MediaPipe's Windows build is CPU-only, while ONNX
+Runtime's CUDA provider runs the same models on an NVIDIA GPU. See
+onnx_pose.py for the re-implemented pipeline and tflite_to_onnx.py for the
+model conversion.
 
 The pose-landmarker model isn't bundled with this repo (it's a multi-MB binary).
-`ensure_model_downloaded` fetches it to a local cache directory the first time
-the app runs, the same "downloads what it needs on first run" behavior PoseForge
-describes for its own weights.
+`ensure_model_downloaded` fetches MediaPipe's official `.task` bundle to a local
+cache directory the first time the app runs, the same "downloads what it needs
+on first run" behavior PoseForge describes for its own weights; it's converted
+to ONNX next to it on first use (`ensure_onnx_models`).
 """
 from __future__ import annotations
 
@@ -90,51 +96,74 @@ def ensure_model_downloaded(variant: str = "full", on_progress: Callable[[int, i
 class DetectedPerson:
     landmarks: np.ndarray  # (33, 3) in the engine's Y-up frame
     image_landmarks_xy: np.ndarray  # (33, 2) normalized [0, 1] image-space x/y, for click-to-select
-    visibility: np.ndarray  # (33,) MediaPipe's per-landmark visibility score, 0..1
+    visibility: np.ndarray  # (33,) BlazePose's per-landmark visibility score, 0..1
 
     def centroid_xy(self) -> tuple[float, float]:
         return float(np.mean(self.image_landmarks_xy[:, 0])), float(np.mean(self.image_landmarks_xy[:, 1]))
 
 
-def _mediapipe_world_to_engine(world_landmarks) -> np.ndarray:
-    """Converts MediaPipe's world-landmark list to the engine's Y-up, +Z-toward-camera frame.
+def _world_to_engine(world_landmarks: np.ndarray) -> np.ndarray:
+    """Converts BlazePose world landmarks ((33, 3) meters, origin at the hip
+    midpoint, in MediaPipe's world frame) to the engine's Y-up, +Z-toward-camera frame.
 
     MediaPipe documents world landmarks as real-world-scale meters with the origin
     at the hip midpoint, but is not fully explicit about axis direction across
     versions. This mapping (flip Y, keep X/Z) matches the commonly observed output
-    where MediaPipe's raw Y increases downward like image coordinates. If an
-    exported pose comes out upside-down or mirrored, this is the one function to fix.
+    where the raw Y increases downward like image coordinates. If an exported pose
+    comes out upside-down or mirrored, this is the one function to fix.
     """
-    points = np.array([[lm.x, -lm.y, lm.z] for lm in world_landmarks], dtype=np.float64)
+    points = np.array(world_landmarks, dtype=np.float64)
+    points[:, 1] = -points[:, 1]
     return points
 
 
+def onnx_model_paths(model_path: Path) -> dict[str, Path]:
+    """Where the ONNX conversions of a downloaded `.task` bundle are cached (next
+    to it). The converter version is part of the name so a converter fix
+    invalidates stale conversions instead of silently reusing them."""
+    from pose_craft.estimation.tflite_to_onnx import CONVERTER_VERSION
+
+    stem = f"{model_path.stem}.v{CONVERTER_VERSION}"
+    return {key: model_path.with_name(f"{stem}.{key}.onnx") for key in ("detector", "landmarks")}
+
+
+def ensure_onnx_models(model_path: Path) -> dict[str, Path]:
+    """Converts `model_path`'s TFLite graphs to ONNX once, reusing the cached
+    conversion afterwards (converting takes well under a second, but there's no
+    reason to redo it on every launch)."""
+    from pose_craft.estimation.tflite_to_onnx import convert_task_bundle
+
+    paths = onnx_model_paths(model_path)
+    if all(path.exists() for path in paths.values()):
+        return paths
+    return convert_task_bundle(model_path, paths)
+
+
 class PoseEstimator:
-    """Owns one live MediaPipe `PoseLandmarker` instance so repeated solves don't
-    re-pay model-load cost on every call. Create one per (model variant, max
-    people) combination you need and reuse it; call `close()` when done with it
-    (the app closes its shared instance on exit).
+    """Owns one BlazePose model pair on ONNX Runtime -- on the GPU (CUDA) when
+    `use_gpu` is set and a CUDA-capable ONNX Runtime + NVIDIA driver are
+    available, otherwise on the CPU -- so repeated solves don't re-pay model-load
+    cost on every call. Create one per (model variant, device) and reuse it;
+    `max_people` can be changed between calls. `device` reports "GPU" or "CPU".
     """
 
-    def __init__(self, model_path: Path, max_people: int = 4):
-        import mediapipe as mp
-        from mediapipe.tasks.python import BaseOptions
-        from mediapipe.tasks.python.vision import PoseLandmarker, PoseLandmarkerOptions, RunningMode
+    def __init__(self, model_path: Path, max_people: int = 4, use_gpu: bool = True):
+        from pose_craft.estimation.onnx_pose import BlazePose
 
-        self._mp = mp
-        options = PoseLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=str(model_path)),
-            running_mode=RunningMode.IMAGE,
-            num_poses=max_people,
-            min_pose_detection_confidence=0.5,
-            min_pose_presence_confidence=0.5,
-        )
-        self._landmarker = PoseLandmarker.create_from_options(options)
+        paths = ensure_onnx_models(model_path)
+        self._pose = BlazePose(paths["detector"], paths["landmarks"], use_gpu=use_gpu)
         self.model_path = model_path
         self.max_people = max_people
+        self.use_gpu = use_gpu
+
+    @property
+    def device(self) -> str:
+        return self._pose.device
 
     def close(self) -> None:
-        self._landmarker.close()
+        # ONNX Runtime sessions release their (GPU) memory when garbage-collected;
+        # dropping the reference is all "closing" needs to do.
+        self._pose = None
 
     def __enter__(self) -> "PoseEstimator":
         return self
@@ -143,16 +172,21 @@ class PoseEstimator:
         self.close()
 
     def detect(self, image_bgr: np.ndarray) -> list[DetectedPerson]:
-        image_rgb = image_bgr[:, :, ::-1]
-        mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=np.ascontiguousarray(image_rgb))
-        result = self._landmarker.detect(mp_image)
-
-        people: list[DetectedPerson] = []
-        for image_landmarks, world_landmarks in zip(result.pose_landmarks, result.pose_world_landmarks):
-            engine_landmarks = _mediapipe_world_to_engine(world_landmarks)
-            image_xy = np.array([[lm.x, lm.y] for lm in image_landmarks], dtype=np.float64)
-            visibility = np.array([lm.visibility for lm in image_landmarks], dtype=np.float64)
-            people.append(DetectedPerson(landmarks=engine_landmarks, image_landmarks_xy=image_xy, visibility=visibility))
-
+        if self._pose is None:
+            raise RuntimeError("PoseEstimator is closed")
+        results = self._pose.detect(
+            image_bgr[:, :, ::-1],
+            max_people=self.max_people,
+            min_detection_confidence=0.5,
+            min_presence_confidence=0.5,
+        )
+        people = [
+            DetectedPerson(
+                landmarks=_world_to_engine(result.world),
+                image_landmarks_xy=result.image_xy,
+                visibility=result.visibility,
+            )
+            for result in results
+        ]
         people.sort(key=lambda p: p.centroid_xy()[0])
         return people

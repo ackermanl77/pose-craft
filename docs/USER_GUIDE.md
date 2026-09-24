@@ -77,16 +77,22 @@ photo loads:
 
 **Max people to detect** (1-8, default 4) caps how many people the pose model
 looks for in one photo. A person beyond this count in a group photo won't be
-detected at all -- raise it before solving a bigger group shot. Changing this
-value after you've already solved once causes the *next* Solve Pose to
-rebuild the pose model with the new count (a brief extra delay, only when the
-count actually changes).
+detected at all -- raise it before solving a bigger group shot. Changing it
+takes effect on the next Solve Pose, with no model reload needed.
+
+**Use GPU (NVIDIA CUDA) when available** (on by default) runs the pose model on
+an NVIDIA graphics card, which makes each solve roughly twice as fast. If the
+computer has no suitable NVIDIA GPU (or the GPU libraries aren't installed),
+the app quietly uses the CPU instead -- the status bar after each solve says
+which one it used ("Solved 2 pose(s) on GPU"). Changing this checkbox or
+**Model quality** reloads the model on the next solve (a brief extra delay).
 
 **Solve Pose** runs the actual detection. On the very first solve of a
 session, this also downloads the pose model, and the status bar shows a live
-download percentage. Every solve after that reuses the already-loaded model,
+download percentage (the downloaded model is also converted once to the
+format the app runs it in -- well under a second). Every solve after that reuses the already-loaded model,
 so later clicks are noticeably faster. While a solve is running, **Load
-Photo** and **Max people to detect** are disabled -- this is intentional:
+Photo**, **Max people to detect**, **Model quality** and **Use GPU** are disabled -- this is intentional:
 swapping the photo or the detection settings mid-solve could let a stale
 result land on the wrong photo.
 

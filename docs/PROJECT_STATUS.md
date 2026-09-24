@@ -8,7 +8,10 @@ Photo (loaded via imaging.imread_unicode, unicode-path-safe;
         |
         v
 PoseEstimator (pose_craft/estimation/landmarker.py)
-  -- wraps one cached MediaPipe PoseLandmarker instance, multi-person via num_poses
+  -- MediaPipe's BlazePose models (downloaded .task bundle), converted once to ONNX
+     (estimation/tflite_to_onnx.py) and run on ONNX Runtime -- CUDA provider on an
+     NVIDIA GPU when available, CPU otherwise (estimation/onnx_pose.py re-implements
+     MediaPipe's detector -> ROI -> landmark calculator graph); multi-person
         |  landmarks converted to the engine frame (Y-up, +X right, +Z toward camera);
         |  each DetectedPerson also carries 2D image-space landmarks + per-landmark visibility
         v
@@ -43,7 +46,7 @@ re-solves `retarget.skeleton.solve_bone_rotations()` synchronously (cheap, no
 model inference) whenever the person picker, a photo click, or the mirror
 checkbox changes. The `PoseEstimator` created for the first solve is cached on
 `MainWindow._estimator` and reused for every later solve in the same session,
-rather than rebuilding MediaPipe's graph every click. Because that estimator
+rather than recreating the ONNX Runtime sessions every click. Because that estimator
 is shared, `load_btn` and `solve_btn` are both disabled for a solve's whole
 duration (not just `solve_btn`) so a new photo can't be loaded, and a second
 solve can't be started, while a `SolveWorker` is still running against the
@@ -56,10 +59,13 @@ than blocking the UI thread for its connection timeout, and Live Link's target
 host/port are now editable in the UI (`live_link_host_edit`/`live_link_port_spin`,
 defaulting to `export.live_link.DEFAULT_HOST`/`DEFAULT_PORT`) rather than fixed
 to `127.0.0.1:8642`. `SolveWorker` also takes a `max_people` value from a
-`max_people_spin` control (1-8, default 4) -- since MediaPipe bakes `num_poses`
-into the landmarker graph at creation time, changing it closes and discards
-the cached `PoseEstimator` so the next solve rebuilds one with the new count,
-instead of silently keeping the old limit. `gui/photo_view.py`'s
+`max_people_spin` control (1-8, default 4), applied per solve
+(`PoseEstimator.max_people`) -- the ONNX pipeline takes it per call, so unlike
+the old MediaPipe graph (which baked `num_poses` in at creation) changing it no
+longer rebuilds the estimator. Changing the model variant or the "Use GPU"
+checkbox (`use_gpu_checkbox`) does close and rebuild it, since both are fixed
+when the ONNX Runtime sessions are created; the post-solve status message says
+which device ("on GPU"/"on CPU") the solve actually ran on. `gui/photo_view.py`'s
 `PhotoView` keeps the full-resolution `QPixmap` so it can
 rescale cleanly on window resize, and turns a click into a normalized
 image-space point that `main_window.py` matches against each detected
@@ -95,7 +101,9 @@ differently.
 | Purpose | Entry point |
 |---|---|
 | Desktop app (load photo, solve, preview, export) | `pose_craft/app.py`, run as `python -m pose_craft.app` |
-| Pose estimation, MediaPipe axis conversion, cached `PoseEstimator` | `pose_craft/estimation/landmarker.py` |
+| Pose estimation entry point, world-axis conversion, cached `PoseEstimator`, model download + ONNX conversion cache | `pose_craft/estimation/landmarker.py` |
+| BlazePose pipeline on ONNX Runtime (detector, ROI, landmarks, GPU/CPU session setup) | `pose_craft/estimation/onnx_pose.py` |
+| TFLite -> ONNX converter for the pose models | `pose_craft/estimation/tflite_to_onnx.py` |
 | Bone retargeting math + per-bone confidence | `pose_craft/retarget/skeleton.py` |
 | Pose file format (write from the app, read by the add-on) | `pose_craft/export/blender_pose.py` |
 | Standard BVH export (own additive path, alongside the JSON/Live Link one) | `pose_craft/export/bvh_export.py` |
@@ -110,11 +118,15 @@ differently.
 
 ```text
 dist/PoseCraft/PoseCraft.exe        -- now built with assets/icon.ico as the exe icon
-dist/PoseCraft/_internal/           -- PySide6, OpenCV, MediaPipe native libs, ~480 MB total
+dist/PoseCraft/_internal/           -- PySide6, OpenCV, ONNX Runtime + (GPU build) the CUDA 13/cuDNN 9 DLLs
 ```
 
 Built with `pyinstaller PoseCraft.spec` (onedir, `--windowed`, `collect_all`
-for `mediapipe`/`cv2`/`pyqtgraph`, plus `assets/icon.png`+`assets/icon.ico`
+for `onnxruntime`/`onnx`/`cv2`/`pyqtgraph`, `collect_submodules("tflite")`,
+the NVIDIA CUDA/cuDNN DLLs from the pip `nvidia-*` packages kept in their
+site-packages layout under `_internal/nvidia/` (where `onnxruntime.preload_dlls()` looks) when installed -- that's what makes the GPU build
+so much bigger than the old ~480 MB one; a build from a venv without
+`requirements-gpu.txt` leaves them out and runs CPU-only -- plus `assets/icon.png`+`assets/icon.ico`
 bundled as `datas` so `app.py` can set the window icon at runtime via
 `sys._MEIPASS`). `dist/` and `build/` are gitignored -- distribute the built
 folder directly (zip it, or wrap it in an installer) rather than committing
@@ -204,6 +216,27 @@ checked" above as weaker evidence than an automated test -- it was true at the
 time each check ran, not guaranteed to stay true as the code changes.
 
 ## Recently Fixed
+
+- **Pose estimation could only run on the CPU.** MediaPipe's Windows wheels
+  are built without GPU support, so the `mediapipe` package couldn't use an
+  NVIDIA GPU at all. **Fixed** by moving inference to ONNX Runtime:
+  `estimation/tflite_to_onnx.py` converts the two TFLite graphs inside
+  MediaPipe's own `.task` bundle to ONNX (a small purpose-built converter --
+  `tf2onnx` needs TensorFlow, which has no Python 3.14 build, and `tflite2onnx`
+  mishandles these models' float16/sparse weights and PAD ops), cached next to
+  the download with the converter version in the filename; `estimation/onnx_pose.py`
+  re-implements MediaPipe's calculator graph around them (SSD anchors, weighted
+  NMS, letterbox removal, alignment-point ROI, rotated crop, heatmap refinement,
+  landmark/world projection), following MediaPipe's C++ sources calculator by
+  calculator. Verified: the converted graphs match LiteRT's output to ~1e-5
+  relative error for all three variants (`tests/test_tflite_to_onnx.py`, run
+  locally where LiteRT is available); end to end against the `mediapipe`
+  package on real photos, visible landmarks agree to a median of 0.1-1.5 px
+  with the same people detected -- the largest remaining differences are on
+  ambiguous landmarks where MediaPipe's *own* output moves as much under +/-1
+  intensity-level noise. On an RTX 5080, one solve takes ~12/13/18 ms
+  (lite/full/heavy, two people) on the GPU vs ~25/28/40 ms on the CPU.
+  `mediapipe` is no longer a dependency.
 
 - **The 3D viewport (the larger, primary preview checked right before
   Export/Live Link) had no confidence indication at all**, unlike the 2D photo
@@ -547,6 +580,18 @@ time each check ran, not guaranteed to stay true as the code changes.
 
 ## Known Issues
 
+- **The GPU build is large.** ONNX Runtime's CUDA provider needs cuBLAS/cuBLASLt
+  and cuDNN, which alone are well over 1 GB; they're bundled so the `.exe` works
+  without a system CUDA install (only an NVIDIA driver). For models this small
+  the GPU speedup is real but modest (~2x per solve, see "Recently Fixed") --
+  a CPU-only build (from a venv without `requirements-gpu.txt`) is far smaller
+  and still perfectly usable.
+- **The ONNX pipeline is a re-implementation, not MediaPipe itself.** It follows
+  MediaPipe's sources and matches its output closely (see "Recently Fixed"),
+  but it isn't bit-identical, and a future MediaPipe model update that changes
+  the graph's op set or I/O would need `tflite_to_onnx.py`/`onnx_pose.py` updates
+  (the converter raises `UnsupportedTFLiteOp` rather than guessing).
+
 Ranked roughly by how much they affect whether an exported pose is usable:
 
 - **Twist is only solved for the hands.** Rotation around a bone's own long
@@ -559,7 +604,7 @@ Ranked roughly by how much they affect whether an exported pose is usable:
   per-bone `low_confidence` flag doesn't help here either way -- it's about
   landmark visibility, not about whether twist could be solved at all.
 - **MediaPipe's world-landmark axis convention is a best-effort guess, not a
-  verified fact.** Isolated in `_mediapipe_world_to_engine()` in
+  verified fact.** Isolated in `_world_to_engine()` in
   `estimation/landmarker.py` specifically so it's the one place to fix if an
   exported pose comes out upside-down or mirrored against the source photo --
   this has not been checked against real MediaPipe output in this dev

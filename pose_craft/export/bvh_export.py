@@ -13,7 +13,7 @@ module picks Y-up, right-handed, +X-right, +Z-toward-camera/forward --
 identical to the engine frame retarget/skeleton.py already works in -- as
 *this exporter's own* BVH convention, and documents that choice here as the
 one place to change it if a downstream BVH consumer expects a different one
-(the same role _mediapipe_world_to_engine()'s docstring plays for the input
+(the same role _world_to_engine()'s docstring plays for the input
 side). Because of that choice _ENGINE_TO_BVH_AXES is the identity rotation,
 but it is still expressed as an explicit, named conversion (mirroring
 blender_pose.py's _rotation_to_blender pattern) rather than just skipped, so

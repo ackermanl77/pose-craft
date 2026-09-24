@@ -278,7 +278,7 @@ ROOT_BONE = BONES[0].name
 
 # Global orientation-correction candidates for the "body orientation / floor
 # contact" GUI control (gui/main_window.py's orientation_combo, next to the
-# mirror checkbox). _mediapipe_world_to_engine() in estimation/landmarker.py
+# mirror checkbox). _world_to_engine() in estimation/landmarker.py
 # documents its axis convention as an unverified guess -- these cover the
 # plausible ways that guess could be wrong (upside-down, or facing 90 degrees
 # off) as one-click fixes, the same "small, live-preview" shape the mirror

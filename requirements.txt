@@ -1,6 +1,14 @@
 numpy==2.5.3
 scipy==1.18.1
-mediapipe==1.0.1
+# Pose estimation: MediaPipe's BlazePose models on ONNX Runtime (see
+# pose_craft/estimation/onnx_pose.py). onnxruntime-gpu also runs on the CPU, so
+# this is the only runtime needed either way; install requirements-gpu.txt on
+# top for NVIDIA GPU acceleration. onnx + tflite are for the one-time
+# conversion of the downloaded .task model bundle to ONNX.
+onnxruntime-gpu==1.30.0
+onnx==1.23.0
+tflite==2.18.0
+opencv-contrib-python==5.0.0.93
 PySide6==6.11.2
 pyqtgraph==0.14.0
 PyOpenGL==3.1.10

@@ -1,0 +1,11 @@
+# NVIDIA GPU acceleration (RTX 20-series and newer, incl. RTX 40/50) -- install on
+# top of requirements.txt:
+#
+#   pip install -r requirements.txt -r requirements-gpu.txt
+#
+# The [cuda,cudnn] extras pull the CUDA 13 runtime + cuDNN 9 as pip packages
+# (nvidia-cuda-runtime, nvidia-cudnn-cu13, ...), which
+# pose_craft/estimation/onnx_pose.py preloads via onnxruntime.preload_dlls() --
+# so no system-wide CUDA Toolkit install is needed, only a current NVIDIA driver.
+# Without these the app still works; ONNX Runtime just runs on the CPU.
+onnxruntime-gpu[cuda,cudnn]==1.30.0

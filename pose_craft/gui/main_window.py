@@ -50,9 +50,9 @@ from pose_craft.retarget.skeleton import (
 class SolveWorker(QThread):
     """Runs model download + pose detection off the UI thread -- the first run in
     particular can take a while while the landmarker model downloads. Reuses an
-    already-created PoseEstimator when the caller has one and its max_people
-    already matches (see MainWindow._estimator) so the model only has to load
-    once per app session, not once per click.
+    already-created PoseEstimator when the caller has one for the same model and
+    device (see MainWindow._estimator) so the model only has to load once per app
+    session, not once per click.
     """
 
     finished_ok = Signal(list, object)  # list[DetectedPerson], PoseEstimator
@@ -65,6 +65,7 @@ class SolveWorker(QThread):
         estimator: PoseEstimator | None,
         max_people: int,
         model_variant: str,
+        use_gpu: bool = True,
         parent=None,
     ):
         super().__init__(parent)
@@ -72,6 +73,7 @@ class SolveWorker(QThread):
         self._estimator = estimator
         self._max_people = max_people
         self._model_variant = model_variant
+        self._use_gpu = use_gpu
 
     def run(self) -> None:
         estimator = self._estimator
@@ -81,7 +83,7 @@ class SolveWorker(QThread):
                 model_path = ensure_model_downloaded(
                     self._model_variant, on_progress=lambda downloaded, total: self.progress.emit(downloaded, total)
                 )
-                estimator = PoseEstimator(model_path, max_people=self._max_people)
+                estimator = PoseEstimator(model_path, max_people=self._max_people, use_gpu=self._use_gpu)
             people = estimator.detect(self._image_bgr)
             self.finished_ok.emit(people, estimator)
         except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
@@ -206,8 +208,7 @@ class MainWindow(QMainWindow):
         self.max_people_spin.setRange(1, 8)
         self.max_people_spin.setValue(4)
         self.max_people_spin.setToolTip(
-            "A person beyond this count in a group photo won't be detected at all. "
-            "Changing this after a solve rebuilds the pose model on the next Solve Pose."
+            "A person beyond this count in a group photo won't be detected at all."
         )
         max_people_row.addWidget(self.max_people_spin)
         layout.addLayout(max_people_row)
@@ -224,6 +225,15 @@ class MainWindow(QMainWindow):
         )
         model_row.addWidget(self.model_variant_combo)
         layout.addLayout(model_row)
+
+        self.use_gpu_checkbox = QCheckBox("Use GPU (NVIDIA CUDA) when available")
+        self.use_gpu_checkbox.setChecked(True)
+        self.use_gpu_checkbox.setToolTip(
+            "Runs pose estimation on an NVIDIA GPU through ONNX Runtime's CUDA provider. "
+            "Falls back to the CPU automatically when no usable GPU/CUDA runtime is found -- "
+            "the status bar says which one each solve actually used."
+        )
+        layout.addWidget(self.use_gpu_checkbox)
 
         self.solve_btn = QPushButton("Solve Pose")
         self.solve_btn.clicked.connect(self._on_solve_pose)
@@ -254,7 +264,7 @@ class MainWindow(QMainWindow):
         self.orientation_combo.addItems(list(ORIENTATION_CORRECTIONS.keys()))
         self.orientation_combo.setToolTip(
             "If the solved pose comes out upside-down or facing the wrong way -- see "
-            "_mediapipe_world_to_engine()'s axis-convention caveat -- pick the correction "
+            "_world_to_engine()'s axis-convention caveat -- pick the correction "
             "that fixes it. Applied as an extra rotation on top of the solved pose, live in "
             "the 3D preview and in every export."
         )
@@ -380,23 +390,27 @@ class MainWindow(QMainWindow):
 
         max_people = self.max_people_spin.value()
         model_variant = self.model_variant_combo.currentText()
+        use_gpu = self.use_gpu_checkbox.isChecked()
         if self._estimator is not None and (
-            self._estimator.max_people != max_people or self._estimator.model_path != model_cache_path(model_variant)
+            self._estimator.model_path != model_cache_path(model_variant) or self._estimator.use_gpu != use_gpu
         ):
-            # num_poses and the model weights are both baked into the MediaPipe
-            # graph at creation time -- changing either means the cached
+            # The model weights and the execution device are both fixed when the
+            # ONNX Runtime sessions are created -- changing either means the cached
             # estimator can't be reused as-is.
             self._estimator.close()
             self._estimator = None
+        if self._estimator is not None:
+            self._estimator.max_people = max_people  # applied per call, no rebuild needed
 
         self.solve_btn.setEnabled(False)
         self.load_btn.setEnabled(False)  # a new photo mid-solve would let this solve's results land on it
         self.max_people_spin.setEnabled(False)
         self.model_variant_combo.setEnabled(False)
-        first_run_note = "" if self._estimator is not None else " (downloading model on first run may take a moment)"
+        self.use_gpu_checkbox.setEnabled(False)
+        first_run_note = "" if self._estimator is not None else " (loading the model -- the first run also downloads it)"
         self.statusBar().showMessage(f"Solving pose...{first_run_note}")
 
-        self._worker = SolveWorker(self._image_bgr, self._estimator, max_people, model_variant)
+        self._worker = SolveWorker(self._image_bgr, self._estimator, max_people, model_variant, use_gpu)
         self._worker.finished_ok.connect(self._on_solve_finished)
         self._worker.failed.connect(self._on_solve_failed)
         self._worker.progress.connect(self._on_solve_progress)
@@ -413,11 +427,12 @@ class MainWindow(QMainWindow):
         self.load_btn.setEnabled(True)
         self.max_people_spin.setEnabled(True)
         self.model_variant_combo.setEnabled(True)
+        self.use_gpu_checkbox.setEnabled(True)
         self._people = people
         self._estimator = estimator
 
         if not people:
-            self.statusBar().showMessage("No person detected in this photo")
+            self.statusBar().showMessage(f"No person detected in this photo (ran on {estimator.device})")
             QMessageBox.information(self, "Solve Pose", "No person was detected in this photo.")
             return
 
@@ -429,7 +444,7 @@ class MainWindow(QMainWindow):
         self.person_combo.setCurrentIndex(0)
 
         self.export_all_btn.setEnabled(True)
-        status = f"Solved {len(people)} pose(s)"
+        status = f"Solved {len(people)} pose(s) on {estimator.device}"
         if len(people) >= estimator.max_people:
             status += (
                 f" -- reached the max-people limit ({estimator.max_people}); "
@@ -448,6 +463,7 @@ class MainWindow(QMainWindow):
         self.load_btn.setEnabled(True)
         self.max_people_spin.setEnabled(True)
         self.model_variant_combo.setEnabled(True)
+        self.use_gpu_checkbox.setEnabled(True)
         self.statusBar().showMessage("Solve failed")
         QMessageBox.critical(self, "Solve Pose", f"Pose solving failed:\n{message}")
 
