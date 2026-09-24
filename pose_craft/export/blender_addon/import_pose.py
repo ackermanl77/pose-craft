@@ -33,9 +33,17 @@ rig's own bone names. Two ways to bridge that, checked in this order:
    renamed or deleted -- that's reported as unmatched rather than silently
    falling back to a guess you didn't ask for.
 2. **Automatic name-guessing** (used for any PoseCraft bone name with no
-   manual mapping row, or a blank one): tries the exact name, then common
-   Rigify-style prefixes/suffixes (DEF-, ORG-, ".fk", ".ik") -- see
-   NAME_CANDIDATES_TEMPLATES.
+   manual mapping row, or a blank one): tries the exact name, then Rigify's
+   control bones (upper_arm_fk.L, then upper_arm_ik.L), then its DEF-/ORG-
+   bones as a last resort, then Mixamo's names (mixamorig:LeftArm, ...) -- see
+   bone_name_candidates().
+
+Rotations: the file stores each bone's rotation relative to its parent, in
+armature axes; a pose bone's rotation_quaternion is in the bone's own rest
+frame, so each one is converted with armature_delta_to_basis() before it's
+applied. The rig's rest pose is still assumed to be a T-pose with bones
+pointing the way PoseCraft's own rest skeleton does (see docs/PROJECT_STATUS.md's
+Known Issues for A-pose rigs and rigs with extra bones between PoseCraft's).
 
 Bones that still can't be resolved either way are reported in the Blender
 status bar / console rather than silently skipped, and bones the PoseCraft
@@ -85,15 +93,35 @@ POSECRAFT_BONE_NAMES = [
 # understands is rejected rather than silently (mis)applied.
 MAX_SUPPORTED_FORMAT_VERSION = 1
 
+# Name-guessing templates, tried in order. {name} is the PoseCraft bone name
+# ("upper_arm.L"); {base}/{side} split it into "upper_arm" / ".L" (side is ""
+# for center bones like "spine"), because Rigify puts its _fk/_ik tag BEFORE
+# the side suffix: upper_arm_fk.L, not upper_arm.L_fk. Control bones come
+# first: a generated Rigify rig's DEF- and ORG- bones are driven by
+# constraints from those controls, so posing them directly has no visible
+# effect (or is overwritten on the next depsgraph update) -- they're only a
+# last resort, for deform-only rigs that have nothing else.
 NAME_CANDIDATES_TEMPLATES = [
     "{name}",
+    "{base}_fk{side}",
+    "{base}_ik{side}",
     "DEF-{name}",
     "ORG-{name}",
-    "{name}_fk",
-    "{name}.fk",
-    "{name}_ik",
-    "{name}.ik",
 ]
+
+# Mixamo's names for PoseCraft's bones (a Mixamo "Left" bone is the
+# character's own left, same as PoseCraft's .L), tried with each of
+# MIXAMO_PREFIXES -- Mixamo exports use "mixamorig:", a second character
+# imported into the same file often gets "mixamorig1:", and some pipelines
+# strip the prefix entirely.
+MIXAMO_BONE_NAMES = {
+    "spine": "Spine", "neck": "Neck", "head": "Head",
+    "upper_arm.L": "LeftArm", "forearm.L": "LeftForeArm", "hand.L": "LeftHand",
+    "upper_arm.R": "RightArm", "forearm.R": "RightForeArm", "hand.R": "RightHand",
+    "thigh.L": "LeftUpLeg", "shin.L": "LeftLeg", "foot.L": "LeftFoot",
+    "thigh.R": "RightUpLeg", "shin.R": "RightLeg", "foot.R": "RightFoot",
+}
+MIXAMO_PREFIXES = ["mixamorig:", "mixamorig1:", ""]
 
 LIVE_LINK_HOST = "127.0.0.1"
 DEFAULT_LIVE_LINK_PORT = 8642
@@ -108,14 +136,54 @@ _server_socket: socket.socket | None = None
 _live_link_status = "Not started"
 
 
-def _guess_bone_name(pose_bones, exported_name: str) -> str | None:
-    """Tries common Rigify-style naming patterns against the armature's actual
-    pose bones. This is the fallback `_resolve_bone_name` uses when no manual
-    mapping row exists (or its row's target bone is blank) for a given
-    PoseCraft bone name -- see POSECRAFT_BoneMapping.
+def bone_name_candidates(exported_name: str) -> list[str]:
+    """Every rig bone name `exported_name` might go by, most-preferred first:
+    NAME_CANDIDATES_TEMPLATES, then MIXAMO_BONE_NAMES with each prefix. Pure
+    (no bpy), so tests/test_blender_addon_source.py can run it outside Blender.
     """
-    for template in NAME_CANDIDATES_TEMPLATES:
-        candidate = template.format(name=exported_name)
+    base, dot, side_letter = exported_name.rpartition(".")
+    if dot and side_letter in ("L", "R"):
+        side = "." + side_letter
+    else:
+        base, side = exported_name, ""
+    candidates = [template.format(name=exported_name, base=base, side=side) for template in NAME_CANDIDATES_TEMPLATES]
+    mixamo_name = MIXAMO_BONE_NAMES.get(exported_name)
+    if mixamo_name is not None:
+        candidates += [prefix + mixamo_name for prefix in MIXAMO_PREFIXES]
+    unique = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    return unique
+
+
+def armature_delta_to_basis(rest_rotation, delta):
+    """Converts an exported rotation (parent-relative, expressed in ARMATURE
+    axes) into a pose bone's rotation_quaternion (expressed in the bone's own
+    rest frame): R^-1 @ delta @ R, with R = bone.matrix_local's rotation.
+
+    Why: Blender evaluates a pose bone as
+    pose = parent_pose @ (parent_rest^-1 @ rest) @ basis. Writing each pose as
+    a world-space delta on top of its rest (pose = D @ rest) turns that into
+    D_bone = D_parent @ (R @ basis @ R^-1), so setting basis = R^-1 @ delta @ R
+    gives D_bone = D_parent @ delta -- exactly the parent-relative delta the
+    file stores. Writing `delta` straight into rotation_quaternion (the old
+    behavior) rotated about the wrong axes for any bone whose rest frame isn't
+    aligned with the armature's (i.e. nearly every bone: a bone's local Y runs
+    along its length). Duck-typed on `@` and `.inverted()`, so it works on
+    mathutils Quaternions and on the test suite's stand-in.
+    """
+    return rest_rotation.inverted() @ delta @ rest_rotation
+
+
+def _guess_bone_name(pose_bones, exported_name: str) -> str | None:
+    """Tries common Rigify/Mixamo naming patterns (bone_name_candidates)
+    against the armature's actual pose bones. This is the fallback
+    `_resolve_bone_name` uses when no manual mapping row exists (or its row's
+    target bone is blank) for a given PoseCraft bone name -- see
+    POSECRAFT_BoneMapping.
+    """
+    for candidate in bone_name_candidates(exported_name):
         if candidate in pose_bones:
             return candidate
     return None
@@ -181,7 +249,8 @@ def apply_pose_document(armature_obj: bpy.types.Object, document: dict) -> tuple
 
         pose_bone = pose_bones[bone_name]
         pose_bone.rotation_mode = "QUATERNION"
-        pose_bone.rotation_quaternion = Quaternion((w, x, y, z))
+        rest_rotation = pose_bone.bone.matrix_local.to_quaternion()
+        pose_bone.rotation_quaternion = armature_delta_to_basis(rest_rotation, Quaternion((w, x, y, z)))
         applied.append(bone_name)
         if bones[exported_name].get("low_confidence"):
             low_confidence.append(bone_name)
@@ -217,8 +286,12 @@ class POSECRAFT_OT_load_pose(bpy.types.Operator):
             self.report({"ERROR"}, "Select an armature first")
             return {"CANCELLED"}
 
-        with open(self.filepath, "r", encoding="utf-8") as f:
-            document = json.load(f)
+        try:
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                document = json.load(f)
+        except (OSError, ValueError) as exc:  # ValueError covers JSONDecodeError/UnicodeDecodeError
+            self.report({"ERROR"}, f"Could not read pose file: {exc}")
+            return {"CANCELLED"}
 
         try:
             applied, unmatched, low_confidence = apply_pose_document(armature_obj, document)
