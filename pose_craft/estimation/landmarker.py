@@ -94,7 +94,7 @@ def ensure_model_downloaded(variant: str = "full", on_progress: Callable[[int, i
 
 @dataclasses.dataclass
 class DetectedPerson:
-    landmarks: np.ndarray  # (33, 3) in the engine's Y-up frame
+    landmarks: np.ndarray  # (33, 3) in the engine's Y-up, +Z-toward-camera frame
     image_landmarks_xy: np.ndarray  # (33, 2) normalized [0, 1] image-space x/y, for click-to-select
     visibility: np.ndarray  # (33,) BlazePose's per-landmark visibility score, 0..1
 
@@ -104,16 +104,21 @@ class DetectedPerson:
 
 def _world_to_engine(world_landmarks: np.ndarray) -> np.ndarray:
     """Converts BlazePose world landmarks ((33, 3) meters, origin at the hip
-    midpoint, in MediaPipe's world frame) to the engine's Y-up, +Z-toward-camera frame.
+    midpoint, in MediaPipe's world frame) to the engine's right-handed Y-up,
+    +Z-toward-camera frame (see retarget/skeleton.py's module docstring).
 
-    MediaPipe documents world landmarks as real-world-scale meters with the origin
-    at the hip midpoint, but is not fully explicit about axis direction across
-    versions. This mapping (flip Y, keep X/Z) matches the commonly observed output
-    where the raw Y increases downward like image coordinates. If an exported pose
-    comes out upside-down or mirrored, this is the one function to fix.
+    MediaPipe's world frame is image-aligned: +x toward image right, +y DOWN
+    (like image rows), and z is depth with smaller values closer to the camera
+    (the same documented convention as its normalized image landmarks) -- a
+    right-handed camera frame looking along +z. Negating both Y and Z is a
+    180-degree rotation about X, so the result stays right-handed: +X image
+    right, +Y up, +Z toward the camera. Flipping Y alone (this function's old
+    mapping) made the frame left-handed, which mirrored every pose front-to-back
+    -- a knee raised toward the camera exported *behind* the rig.
     """
     points = np.array(world_landmarks, dtype=np.float64)
     points[:, 1] = -points[:, 1]
+    points[:, 2] = -points[:, 2]
     return points
 
 

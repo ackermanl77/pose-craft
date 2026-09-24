@@ -504,7 +504,14 @@ class MainWindow(QMainWindow):
         # applied as a position-space rotation here rather than reused as-is.
         positions = rotate_joint_positions(positions, self._orientation_correction(), pivot=positions["spine.head"])
         selected_index = self.person_combo.currentIndex()
-        selected_confidence = bone_confidence(self._people[selected_index].visibility) if selected_index >= 0 else None
+        selected_confidence = None
+        if selected_index >= 0:
+            # Mirrored the same way the landmarks are (see _document_inputs_for),
+            # so the preview's low-confidence coloring follows the mirrored limbs.
+            visibility = self._people[selected_index].visibility
+            if self.mirror_checkbox.isChecked():
+                visibility = mirror_landmarks(visibility)
+            selected_confidence = bone_confidence(visibility)
         self.viewport.show_skeleton(positions, confidence=selected_confidence)
         self.export_btn.setEnabled(True)
         self.export_bvh_btn.setEnabled(True)
@@ -524,10 +531,10 @@ class MainWindow(QMainWindow):
         landmarks: np.ndarray, visibility: np.ndarray, mirror: bool, orientation_correction=None
     ) -> tuple[dict, dict]:
         """Shared by _current_person_document_inputs (the selected person) and
-        _on_export_all (every detected person): mirror_landmarks just swaps
-        left/right rows -- it doesn't care that `visibility` holds a score per
-        landmark instead of a 3D position, and it needs to be swapped the same
-        way `landmarks` is, or the confidence for e.g. a mirrored thigh.L would
+        _on_export_all (every detected person): mirror_landmarks swaps the
+        left/right rows (and, for 3D positions only, reflects X) -- a 1-D
+        `visibility` array gets just the row swap, and it needs to be swapped
+        the same way `landmarks` is, or the confidence for e.g. a mirrored thigh.L would
         report the ORIGINAL left leg's visibility instead of the real
         (now swapped-in) right leg's.
 

@@ -3,7 +3,10 @@ computes per-bone rotations by comparing each bone's current direction (from
 landmark positions) against its rest-pose direction (a T-pose).
 
 Coordinate convention used throughout this module (the "engine" frame):
-right-handed, Y-up, +X to the subject's right, +Z toward the camera.
+right-handed, Y-up, +X toward image right, +Z toward the camera. For a subject
+facing the camera that makes +X the subject's own LEFT and +Z the direction
+they face -- hence LEFT_X = +X and FORWARD = +Z below, the same body-relative
+layout as a Blender rig (.L bones on +X; see export/blender_pose.py).
 Landmark-space vectors must already be in this frame before reaching
 `solve_bone_rotations` -- see `estimation/landmarker.py` for the MediaPipe
 world-landmark conversion.
@@ -76,17 +79,36 @@ def _shoulder_center(lm: np.ndarray) -> np.ndarray:
     return _mid(lm, LEFT_SHOULDER, RIGHT_SHOULDER)
 
 
+# Skull-top height above the ear midpoint, as a multiple of the ear-to-ear
+# distance -- only sets the head bone's length, which the solve ignores.
+_HEAD_TOP_HEIGHT_PER_EAR_WIDTH = 0.8
+
+
 def _head_top(lm: np.ndarray) -> np.ndarray:
+    """A head-top point along the head's own "up" axis, since MediaPipe has no
+    skull landmark: perpendicular to both the ear-to-ear line and the face's
+    forward direction (ear midpoint -> eye midpoint, roughly the Frankfort
+    plane, which is level on a level head). The old version extrapolated back
+    along the nose->ear line; the nose sits below and in front of the ears, so
+    that tilted a level head ~20 degrees backward on export.
+    """
     ear_center = _mid(lm, LEFT_EAR, RIGHT_EAR)
-    # Extrapolate a head-top point above the nose/ear line since MediaPipe has no skull landmark.
-    return ear_center + (ear_center - lm[NOSE]) * 0.6 + np.array([0.0, 0.15, 0.0])
+    lateral = lm[LEFT_EAR] - lm[RIGHT_EAR]  # toward the subject's left (+X at rest)
+    forward = _mid(lm, LEFT_EYE, RIGHT_EYE) - ear_center  # the way the face points (+Z at rest)
+    up = np.cross(forward, lateral)  # +Z x +X = +Y at rest
+    up_norm = np.linalg.norm(up)
+    ear_width = np.linalg.norm(lateral)
+    if up_norm < 1e-9 or ear_width < 1e-9:
+        # Degenerate (coincident ears/eyes): fall back to straight up.
+        return ear_center + np.array([0.0, 0.15, 0.0])
+    return ear_center + up / up_norm * ear_width * _HEAD_TOP_HEIGHT_PER_EAR_WIDTH
 
 
 UP = np.array([0.0, 1.0, 0.0])
 DOWN = np.array([0.0, -1.0, 0.0])
 LEFT_X = np.array([1.0, 0.0, 0.0])
 RIGHT_X = np.array([-1.0, 0.0, 0.0])
-FORWARD = np.array([0.0, 0.0, -1.0])
+FORWARD = np.array([0.0, 0.0, 1.0])
 
 BONES: list[BoneSpec] = [
     BoneSpec("spine", None, UP, _hip_center, _shoulder_center,
@@ -94,7 +116,7 @@ BONES: list[BoneSpec] = [
     BoneSpec("neck", "spine", UP, _shoulder_center, lambda lm: _mid(lm, LEFT_EAR, RIGHT_EAR),
              (LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_EAR, RIGHT_EAR)),
     BoneSpec("head", "neck", UP, lambda lm: _mid(lm, LEFT_EAR, RIGHT_EAR), _head_top,
-             (LEFT_EAR, RIGHT_EAR, NOSE)),
+             (LEFT_EAR, RIGHT_EAR, LEFT_EYE, RIGHT_EYE)),
     BoneSpec("upper_arm.L", "spine", LEFT_X, lambda lm: lm[LEFT_SHOULDER], lambda lm: lm[LEFT_ELBOW],
              (LEFT_SHOULDER, LEFT_ELBOW)),
     BoneSpec("forearm.L", "upper_arm.L", LEFT_X, lambda lm: lm[LEFT_ELBOW], lambda lm: lm[LEFT_WRIST],
@@ -139,17 +161,19 @@ def joint_positions(landmarks: np.ndarray) -> dict[str, np.ndarray]:
 
 
 def _head_top_2d(lm: np.ndarray) -> np.ndarray:
-    """2D-image-space analogue of _head_top, for image_joint_positions_2d below.
-    _head_top's offset is a 3-component vector (a small nudge along the engine
-    frame's +Y/"up"); image coordinates only have two axes, and image y
-    increases downward rather than up, so this can't just reuse that constant.
+    """2D-image-space stand-in for _head_top, for image_joint_positions_2d below.
+    _head_top needs a 3D cross product (the head's up axis is perpendicular to
+    the ear line and the face direction); image coordinates only have two axes,
+    and image y increases downward rather than up, so the photo overlay keeps
+    this simpler nose/ear extrapolation -- it only decides where the drawn head
+    line ends, not anything that's exported.
     """
     ear_center = _mid(lm, LEFT_EAR, RIGHT_EAR)
     return ear_center + (ear_center - lm[NOSE]) * 0.6 + np.array([0.0, -0.05])
 
 
 # Bones whose 3D tail_fn isn't dimension-agnostic (only "head", via _head_top's
-# 3-component offset) need a 2D-specific override here for image_joint_positions_2d.
+# cross product) need a 2D-specific override here for image_joint_positions_2d.
 _BONE_2D_TAIL_OVERRIDES = {"head": _head_top_2d}
 
 
@@ -160,7 +184,7 @@ def image_joint_positions_2d(image_landmarks_xy: np.ndarray) -> dict[str, np.nda
     dimension-agnostic (plain indexing or midpoint averaging, which work the
     same regardless of how many columns `landmarks` has) -- only the head
     bone's extrapolated top-of-skull point needs a 2D-specific version, since
-    the 3D one adds a 3-component offset.
+    the 3D one uses a cross product.
     """
     if image_landmarks_xy.shape != (NUM_LANDMARKS, 2):
         raise ValueError(f"expected ({NUM_LANDMARKS}, 2) landmarks, got {image_landmarks_xy.shape}")
@@ -213,7 +237,9 @@ def _swing_rotation(rest_direction: np.ndarray, current_direction: np.ndarray) -
 # of the wrist. _TWIST_REST_LATERAL is this project's own zero-twist reference
 # (perpendicular to the bone's rest_direction; the exact direction is an
 # arbitrary convention, not an anatomical claim, as long as it's applied
-# consistently between the rest pose and every solved pose).
+# consistently between the rest pose and every solved pose). +Z (forward) is
+# where the index knuckle sits relative to the pinky on a palm-down T-pose
+# hand, so a palm-down hand -- the usual rig rest pose -- solves to zero twist.
 _TWIST_REST_LATERAL = {
     "hand.L": np.array([0.0, 0.0, 1.0]),
     "hand.R": np.array([0.0, 0.0, 1.0]),
@@ -264,12 +290,26 @@ _LEFT_RIGHT_PAIRS = [
 
 
 def mirror_landmarks(landmarks: np.ndarray) -> np.ndarray:
-    """Swaps left/right landmark rows. Used as the "body orientation" fix when the
-    estimator's facing guess comes out mirrored -- see PoseForge's equivalent control.
+    """Mirrors a pose left/right (a reflection through the body's midline, like
+    Blender's "paste X-flipped pose"): swaps the left/right landmark rows AND
+    reflects the lateral coordinate -- X -> -X for (33, 3) engine-frame
+    landmarks, x -> 1 - x for (33, 2) normalized image landmarks. Used as the
+    "body orientation" fix when the estimator's left/right labeling comes out
+    swapped -- see PoseForge's equivalent control.
+
+    Swapping rows alone (this function's old behavior) left the old left
+    shoulder's position labeled as the right shoulder while it still sat on the
+    +X side, so every arm/leg pointed across the body -- a T-pose came out with
+    both arms rotated 180 degrees. A 1-D per-landmark array (e.g. visibility)
+    has no coordinate to reflect, so only its rows are swapped.
     """
-    mirrored = landmarks.copy()
+    mirrored = np.array(landmarks, copy=True)
     for left, right in _LEFT_RIGHT_PAIRS:
         mirrored[[left, right]] = mirrored[[right, left]]
+    if mirrored.ndim == 2 and mirrored.shape[1] == 3:
+        mirrored[:, 0] = -mirrored[:, 0]
+    elif mirrored.ndim == 2 and mirrored.shape[1] == 2:
+        mirrored[:, 0] = 1.0 - mirrored[:, 0]
     return mirrored
 
 
@@ -278,12 +318,13 @@ ROOT_BONE = BONES[0].name
 
 # Global orientation-correction candidates for the "body orientation / floor
 # contact" GUI control (gui/main_window.py's orientation_combo, next to the
-# mirror checkbox). _world_to_engine() in estimation/landmarker.py
-# documents its axis convention as an unverified guess -- these cover the
-# plausible ways that guess could be wrong (upside-down, or facing 90 degrees
-# off) as one-click fixes, the same "small, live-preview" shape the mirror
-# checkbox already provides for a left/right swap. All rotations are in the
-# engine frame (Y-up, +X right, +Z toward camera).
+# mirror checkbox. _world_to_engine() in estimation/landmarker.py follows
+# MediaPipe's documented axis convention, but a monocular estimate can still
+# come out upside-down or facing 90 degrees off -- these are one-click fixes
+# for that, the same "small, live-preview" shape the mirror checkbox already
+# provides for a left/right swap. All rotations are in the engine frame (Y-up,
+# +X image right / subject's left, +Z toward camera); "Rotate 90° Left" turns
+# the subject toward their own left (+Z -> +X).
 ORIENTATION_CORRECTIONS: dict[str, Rotation] = {
     "Default": Rotation.identity(),
     "Flip Upside-Down": Rotation.from_euler("z", 180, degrees=True),

@@ -19,8 +19,11 @@ FORMAT_VERSION = 1
 # the same category of case PoseForge's own docs call out.
 LOW_CONFIDENCE_THRESHOLD = 0.5
 
-# Engine (Y-up, X-right, Z-toward-camera) -> Blender (Z-up, X-right, Y-into-scene).
-# A pure 90-degree rotation about X, so quaternions convert by conjugation, not just relabeling.
+# Engine (Y-up, +X = subject's left, +Z = the way the subject faces, i.e. toward
+# the camera) -> Blender's rig convention (Z-up, .L bones on +X, the character
+# facing -Y): engine +X -> Blender +X, +Y -> +Z, +Z -> -Y. A pure 90-degree
+# rotation about X (both frames right-handed), so quaternions convert by
+# conjugation, not just relabeling.
 _ENGINE_TO_BLENDER_AXES = Rotation.from_matrix([
     [1.0, 0.0, 0.0],
     [0.0, 0.0, -1.0],

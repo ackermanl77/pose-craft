@@ -7,9 +7,13 @@ from pose_craft.estimation.onnx_pose import PoseResult
 from pose_craft.estimation.tflite_to_onnx import CONVERTER_VERSION
 
 
-def test_world_to_engine_flips_y_only():
+def test_world_to_engine_flips_y_and_z():
+    """MediaPipe's world frame is +y down, smaller z = closer to the camera;
+    the engine frame is +Y up, +Z toward the camera. Negating both keeps the
+    frame right-handed (a rotation, not a reflection)."""
     world = np.array([[0.1, 0.2, 0.3], [-0.4, -0.5, 0.6]])
-    np.testing.assert_allclose(landmarker._world_to_engine(world), [[0.1, -0.2, 0.3], [-0.4, 0.5, 0.6]])
+    np.testing.assert_allclose(landmarker._world_to_engine(world), [[0.1, -0.2, -0.3], [-0.4, 0.5, -0.6]])
+    np.testing.assert_allclose(np.linalg.det(np.diag([1.0, -1.0, -1.0])), 1.0)
 
 
 def test_onnx_model_paths_sit_next_to_the_task_bundle_and_carry_the_converter_version(tmp_path):

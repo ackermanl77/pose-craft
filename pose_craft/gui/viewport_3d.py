@@ -22,6 +22,27 @@ LOW_CONFIDENCE_BONE_COLOR = (1.0, 100 / 255, 60 / 255, 1.0)
 _FRAME_MARGIN = 2.2
 _MIN_CAMERA_DISTANCE = 0.5
 
+# pyqtgraph's GL view is Z-up (its grid lies in the XY plane and the orbit
+# camera's elevation is measured from it), while the engine frame is Y-up --
+# drawn as-is, a standing skeleton lay flat on the grid. Engine -> display is
+# the same axis change export/blender_pose.py applies (engine +X -> +X, +Y -> +Z,
+# +Z -> -Y), so the preview matches how the pose lands in Blender: upright,
+# facing -Y. The default azimuth puts the camera in front of the subject
+# (-Y side), turned slightly toward their left (+X), so the preview roughly
+# matches the photo's viewpoint with a little depth visible.
+_ENGINE_TO_DISPLAY = np.array([
+    [1.0, 0.0, 0.0],
+    [0.0, 0.0, -1.0],
+    [0.0, 1.0, 0.0],
+])
+_DEFAULT_AZIMUTH = -70
+_DEFAULT_ELEVATION = 10
+
+
+def _engine_to_display(points: np.ndarray) -> np.ndarray:
+    """(N, 3) engine-frame (Y-up) points -> pyqtgraph's Z-up display frame."""
+    return np.asarray(points, dtype=np.float64) @ _ENGINE_TO_DISPLAY.T
+
 
 def _bone_line_colors(confidence: dict[str, float] | None) -> np.ndarray | tuple[float, float, float, float]:
     """Pure math behind show_skeleton's per-bone coloring, pulled out the same way
@@ -62,8 +83,8 @@ def _compute_camera_frame(points: np.ndarray) -> tuple[np.ndarray, float]:
 class SkeletonViewport(gl.GLViewWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setCameraPosition(distance=3.0, elevation=10, azimuth=45)
-        self.opts["center"] = Vector(0, 0.8, 0)
+        self.setCameraPosition(distance=3.0, elevation=_DEFAULT_ELEVATION, azimuth=_DEFAULT_AZIMUTH)
+        self.opts["center"] = Vector(0, 0, 0)
 
         grid = gl.GLGridItem()
         grid.setSize(2, 2)
@@ -84,7 +105,8 @@ class SkeletonViewport(gl.GLViewWidget):
     def show_skeleton(
         self, joint_positions: dict[str, np.ndarray], confidence: dict[str, float] | None = None
     ) -> None:
-        """joint_positions: output of retarget.skeleton.joint_positions (engine Y-up frame).
+        """joint_positions: output of retarget.skeleton.joint_positions (engine Y-up
+        frame; converted to the view's Z-up frame here -- see _engine_to_display).
 
         confidence: optional per-bone score from retarget.skeleton.bone_confidence(). When
         given, each bone segment below LOW_CONFIDENCE_THRESHOLD is drawn in
@@ -104,12 +126,12 @@ class SkeletonViewport(gl.GLViewWidget):
             segments.append(joint_positions[f"{bone.name}.head"])
             segments.append(joint_positions[f"{bone.name}.tail"])
 
-        points = np.array(segments, dtype=np.float32)
+        points = _engine_to_display(np.array(segments)).astype(np.float32)
         line_color = _bone_line_colors(confidence)
         self._bone_lines = gl.GLLinePlotItem(pos=points, color=line_color, width=3, mode="lines")
         self.addItem(self._bone_lines)
 
-        joints = np.array(list(joint_positions.values()), dtype=np.float32)
+        joints = _engine_to_display(np.array(list(joint_positions.values()))).astype(np.float32)
         self._joints = gl.GLScatterPlotItem(pos=joints, color=JOINT_COLOR, size=8)
         self.addItem(self._joints)
 

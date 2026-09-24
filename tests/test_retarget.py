@@ -24,7 +24,11 @@ def _t_pose_landmarks() -> np.ndarray:
 
     lm[sk.LEFT_EAR] = [0.05, 0.65, 0.0]
     lm[sk.RIGHT_EAR] = [-0.05, 0.65, 0.0]
-    lm[sk.NOSE] = [0.0, 0.60, 0.0]
+    lm[sk.NOSE] = [0.0, 0.60, 0.1]
+    # Eyes level with the ears and in front of them (+Z, toward the camera):
+    # a level head, which skeleton._head_top turns into a straight-up head bone.
+    lm[sk.LEFT_EYE] = [0.03, 0.65, 0.08]
+    lm[sk.RIGHT_EYE] = [-0.03, 0.65, 0.08]
 
     lm[sk.LEFT_ELBOW] = lm[sk.LEFT_SHOULDER] + [0.25, 0.0, 0.0]
     lm[sk.LEFT_WRIST] = lm[sk.LEFT_ELBOW] + [0.25, 0.0, 0.0]
@@ -40,11 +44,11 @@ def _t_pose_landmarks() -> np.ndarray:
 
     lm[sk.LEFT_KNEE] = lm[sk.LEFT_HIP] + [0.0, -0.5, 0.0]
     lm[sk.LEFT_ANKLE] = lm[sk.LEFT_KNEE] + [0.0, -0.5, 0.0]
-    lm[sk.LEFT_FOOT_INDEX] = lm[sk.LEFT_ANKLE] + [0.0, 0.0, -0.2]
+    lm[sk.LEFT_FOOT_INDEX] = lm[sk.LEFT_ANKLE] + [0.0, 0.0, 0.2]
 
     lm[sk.RIGHT_KNEE] = lm[sk.RIGHT_HIP] + [0.0, -0.5, 0.0]
     lm[sk.RIGHT_ANKLE] = lm[sk.RIGHT_KNEE] + [0.0, -0.5, 0.0]
-    lm[sk.RIGHT_FOOT_INDEX] = lm[sk.RIGHT_ANKLE] + [0.0, 0.0, -0.2]
+    lm[sk.RIGHT_FOOT_INDEX] = lm[sk.RIGHT_ANKLE] + [0.0, 0.0, 0.2]
 
     return lm
 
@@ -200,14 +204,36 @@ def test_bone_confidence_rejects_wrong_shape():
         sk.bone_confidence(np.zeros(10))
 
 
-def test_mirror_landmarks_swaps_left_and_right():
+def test_mirror_landmarks_swaps_left_and_right_and_reflects_x():
     landmarks = _t_pose_landmarks()
+    landmarks[sk.LEFT_ELBOW] += [0.0, 0.1, 0.05]  # make the pose asymmetric
     mirrored = sk.mirror_landmarks(landmarks)
 
-    assert np.array_equal(mirrored[sk.LEFT_SHOULDER], landmarks[sk.RIGHT_SHOULDER])
-    assert np.array_equal(mirrored[sk.RIGHT_HIP], landmarks[sk.LEFT_HIP])
+    reflect = np.array([-1.0, 1.0, 1.0])
+    assert np.array_equal(mirrored[sk.LEFT_SHOULDER], landmarks[sk.RIGHT_SHOULDER] * reflect)
+    assert np.array_equal(mirrored[sk.RIGHT_HIP], landmarks[sk.LEFT_HIP] * reflect)
+    assert np.array_equal(mirrored[sk.RIGHT_ELBOW], landmarks[sk.LEFT_ELBOW] * reflect)
     # Mirroring twice returns the original.
     assert np.array_equal(sk.mirror_landmarks(mirrored), landmarks)
+
+
+def test_mirror_landmarks_reflects_normalized_image_x_and_only_swaps_1d_arrays():
+    image_xy = _sample_image_landmarks_2d()
+    mirrored_xy = sk.mirror_landmarks(image_xy)
+    np.testing.assert_allclose(mirrored_xy[sk.LEFT_WRIST], [1.0 - image_xy[sk.RIGHT_WRIST][0], image_xy[sk.RIGHT_WRIST][1]])
+
+    visibility = np.linspace(0.0, 1.0, sk.NUM_LANDMARKS)
+    mirrored_visibility = sk.mirror_landmarks(visibility)
+    assert mirrored_visibility[sk.LEFT_KNEE] == visibility[sk.RIGHT_KNEE]
+    assert mirrored_visibility[sk.NOSE] == visibility[sk.NOSE]
+
+
+def test_mirrored_t_pose_still_solves_to_identity():
+    """Regression test: mirroring used to swap rows without reflecting X, so
+    both arms of a T-pose pointed back through the body (180-degree swings)."""
+    rotations = sk.solve_bone_rotations(sk.mirror_landmarks(_t_pose_landmarks()))
+    for name, rot in rotations.items():
+        assert np.linalg.norm(rot.as_rotvec()) < 1e-6, name
 
 
 def test_orientation_corrections_include_default_identity():

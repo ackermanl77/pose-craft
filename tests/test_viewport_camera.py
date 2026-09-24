@@ -11,6 +11,7 @@ from pose_craft.gui.viewport_3d import (  # noqa: E402
     LOW_CONFIDENCE_BONE_COLOR,
     _bone_line_colors,
     _compute_camera_frame,
+    _engine_to_display,
     _MIN_CAMERA_DISTANCE,
 )
 from pose_craft.retarget.skeleton import BONE_NAMES  # noqa: E402
@@ -84,3 +85,13 @@ def test_bone_line_colors_defaults_missing_bones_to_full_confidence():
     """
     colors = _bone_line_colors({})
     assert np.allclose(colors, np.tile(BONE_COLOR, (2 * len(BONE_NAMES), 1)))
+
+
+def test_engine_to_display_stands_the_skeleton_up_in_the_z_up_view():
+    """pyqtgraph's view is Z-up; the engine is Y-up with the subject facing +Z.
+    Engine up must become display up (+Z) and the subject's facing direction
+    must become -Y (Blender's front), with their left staying on +X."""
+    up, forward, left = _engine_to_display(np.eye(3)[[1, 2, 0]])
+    np.testing.assert_allclose(up, [0.0, 0.0, 1.0])
+    np.testing.assert_allclose(forward, [0.0, -1.0, 0.0])
+    np.testing.assert_allclose(left, [1.0, 0.0, 0.0])
