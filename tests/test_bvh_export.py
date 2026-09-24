@@ -113,19 +113,36 @@ def test_known_rotation_round_trips_through_bvh_euler_values():
         assert np.linalg.norm(relative.as_rotvec()) < 1e-6, bone_name
 
 
-def test_offsets_point_along_each_bones_rest_direction():
-    document = bvh.build_bvh_document({})
-    lines = document.splitlines()
+def _offsets_by_joint(document: str) -> dict[str, np.ndarray]:
+    """First OFFSET after each ROOT/JOINT line -- the joint's own OFFSET."""
+    offsets: dict[str, np.ndarray] = {}
+    current = None
+    for line in document.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("ROOT ", "JOINT ")):
+            current = stripped.split(" ", 1)[1]
+        elif stripped.startswith("OFFSET") and current is not None:
+            offsets[current] = np.array([float(v) for v in stripped.split()[1:]])
+            current = None
+    return offsets
 
-    # spine's OFFSET (the root's own OFFSET line, right after "ROOT spine {")
-    offset_line = next(line for line in lines if line.strip().startswith("OFFSET"))
-    offset = np.array([float(v) for v in offset_line.strip().split()[1:]])
-    # spine's rest_direction (BONES[0].rest_direction) is UP == (0, 1, 0); its
-    # offset should point the same way.
-    assert offset[1] > 0
-    assert np.isclose(offset[0], 0.0)
-    assert np.isclose(offset[2], 0.0)
-    assert np.isclose(np.linalg.norm(offset), bvh.BONE_LENGTHS_CM["spine"])
+
+def test_joint_offsets_are_head_relative_to_the_parents_head():
+    """Regression test: every JOINT's OFFSET used to be its OWN bone vector
+    (shifting the whole skeleton one level) -- BVH defines it as the joint's
+    head relative to its parent's head."""
+    offsets = _offsets_by_joint(bvh.build_bvh_document({}))
+    L = bvh.BONE_LENGTHS_CM
+
+    np.testing.assert_allclose(offsets["spine"], [0.0, 0.0, 0.0])  # placed by the root position channels
+    np.testing.assert_allclose(offsets["neck"], [0.0, L["spine"], 0.0])  # the spine's own vector
+    np.testing.assert_allclose(offsets["head"], [0.0, L["neck"], 0.0])
+    np.testing.assert_allclose(offsets["upper_arm.L"], [bvh.SHOULDER_HALF_WIDTH_CM, L["spine"], 0.0])
+    np.testing.assert_allclose(offsets["upper_arm.R"], [-bvh.SHOULDER_HALF_WIDTH_CM, L["spine"], 0.0])
+    np.testing.assert_allclose(offsets["forearm.L"], [L["upper_arm.L"], 0.0, 0.0])
+    np.testing.assert_allclose(offsets["thigh.L"], [bvh.HIP_HALF_WIDTH_CM, 0.0, 0.0])
+    np.testing.assert_allclose(offsets["shin.R"], [0.0, -L["thigh.R"], 0.0])
+    np.testing.assert_allclose(offsets["foot.R"], [0.0, -L["shin.R"], 0.0])
 
 
 def test_save_bvh_file_writes_a_readable_bvh_file(tmp_path):
