@@ -350,7 +350,7 @@ class MainWindow(QMainWindow):
         if self._worker is not None and self._worker.isRunning():
             return
 
-        path, _ = QFileDialog.getOpenFileName(self, "Load Photo", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
+        path, _ = QFileDialog.getOpenFileName(self, "Load Photo", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff)")
         if not path:
             return
 

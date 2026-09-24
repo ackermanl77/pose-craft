@@ -59,3 +59,20 @@ def test_assess_photo_quality_checks_the_shorter_side():
     # not the long side (2000) alone.
     wide_but_short = np.zeros((300, 2000, 3), dtype=np.uint8)
     assert len(assess_photo_quality(wide_but_short)) == 1
+
+
+def test_imread_unicode_reads_a_16_bit_tiff_as_8_bit_bgr(tmp_path):
+    # The Load Photo dialog accepts .tif/.tiff; a 16-bit grayscale TIFF (common
+    # from scanners/raw converters) must still come back as the 8-bit 3-channel
+    # BGR image the pose pipeline expects.
+    image = np.full((6, 5), 65535, dtype=np.uint16)
+    ok, encoded = cv2.imencode(".tiff", image)
+    assert ok
+    path = tmp_path / "scan.tiff"
+    path.write_bytes(encoded.tobytes())
+
+    loaded = imread_unicode(path)
+    assert loaded is not None
+    assert loaded.shape == (6, 5, 3)
+    assert loaded.dtype == np.uint8
+    assert np.all(loaded == 255)

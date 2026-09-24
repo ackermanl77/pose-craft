@@ -23,13 +23,15 @@ hiddenimports += collect_submodules('tflite')
 # so the frozen app finds them the same way a dev venv does, and PyInstaller's own
 # dependency scan (which copies some of them there too) doesn't create duplicates.
 # Skipped (CPU-only build) when they aren't installed. cufftw/nvblas are CPU-API shims
-# nothing here uses.
+# nothing here uses; curand64_10 (~60 MB) isn't imported (statically or delay-loaded)
+# by onnxruntime's providers, cuDNN or cuBLAS -- checked with pefile -- and
+# onnxruntime.preload_dlls() only preloads curand on Linux.
 _nvidia_spec = importlib.util.find_spec('nvidia')
 if _nvidia_spec is not None and _nvidia_spec.submodule_search_locations:
     _nvidia_root = list(_nvidia_spec.submodule_search_locations)[0]
     _site_packages = os.path.dirname(_nvidia_root)
     for _dll in glob.glob(os.path.join(_nvidia_root, '**', 'bin', '**', '*.dll'), recursive=True):
-        if not os.path.basename(_dll).startswith(('cufftw', 'nvblas')):
+        if not os.path.basename(_dll).startswith(('cufftw', 'nvblas', 'curand')):
             binaries.append((_dll, os.path.relpath(os.path.dirname(_dll), _site_packages)))
 
 
