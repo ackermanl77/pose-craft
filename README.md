@@ -50,7 +50,7 @@ want the latest of everything instead, drop the `==` pins.
 python -m pose_craft.app
 ```
 
-Load a photo (a resolution/framing warning pops up if it's likely to give a
+Load a photo (PNG/JPEG/BMP/WebP/TIFF; a resolution/framing warning pops up if it's likely to give a
 worse result -- see the tips under the Load Photo button), optionally raise
 "Max people to detect" above its default of 4 for a bigger group photo, then
 click **Solve Pose** (downloads MediaPipe's pose model to
@@ -81,7 +81,8 @@ the photo) are called out separately from unmatched bone names in both paths.
 If your rig's bone names don't match PoseCraft's automatic guessing (a bone
 shows up as "unmatched"), use the panel's **Bone Mapping** box: click
 "Initialize/Refresh" for one row per PoseCraft bone name, then either "Auto-Guess
-Unset" to fill in what it can, or pick each target bone yourself from the
+Unset" to fill in what it can (it knows Rigify's `upper_arm_fk.L`-style controls
+and Mixamo's `mixamorig:` names), or pick each target bone yourself from the
 searchable dropdown. Saved on the armature, so it's a one-time setup per rig.
 
 ## Build the .exe
@@ -114,5 +115,7 @@ today.
 See [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) for architecture, and its
 "Known Issues" section before relying on an exported pose -- twist is only
 solved for the hands (everything else stays at identity), the world-landmark axis
-convention is an unverified best guess, and the Blender add-on (including the
-new Live Link server) hasn't been checked against a real Blender install or rig.
+convention follows MediaPipe's docs but hasn't been checked end to end against a
+real photo, the add-on assumes a T-pose rig (A-pose rigs and rigs with extra
+spine/hip bones need manual touch-up), and the Blender add-on (including the
+Live Link server) hasn't been checked against a real Blender install or rig.

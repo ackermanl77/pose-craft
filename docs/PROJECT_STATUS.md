@@ -12,7 +12,8 @@ PoseEstimator (pose_craft/estimation/landmarker.py)
      (estimation/tflite_to_onnx.py) and run on ONNX Runtime -- CUDA provider on an
      NVIDIA GPU when available, CPU otherwise (estimation/onnx_pose.py re-implements
      MediaPipe's detector -> ROI -> landmark calculator graph); multi-person
-        |  landmarks converted to the engine frame (Y-up, +X right, +Z toward camera);
+        |  landmarks converted to the engine frame (right-handed, Y-up, +X image right =
+        |  subject's left, +Z toward camera = the way the subject faces);
         |  each DetectedPerson also carries 2D image-space landmarks + per-landmark visibility
         v
 retarget/skeleton.py -- 15-bone humanoid hierarchy, T-pose rest directions
@@ -35,8 +36,9 @@ export/blender_addon/import_pose.py (installed inside Blender)
      non-blocking accept) that applies a received pose automatically
   -- bone name resolution: an explicit per-armature manual mapping row
      (POSECRAFT_BoneMapping, saved with the .blend file) wins if set, else
-     falls back to Rigify-style name-guessing (DEF-/ORG-/_fk/_ik)
-  -- applies bone quaternions to the active armature's pose bones
+     falls back to name-guessing (exact, Rigify upper_arm_fk.L/_ik, DEF-/ORG-, Mixamo)
+  -- converts each armature-space delta into the bone's rest frame
+     (R^-1 q R) and applies it to the active armature's pose bones
 ```
 
 `pose_craft/gui/main_window.py` is the only orchestrator: it owns the loaded
@@ -217,6 +219,71 @@ time each check ran, not guaranteed to stay true as the code changes.
 
 ## Recently Fixed
 
+- **Review fixes (axis convention, mirror, BVH, head, stale UI, add-on).**
+  Each now has a test that describes what should happen, not just the math
+  (`tests/test_axis_conventions.py`, plus additions to the existing test files):
+  - **Depth was mirrored.** `_world_to_engine()` flipped only Y. MediaPipe's
+    world frame is +y down with smaller z closer to the camera, so the result
+    was left-handed: a knee raised toward the camera exported *behind* the rig
+    (Blender +Y). It now negates Y and Z (a 180-degree rotation about X),
+    giving a right-handed frame where +X is image right (the subject's left,
+    which is why `LEFT_X = +X` was already right) and +Z points toward the
+    camera. `FORWARD` (the foot rest direction) is now +Z, and the docstrings
+    that said "+X = subject's right" are fixed. `blender_pose.py`'s axis
+    conversion was already right for this frame (a character faces -Y, .L is
+    on +X). Tests: a knee toward the camera lands in front of the rig in
+    Blender and in the BVH, and a left arm raised out to the subject's left
+    stays on the left. Side effect: the hand-twist zero reference (+Z) now
+    means a palm-down T-pose hand. In the old left-handed frame, a palm-down
+    hand solved to a 180-degree twist.
+  - **The 3D viewport drew the skeleton lying on the grid.** pyqtgraph's view
+    is Z-up, but it was given raw Y-up engine points. `viewport_3d.py` now
+    converts to Z-up (`_engine_to_display`, the same axis change as the Blender
+    export) and starts the camera in front of the subject. The orientation
+    presets still rotate in the engine frame before that conversion, so they
+    behave as before.
+  - **The mirror checkbox rotated the limbs 180 degrees.** `mirror_landmarks()`
+    swapped the left/right rows but didn't reflect them, so a mirrored T-pose
+    had both arms pointing through the body. It now also negates X (for 3D)
+    or maps x to 1 - x (for 2D normalized coordinates). 1-D visibility arrays
+    still only get the row swap. The 3D preview's low-confidence coloring now
+    uses mirrored visibility too.
+  - **BVH offsets were shifted one level.** Each JOINT's OFFSET was the
+    joint's own bone vector instead of its head relative to its parent's
+    head. The rest skeleton (`_rest_heads`) now uses chain offsets plus
+    `SHOULDER_HALF_WIDTH_CM`/`HIP_HALF_WIDTH_CM` lateral attachments, with the
+    root at zero. Each End Site is the leaf bone's own vector. A
+    forward-kinematics test evaluates the written BVH (rest offsets plus
+    rotations) and checks that it reproduces every solved joint position.
+    scipy's gimbal-lock warning at exactly +/-90 degrees about X is now
+    suppressed, because the angles it returns are still exact.
+  - **A level head exported pitched ~20 degrees back.** `_head_top`
+    extrapolated along the nose-to-ear line, and the nose sits below and in
+    front of the ears. The head's up axis is now the cross product of the
+    face-forward vector (ear midpoint to eye midpoint) and the ear-to-ear line.
+    A level head gives about 0 degrees, and a 30-degree nod gives 30 degrees
+    forward.
+  - **A re-solve that found nobody left stale UI.** The person list, photo
+    overlay and 3D skeleton from the previous solve stayed up, and every
+    export button stayed enabled. That path now clears all of them.
+  - **Blender add-on.** Unreadable or invalid JSON now shows an error report
+    instead of a traceback. The Rigify templates now put the tag before the
+    side suffix (`upper_arm_fk.L`, not `upper_arm.L_fk`) and prefer control
+    bones over constraint-driven DEF-/ORG- bones. Mixamo names
+    (`mixamorig:LeftArm`, ...) were added. Rotations are now converted into
+    each bone's rest frame before being applied (`armature_delta_to_basis`,
+    `R^-1 @ q @ R` with `R = bone.matrix_local`). Previously the
+    armature-space delta was written straight into `rotation_quaternion`,
+    which rotated almost every bone about the wrong axes. The pure helpers
+    (`bone_name_candidates`, `armature_delta_to_basis`) are tested by
+    compiling them out of the add-on's source with `ast`. The second one is
+    checked against a simulation of Blender's pose evaluation with
+    non-aligned rest frames.
+  - **Packaging.** `PoseCraft.spec` now leaves out `curand64_10.dll` (~60 MB).
+    pefile shows none of the bundled onnxruntime, cuDNN or cuBLAS DLLs import
+    it (statically or delay-loaded), and `onnxruntime.preload_dlls()` only
+    preloads curand on Linux. The Load Photo dialog now accepts `.tif`/`.tiff`.
+
 - **Pose estimation could only run on the CPU.** MediaPipe's Windows wheels
   are built without GPU support, so the `mediapipe` package couldn't use an
   NVIDIA GPU at all. **Fixed** by moving inference to ONNX Runtime:
@@ -303,7 +370,7 @@ time each check ran, not guaranteed to stay true as the code changes.
   each bone's local rotation converted to intrinsic Z/X/Y Euler angles
   (`BVH_ROTATION_ORDER = "ZXY"`, matching the "Zrotation Xrotation Yrotation"
   channel order it always writes). Documents its own explicit (currently
-  identity, since it targets the same Y-up/+X-right/+Z-forward convention as
+  identity, since it targets the same Y-up/+X-left/+Z-forward convention as
   the engine frame) axis conversion the same way `blender_pose.py`'s
   `_ENGINE_TO_BLENDER_AXES` does, for the same reason: BVH has no single
   universal up-axis convention across tools, unlike this project's Blender
@@ -603,23 +670,37 @@ Ranked roughly by how much they affect whether an exported pose is usable:
   of fix PoseForge's own "Before you buy" section warns about for DAZ. The
   per-bone `low_confidence` flag doesn't help here either way -- it's about
   landmark visibility, not about whether twist could be solved at all.
-- **MediaPipe's world-landmark axis convention is a best-effort guess, not a
-  verified fact.** Isolated in `_world_to_engine()` in
-  `estimation/landmarker.py` specifically so it's the one place to fix if an
-  exported pose comes out upside-down or mirrored against the source photo --
-  this has not been checked against real MediaPipe output in this dev
-  environment (no working display was used to run the live solve loop
+- **The world-landmark axis convention follows MediaPipe's documentation
+  (+y down, smaller z = closer to the camera; see "Recently Fixed"), but the
+  whole export hasn't been checked against a real photo.** Isolated in
+  `_world_to_engine()` in `estimation/landmarker.py` specifically so it's the
+  one place to fix if an exported pose comes out upside-down or mirrored
+  against the source photo. No live solve with a real photo has been compared
+  against a Blender rig in this dev environment (no working display was used to run the live solve loop
   end-to-end against a real photo). The GUI now has a user-facing mitigation
   for this specific failure mode (see "Recently Fixed" -- the orientation
   combo next to the mirror checkbox), so an upside-down/wrong-facing result no
   longer requires a code fix to work around, only picking the right dropdown
   entry; it doesn't make the underlying axis-convention guess itself any more
   verified.
+- **Retargeting assumes the rig's rest pose matches PoseCraft's own T-pose
+  rest skeleton.** The add-on converts each rotation into the bone's rest
+  frame, but it doesn't correct for different rest *directions* (e.g. an
+  A-pose rig, whose arms point about 45 degrees down at rest, ends up with
+  arms about 45 degrees lower than the photo). It also doesn't correct for a
+  different hierarchy: PoseCraft parents the thighs, arms and neck to one
+  "spine" bone, while Rigify and Mixamo rigs have hips and several
+  spine/chest bones in between, and bones PoseCraft doesn't map stay at rest.
+  A torso lean therefore doesn't carry through to the thighs on those rigs.
+  The fix is full retargeting: compute each target bone's basis from the
+  world-space delta and the actual parent's pose, measured against the rig's
+  own rest directions. That's out of scope for the minimal fix.
 - **The Blender add-on -- bone-name matching, the manual Bone Mapping UI, and
   the Live Link server -- is unverified against a real Blender install.**
-  `NAME_CANDIDATES_TEMPLATES` in `import_pose.py` guesses at common Rigify
-  naming patterns (`DEF-`, `ORG-`, `_fk`, `_ik`) but was never loaded into
-  Blender or run against an actual Rigify-generated armature; the manual
+  `bone_name_candidates()` in `import_pose.py` guesses at Rigify
+  (`upper_arm_fk.L`, `_ik`, then `DEF-`/`ORG-`) and Mixamo (`mixamorig:*`)
+  names, and its pure helpers are unit-tested, but it was never loaded into
+  Blender or run against an actual Rigify or Mixamo armature; the manual
   bone-mapping panel (`prop_search`, the `CollectionProperty` on `Object`,
   the `UIList`) and the Live Link server's `bpy.app.timers`-based
   non-blocking accept loop are likewise only checked by code review and a

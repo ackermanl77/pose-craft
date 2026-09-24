@@ -62,7 +62,7 @@ progress, solve results, export/send confirmations, and errors.
 
 ## 1. Load & Detect
 
-**Load Photo...** opens a file picker (PNG, JPG, JPEG, BMP, WEBP). Once a
+**Load Photo...** opens a file picker (PNG, JPG, JPEG, BMP, WEBP, TIF, TIFF). Once a
 photo loads:
 
 - The tips list under the button (*"For best results..."*) is always visible
@@ -120,7 +120,8 @@ top of the image:
   obvious who you're about to export.
 
 **Mirror left/right (body orientation fix)** swaps which side of the body
-feeds which exported bone -- use it if a solved pose comes out with left and
+feeds which exported bone and mirrors the pose (a left arm raised becomes a
+right arm raised) -- use it if a solved pose comes out with left and
 right reversed. It's a property of the *photo/camera orientation*, not of one
 person, so when checked it applies consistently to every person in a batch
 export too, not just whoever's currently selected. It does **not** change the
@@ -194,8 +195,8 @@ whatever your rig actually calls its bones:
 1. Click **Initialize/Refresh** once per armature -- this creates one row per
    PoseCraft bone name.
 2. Click **Auto-Guess Unset** to try filling blank rows automatically (it
-   tries the exact name, then common Rigify-style variants like `DEF-`,
-   `ORG-`, `_fk`, `_ik`).
+   tries the exact name, then Rigify controls like `upper_arm_fk.L`, then
+   `DEF-`/`ORG-` bones, then Mixamo names like `mixamorig:LeftArm`).
 3. For anything still blank, or wrong, use each row's searchable dropdown to
    pick the correct bone on your armature by hand.
 4. **Clear All** blanks every row's assignment if you want to start over
