@@ -47,8 +47,9 @@ Rotations, two ways:
 - **Match rig rest pose** (the panel checkbox, on by default; needs a format
   version 2 file): each mapped bone is aimed at the world-space target the
   file gives (PoseCraft's world rotation times its rest direction), measured
-  against the rig's OWN rest direction and the actual posed parent -- see
-  rig_pose_basis(). A-pose arms, sloped foot bones, a hips bone above the
+  against the rig's OWN rest direction and the parent's pose as Blender
+  evaluated it, constraints included -- see rig_pose_basis_evaluated() (and
+  rig_pose_basis(), the same solve on a simulated hierarchy). A-pose arms, sloped foot bones, a hips bone above the
   thighs (Mixamo) and clavicles between spine and arms all work; bones with no
   PoseCraft counterpart stay as they are and their children still land on
   target.
@@ -58,7 +59,27 @@ Rotations, two ways:
 
 A mapping row can name a chain: "Extra Bones" lists more rig bones continuing
 after its target (a Mixamo "Spine1, Spine2"), and the rotation is spread over
-the chain (Match rig rest pose only). Mixamo spines are chained automatically.
+the chain (Match rig rest pose only). Mixamo and Rigify spines are chained
+automatically (Spine/Spine1/Spine2; spine_fk/.001/.002/.003).
+
+Rigify (and other constraint-driven rigs), "Pose rig controls" on by default:
+a generated Rigify rig deforms with DEF- bones that copy ORG- bones, which in
+turn copy the FK or IK controls -- posing a DEF-/ORG- bone directly does
+nothing. A mapped bone whose rotation is overridden by a constraint is
+redirected to the bone that actually drives it (constraint_driver follows
+Copy Transforms/Copy Rotation/Child Of/Armature targets, preferring FK
+controls; else a control with the bone's unprefixed name), the limbs whose FK
+controls get posed are switched to FK (Rigify's IK_FK property on
+upper_arm_parent.L/thigh_parent.L, see rigify_fk_switches), and every bone is
+solved against its parent's pose as Blender actually evaluated it,
+constraints included (rig_pose_basis_evaluated) -- so the MCH- bones Rigify
+puts between the torso and the limbs don't throw the limbs off.
+
+Fingers: a file from the app's "Hands and fingers" option also has 15
+finger bones per hand, named as in Rigify (thumb.01.L .. f_pinky.03.R, see
+POSECRAFT_FINGER_BONE_NAMES), which match a Rigify rig's finger controls by
+name and a Mixamo rig's LeftHandThumb1.. bones through
+MIXAMO_FINGER_BONE_NAMES. Bone Mapping rows exist for them too.
 
 Options in the panel: "Keep feet on the floor" moves the rig's root so the
 pose stands on the rig's own floor (a crouch comes out lowered); "Insert
@@ -89,7 +110,7 @@ from mathutils import Quaternion, Vector
 bl_info = {
     "name": "PoseCraft Pose Importer",
     "author": "PoseCraft",
-    "version": (0, 5, 0),
+    "version": (0, 6, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > PoseCraft",
     "description": "Applies a PoseCraft .json pose export (file or Live Link) to an armature's pose bones",
@@ -107,6 +128,21 @@ POSECRAFT_BONE_NAMES = [
     "upper_arm.R", "forearm.R", "hand.R",
     "thigh.L", "shin.L", "foot.L",
     "thigh.R", "shin.R", "foot.R",
+]
+
+# Mirrors pose_craft/retarget/skeleton.py::FINGER_BONE_NAMES (B11): present in
+# a file only when the app solved the hands. Rigify's own finger names.
+POSECRAFT_FINGER_BONE_NAMES = [
+    "thumb.01.L", "thumb.02.L", "thumb.03.L",
+    "f_index.01.L", "f_index.02.L", "f_index.03.L",
+    "f_middle.01.L", "f_middle.02.L", "f_middle.03.L",
+    "f_ring.01.L", "f_ring.02.L", "f_ring.03.L",
+    "f_pinky.01.L", "f_pinky.02.L", "f_pinky.03.L",
+    "thumb.01.R", "thumb.02.R", "thumb.03.R",
+    "f_index.01.R", "f_index.02.R", "f_index.03.R",
+    "f_middle.01.R", "f_middle.02.R", "f_middle.03.R",
+    "f_ring.01.R", "f_ring.02.R", "f_ring.03.R",
+    "f_pinky.01.R", "f_pinky.02.R", "f_pinky.03.R",
 ]
 
 # Mirrors pose_craft/export/blender_pose.py::FORMAT_VERSION, for the same
@@ -143,10 +179,42 @@ MIXAMO_BONE_NAMES = {
     "thigh.L": "LeftUpLeg", "shin.L": "LeftLeg", "foot.L": "LeftFoot",
     "thigh.R": "RightUpLeg", "shin.R": "RightLeg", "foot.R": "RightFoot",
 }
+MIXAMO_FINGER_BONE_NAMES = {
+    "thumb.01.L": "LeftHandThumb1", "thumb.02.L": "LeftHandThumb2", "thumb.03.L": "LeftHandThumb3",
+    "f_index.01.L": "LeftHandIndex1", "f_index.02.L": "LeftHandIndex2", "f_index.03.L": "LeftHandIndex3",
+    "f_middle.01.L": "LeftHandMiddle1", "f_middle.02.L": "LeftHandMiddle2", "f_middle.03.L": "LeftHandMiddle3",
+    "f_ring.01.L": "LeftHandRing1", "f_ring.02.L": "LeftHandRing2", "f_ring.03.L": "LeftHandRing3",
+    "f_pinky.01.L": "LeftHandPinky1", "f_pinky.02.L": "LeftHandPinky2", "f_pinky.03.L": "LeftHandPinky3",
+    "thumb.01.R": "RightHandThumb1", "thumb.02.R": "RightHandThumb2", "thumb.03.R": "RightHandThumb3",
+    "f_index.01.R": "RightHandIndex1", "f_index.02.R": "RightHandIndex2", "f_index.03.R": "RightHandIndex3",
+    "f_middle.01.R": "RightHandMiddle1", "f_middle.02.R": "RightHandMiddle2", "f_middle.03.R": "RightHandMiddle3",
+    "f_ring.01.R": "RightHandRing1", "f_ring.02.R": "RightHandRing2", "f_ring.03.R": "RightHandRing3",
+    "f_pinky.01.R": "RightHandPinky1", "f_pinky.02.R": "RightHandPinky2", "f_pinky.03.R": "RightHandPinky3",
+}
 MIXAMO_PREFIXES = ["mixamorig:", "mixamorig1:", ""]
 # Mixamo's spine is three bones (Spine, Spine1, Spine2); PoseCraft's one spine
 # bone is spread over all of them (see distribute_rotation).
 MIXAMO_SPINE_CHAIN_EXTRAS = ["Spine1", "Spine2"]
+# Rigify's FK spine controls above spine_fk (a generated rig's torso).
+RIGIFY_SPINE_CHAIN_EXTRAS = ["spine_fk.001", "spine_fk.002", "spine_fk.003"]
+
+# Constraint types that override a bone's own rotation: a bone carrying one
+# (unmuted) is driven by something else, and posing it has no effect.
+OVERRIDING_CONSTRAINTS = [
+    "COPY_TRANSFORMS", "COPY_ROTATION", "CHILD_OF", "ARMATURE",
+    "DAMPED_TRACK", "STRETCH_TO", "TRACK_TO", "LOCKED_TRACK", "IK",
+]
+# The subset whose target is the bone it copies its rotation from -- what
+# constraint_driver follows back to the control that drives a DEF-/ORG- bone.
+FOLLOWED_CONSTRAINTS = ["COPY_TRANSFORMS", "COPY_ROTATION", "CHILD_OF", "ARMATURE"]
+RIGIFY_PREFIXES = ["DEF-", "ORG-", "MCH-"]
+# Rigify limbs: which chain's master control holds each FK control's IK/FK
+# switch (upper_arm_parent.L holds IK_FK for upper_arm/forearm/hand_fk.L).
+RIGIFY_LIMB_ROOTS = {
+    "upper_arm": "upper_arm", "forearm": "upper_arm", "hand": "upper_arm",
+    "thigh": "thigh", "shin": "thigh", "foot": "thigh",
+}
+RIGIFY_IK_FK_PROPERTY = "IK_FK"
 
 LIVE_LINK_HOST = "127.0.0.1"
 DEFAULT_LIVE_LINK_PORT = 8642
@@ -181,7 +249,7 @@ def bone_name_candidates(exported_name: str) -> list[str]:
     else:
         base, side = exported_name, ""
     candidates = [template.format(name=exported_name, base=base, side=side) for template in NAME_CANDIDATES_TEMPLATES]
-    mixamo_name = MIXAMO_BONE_NAMES.get(exported_name)
+    mixamo_name = MIXAMO_BONE_NAMES.get(exported_name) or MIXAMO_FINGER_BONE_NAMES.get(exported_name)
     if mixamo_name is not None:
         candidates += [prefix + mixamo_name for prefix in MIXAMO_PREFIXES]
     unique = []
@@ -294,6 +362,134 @@ def mixamo_chain_extras(exported_name: str, base_bone: str, existing) -> list:
         if base_bone == prefix + MIXAMO_BONE_NAMES["spine"]:
             return [prefix + extra for extra in MIXAMO_SPINE_CHAIN_EXTRAS if prefix + extra in existing]
     return []
+
+
+def rigify_chain_extras(exported_name: str, base_bone: str, existing) -> list:
+    """Rigify's FK spine above a guessed spine_fk (spine_fk.001-.003, when
+    they exist): the torso bends along it like a Mixamo spine."""
+    if exported_name != "spine" or base_bone != "spine_fk":
+        return []
+    return [name for name in RIGIFY_SPINE_CHAIN_EXTRAS if name in existing]
+
+
+def is_constraint_driven(name: str, constraints: dict) -> bool:
+    """Whether `name` has an unmuted constraint that overrides its rotation.
+    `constraints`: bone name -> list of {"type", "subtarget", "influence",
+    "mute"} for constraints targeting this armature's bones. Pure (no bpy).
+    A constraint at influence 0 still counts: Rigify drives influences."""
+    return any(c.get("type") in OVERRIDING_CONSTRAINTS and not c.get("mute") for c in constraints.get(name, ()))
+
+
+def constraint_driver(name: str, constraints: dict, max_depth: int = 8) -> str:
+    """The bone whose rotation `name` follows through Copy Transforms / Copy
+    Rotation / Child Of / Armature constraints (several hops: DEF- -> ORG- ->
+    the control), preferring FK targets (Rigify's ORG- bones copy both the
+    FK and the IK chain), then non-MCH ones, then the higher influence. `name`
+    itself when nothing is followed. Pure (no bpy)."""
+    seen, current = {name}, name
+    for _hop in range(max_depth):
+        options = [
+            c for c in constraints.get(current, ())
+            if c.get("type") in FOLLOWED_CONSTRAINTS and c.get("subtarget") and not c.get("mute")
+        ]
+        if not options:
+            break
+
+        def preference(item):
+            index, constraint = item
+            target = constraint["subtarget"]
+            return (
+                0 if "_fk" in target.lower() else 1,
+                1 if target.startswith("MCH-") else 0,
+                -float(constraint.get("influence", 1.0)),
+                index,
+            )
+
+        _index, best = min(enumerate(options), key=preference)
+        if best["subtarget"] in seen:
+            break
+        current = best["subtarget"]
+        seen.add(current)
+    return current
+
+
+def control_bone_for(name: str, constraints: dict, existing) -> str:
+    """The bone to pose so that `name` moves: `name` itself when nothing
+    overrides its rotation; else the free bone its constraints follow
+    (constraint_driver); else a free control named like it without Rigify's
+    DEF-/ORG-/MCH- prefix (upper_arm_fk.L for DEF-upper_arm.L). Pure (no bpy)."""
+    if not is_constraint_driven(name, constraints):
+        return name
+    driver = constraint_driver(name, constraints)
+    if driver != name and driver in existing and not is_constraint_driven(driver, constraints):
+        return driver
+    for prefix in RIGIFY_PREFIXES:
+        if name.startswith(prefix):
+            for candidate in bone_name_candidates(name[len(prefix):]):
+                if any(candidate.startswith(p) for p in RIGIFY_PREFIXES):
+                    continue
+                if candidate in existing and not is_constraint_driven(candidate, constraints):
+                    return candidate
+    return driver if driver in existing else name
+
+
+def rigify_fk_switches(controls, properties: dict) -> list:
+    """(holder bone, property) pairs to set to 1.0 so the Rigify limbs whose FK
+    controls are in `controls` follow FK instead of IK: the limb's master
+    control (upper_arm_parent.L / thigh_parent.L, or an MCH- one) carrying
+    an IK_FK property. `properties`: bone name -> its custom property names.
+    Pure (no bpy)."""
+    switches = []
+    for control in controls:
+        base, dot, side = control.rpartition(".")
+        side = dot + side if dot and side in ("L", "R") else ""
+        stem = base if side else control
+        if not stem.endswith("_fk"):
+            continue
+        root = RIGIFY_LIMB_ROOTS.get(stem[: -len("_fk")])
+        if root is None:
+            continue
+        for holder in (f"{root}_parent{side}", f"MCH-{root}_parent{side}"):
+            if RIGIFY_IK_FK_PROPERTY in properties.get(holder, ()):
+                if (holder, RIGIFY_IK_FK_PROPERTY) not in switches:
+                    switches.append((holder, RIGIFY_IK_FK_PROPERTY))
+                break
+    return switches
+
+
+def rig_pose_basis_evaluated(order, parents, rest, deltas, evaluate, write, inherit_rotation=None, passes=2):
+    """rig_pose_basis against the rig as Blender actually evaluates it: each
+    mapped bone is solved from its parent's evaluated pose (constraints and
+    drivers included -- Rigify's MCH- bones between the torso and the limbs
+    follow other bones), so it lands on its target whatever drives the
+    parent. Level by level down the hierarchy: `evaluate(names)` returns
+    {name: posed armature-space rotation} after the writes so far (Blender:
+    view_layer.update(), then pose_bone.matrix), `write(name, basis)` applies
+    a basis rotation. A second pass catches a parent driven by a bone solved
+    after it (a constraint across branches). Returns the bases written.
+    Duck-typed on `@` and `.inverted()`."""
+    inherit_rotation = inherit_rotation or {}
+    depth = {}
+    for name in order:
+        parent = parents.get(name)
+        depth[name] = 0 if parent is None else depth.get(parent, -1) + 1
+    mapped = [name for name in order if name in deltas]
+    result = {}
+    for _pass in range(max(1, passes)):
+        for level in sorted({depth[name] for name in mapped}):
+            bones = [name for name in mapped if depth[name] == level]
+            needed = [parents[n] for n in bones if parents.get(n) is not None and inherit_rotation.get(n, True)]
+            posed = evaluate(sorted(set(needed))) if needed else {}
+            for name in bones:
+                parent = parents.get(name)
+                if parent is None or not inherit_rotation.get(name, True):
+                    chain = rest[name]
+                else:
+                    chain = posed[parent] @ rest[parent].inverted() @ rest[name]
+                basis = chain.inverted() @ (deltas[name] @ rest[name])
+                write(name, basis)
+                result[name] = basis
+    return result
 
 
 def top_ancestor(name: str, parents: dict) -> str:
@@ -442,9 +638,60 @@ def _guess_bone_name(pose_bones, exported_name: str) -> str | None:
     return None
 
 
-def _resolve_bone_chain(armature_obj: bpy.types.Object, exported_name: str) -> list[str] | None:
+def _armature_constraints(armature_obj: bpy.types.Object) -> dict:
+    """Every pose bone's constraints that target this armature's bones, in
+    the plain-dict form the pure helpers take (see is_constraint_driven)."""
+    table = {}
+    for pose_bone in armature_obj.pose.bones:
+        entries = []
+        for constraint in pose_bone.constraints:
+            mute = bool(getattr(constraint, "mute", False)) or not getattr(constraint, "enabled", True)
+            if constraint.type == "ARMATURE":
+                for target in constraint.targets:
+                    if target.target is armature_obj and target.subtarget:
+                        entries.append({"type": "ARMATURE", "subtarget": target.subtarget,
+                                        "influence": target.weight, "mute": mute})
+                continue
+            subtarget = getattr(constraint, "subtarget", "") if getattr(constraint, "target", None) is armature_obj else ""
+            entries.append({"type": constraint.type, "subtarget": subtarget,
+                            "influence": constraint.influence, "mute": mute})
+        if entries:
+            table[pose_bone.name] = entries
+    return table
+
+
+def _switch_rigify_limbs_to_fk(armature_obj: bpy.types.Object, controls) -> list:
+    """Sets Rigify's IK_FK switch to FK for the limbs whose FK controls get
+    posed (rigify_fk_switches); returns the holder bones changed."""
+    pose_bones = armature_obj.pose.bones
+    properties = {pb.name: set(pb.keys()) for pb in pose_bones if pb.keys()}
+    changed = []
+    for holder, prop in rigify_fk_switches(controls, properties):
+        if pose_bones[holder][prop] != 1.0:
+            pose_bones[holder][prop] = 1.0
+            changed.append(holder)
+    return changed
+
+
+def _resolve_bone_chain(
+    armature_obj: bpy.types.Object, exported_name: str, constraints: dict | None = None
+) -> list[str] | None:
     """The rig bones `exported_name` drives, base first (usually one; a spine
-    chain can be several), or None if it can't be resolved."""
+    chain can be several), or None if it can't be resolved. With
+    `constraints` (see _armature_constraints), a constraint-driven bone is
+    replaced by the control that drives it (control_bone_for)."""
+    chain = _resolve_bone_chain_names(armature_obj, exported_name)
+    if chain is None or constraints is None:
+        return chain
+    redirected = []
+    for name in chain:
+        control = control_bone_for(name, constraints, armature_obj.pose.bones)
+        if control not in redirected:
+            redirected.append(control)
+    return redirected
+
+
+def _resolve_bone_chain_names(armature_obj: bpy.types.Object, exported_name: str) -> list[str] | None:
     pose_bones = armature_obj.pose.bones
 
     for entry in armature_obj.posecraft_bone_mapping:
@@ -459,7 +706,11 @@ def _resolve_bone_chain(armature_obj: bpy.types.Object, exported_name: str) -> l
     guess = _guess_bone_name(pose_bones, exported_name)
     if guess is None:
         return None
-    return [guess] + mixamo_chain_extras(exported_name, guess, pose_bones)
+    return (
+        [guess]
+        + mixamo_chain_extras(exported_name, guess, pose_bones)
+        + rigify_chain_extras(exported_name, guess, pose_bones)
+    )
 
 
 def _validate_quaternion(exported_name: str, data: object) -> tuple[float, float, float, float]:
@@ -520,16 +771,23 @@ def _keep_feet_on_floor(armature_obj: bpy.types.Object, bone_names: list[str]) -
 
 
 def apply_pose_document(
-    armature_obj: bpy.types.Object, document: dict, match_rig_rest: bool = True, floor_contact: bool = False
+    armature_obj: bpy.types.Object,
+    document: dict,
+    match_rig_rest: bool = True,
+    floor_contact: bool = False,
+    pose_controls: bool = True,
 ) -> tuple[list[str], list[str], list[str]]:
     """Returns (applied_bone_names, unmatched_bone_names, low_confidence_bone_names).
 
-    match_rig_rest: use the rig-aware solve (rig_pose_basis) when the document
-    carries version 2 world targets for every bone; otherwise (or when False)
+    match_rig_rest: use the rig-aware solve when the document carries version
+    2 world targets for every bone -- each bone solved against its parent's
+    evaluated pose (rig_pose_basis_evaluated); otherwise (or when False)
     apply each parent-relative rotation in the bone's rest frame (a chain's
     extra bones then stay as they are).
     floor_contact: afterwards, move the rig's root so the pose stands on the
-    rig's own floor (_keep_feet_on_floor)."""
+    rig's own floor (_keep_feet_on_floor).
+    pose_controls: redirect constraint-driven bones (Rigify DEF-/ORG-) to the
+    controls that drive them, and switch the Rigify limbs being posed to FK."""
     if not isinstance(document, dict) or document.get("format") != "pose_craft_pose":
         raise ValueError("Not a PoseCraft pose file")
 
@@ -557,12 +815,17 @@ def apply_pose_document(
     pose_bones = armature_obj.pose.bones
     applied, unmatched, low_confidence = [], [], []
     resolved = {}
+    constraints = _armature_constraints(armature_obj) if pose_controls else None
     for exported_name in quaternions:
-        chain = _resolve_bone_chain(armature_obj, exported_name)
+        chain = _resolve_bone_chain(armature_obj, exported_name, constraints)
         if chain is None:
             unmatched.append(exported_name)
         else:
             resolved[exported_name] = chain
+    if pose_controls:
+        switched = _switch_rigify_limbs_to_fk(armature_obj, [name for chain in resolved.values() for name in chain])
+        if switched:
+            print(f"PoseCraft: switched Rigify limb(s) to FK: {', '.join(switched)}")
 
     use_rig_rest = match_rig_rest and bool(resolved) and all(name in world_targets for name in resolved)
     if use_rig_rest:
@@ -577,9 +840,18 @@ def apply_pose_document(
                 deltas[bone_name] = share @ alignment
         parents = {bone.name: (bone.parent.name if bone.parent else None) for bone in bones_data}
         rest = {bone.name: bone.matrix_local.to_quaternion() for bone in bones_data}
-        basis = {pose_bone.name: pose_bone.matrix_basis.to_quaternion() for pose_bone in pose_bones}
         inherit = {bone.name: bone.use_inherit_rotation for bone in bones_data}
-        new_basis = rig_pose_basis(bones_parents_first(parents), parents, rest, basis, deltas, inherit)
+
+        def evaluate(names):
+            bpy.context.view_layer.update()
+            return {name: pose_bones[name].matrix.to_quaternion() for name in names}
+
+        def write(name, basis):
+            _write_rotation(pose_bones[name], basis)
+
+        new_basis = rig_pose_basis_evaluated(
+            bones_parents_first(parents), parents, rest, deltas, evaluate, write, inherit
+        )
     else:
         new_basis = {}
         for exported_name, chain in resolved.items():
@@ -660,7 +932,8 @@ class POSECRAFT_OT_load_pose(bpy.types.Operator):
 
         try:
             applied, unmatched, low_confidence = apply_pose_document(
-                armature_obj, document, context.scene.posecraft_match_rig_rest, context.scene.posecraft_floor_contact
+                armature_obj, document, context.scene.posecraft_match_rig_rest, context.scene.posecraft_floor_contact,
+                context.scene.posecraft_pose_controls,
             )
         except ValueError as exc:
             self.report({"ERROR"}, str(exc))
@@ -725,12 +998,13 @@ class POSECRAFT_OT_init_bone_mapping(bpy.types.Operator):
             entry.posecraft_name: (entry.target_bone, entry.extra_bones) for entry in armature_obj.posecraft_bone_mapping
         }
         armature_obj.posecraft_bone_mapping.clear()
-        for name in POSECRAFT_BONE_NAMES:
+        names = POSECRAFT_BONE_NAMES + POSECRAFT_FINGER_BONE_NAMES
+        for name in names:
             entry = armature_obj.posecraft_bone_mapping.add()
             entry.posecraft_name = name
             entry.target_bone, entry.extra_bones = existing.get(name, ("", ""))
 
-        self.report({"INFO"}, f"{len(POSECRAFT_BONE_NAMES)} bone mapping row(s) ready")
+        self.report({"INFO"}, f"{len(names)} bone mapping row(s) ready")
         return {"FINISHED"}
 
 
@@ -755,7 +1029,9 @@ class POSECRAFT_OT_auto_guess_bone_mapping(bpy.types.Operator):
             if guess is not None:
                 entry.target_bone = guess
                 if not entry.extra_bones:
-                    entry.extra_bones = ", ".join(mixamo_chain_extras(entry.posecraft_name, guess, pose_bones))
+                    extras = mixamo_chain_extras(entry.posecraft_name, guess, pose_bones)
+                    extras += rigify_chain_extras(entry.posecraft_name, guess, pose_bones)
+                    entry.extra_bones = ", ".join(extras)
                 filled += 1
 
         self.report({"INFO"}, f"Filled {filled} row(s) from name-guessing")
@@ -807,7 +1083,8 @@ def _apply_live_link_document(document) -> dict:
         _live_link_status = "Received a pose but no target armature is set or selected"
         return build_live_link_reply(error="No target armature in Blender: pick one in the PoseCraft panel")
     applied, unmatched, low_confidence = apply_pose_document(
-        armature_obj, document, scene.posecraft_match_rig_rest, scene.posecraft_floor_contact
+        armature_obj, document, scene.posecraft_match_rig_rest, scene.posecraft_floor_contact,
+        scene.posecraft_pose_controls,
     )
     if _should_keyframe(scene):
         _keyframe_applied(armature_obj, applied, scene)
@@ -991,6 +1268,7 @@ class POSECRAFT_PT_panel(bpy.types.Panel):
 
         scene = context.scene
         layout.prop(scene, "posecraft_match_rig_rest")
+        layout.prop(scene, "posecraft_pose_controls")
         layout.prop(scene, "posecraft_floor_contact")
         row = layout.row(align=True)
         row.prop(scene, "posecraft_insert_keyframes")
@@ -1041,6 +1319,14 @@ def register():
         ),
         default=True,
     )
+    bpy.types.Scene.posecraft_pose_controls = bpy.props.BoolProperty(
+        name="Pose rig controls",
+        description=(
+            "For constraint-driven rigs such as Rigify: pose the control that drives a mapped DEF-/ORG- bone "
+            "instead of the bone itself, and switch the Rigify arms and legs being posed to FK"
+        ),
+        default=True,
+    )
     bpy.types.Scene.posecraft_floor_contact = bpy.props.BoolProperty(
         name="Keep feet on the floor",
         description=(
@@ -1079,6 +1365,7 @@ def unregister():
     del bpy.types.Scene.posecraft_frame_step
     del bpy.types.Scene.posecraft_insert_keyframes
     del bpy.types.Scene.posecraft_floor_contact
+    del bpy.types.Scene.posecraft_pose_controls
     del bpy.types.Scene.posecraft_match_rig_rest
     del bpy.types.Scene.posecraft_live_link_port
     for cls in reversed(CLASSES):

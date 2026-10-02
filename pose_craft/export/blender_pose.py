@@ -21,6 +21,12 @@ subject's own meters. hip_height / leg_length is the rig-independent ratio a
 reader scales by its own leg length to place the hips (a crouch is well under
 1). The add-on's "Keep feet on the floor" option instead measures the floor
 on the rig itself.
+
+Finger bones (B11, only when the app's "Hands and fingers" option solved
+them): the same three keys per bone, named as in Rigify (f_index.01.L ...
+thumb.03.R, see skeleton.FINGER_BONE_NAMES). Still version 2: a body-only
+document is unchanged, and an older add-on reports the finger bones as
+unmatched rather than failing.
 """
 from __future__ import annotations
 
@@ -31,7 +37,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from pose_craft.retarget.skeleton import (
-    BONES,
+    bone_rest_direction,
     hip_height_above_floor,
     measured_proportions,
     world_rotations_from_local,
@@ -86,13 +92,12 @@ def build_pose_document(
     don't get those keys -- callers that don't have visibility data are unaffected.
     """
     world_rotations = world_rotations_from_local(bone_rotations)
-    rest_directions = {bone.name: bone.rest_direction for bone in BONES}
     bones = {}
     for name, rotation in bone_rotations.items():
         entry = {"quaternion_wxyz": _wxyz(_rotation_to_blender(rotation))}
         if name in world_rotations:
             entry["world_quaternion_wxyz"] = _wxyz(_rotation_to_blender(world_rotations[name]))
-            entry["rest_direction"] = [float(v) for v in _ENGINE_TO_BLENDER_AXES.apply(rest_directions[name])]
+            entry["rest_direction"] = [float(v) for v in _ENGINE_TO_BLENDER_AXES.apply(bone_rest_direction(name))]
         if bone_confidence is not None and name in bone_confidence:
             confidence = bone_confidence[name]
             entry["confidence"] = confidence
@@ -113,12 +118,15 @@ def build_pose_document(
     return document
 
 
-def root_measurements(bone_rotations: dict[str, Rotation], landmarks: np.ndarray) -> tuple[float, float]:
+def root_measurements(
+    bone_rotations: dict[str, Rotation], landmarks: np.ndarray, hands: dict | None = None
+) -> tuple[float, float]:
     """(hip_height, leg_length) for build_pose_document, in the landmarks' own
     units (meters for BlazePose's world landmarks): the posed skeleton built
     with the subject's measured proportions, its hip center's height above its
-    lowest joint, and the mean thigh + shin length."""
-    lengths, shoulder_half, hip_half = measured_proportions(landmarks)
+    lowest joint, and the mean thigh + shin length. hands: the hand landmarks
+    the rotations were solved with, if any (fingers can touch the floor)."""
+    lengths, shoulder_half, hip_half = measured_proportions(landmarks, hands)
     hip_height = hip_height_above_floor(bone_rotations, lengths, shoulder_half, hip_half)
     leg_length = (lengths["thigh.L"] + lengths["shin.L"] + lengths["thigh.R"] + lengths["shin.R"]) / 2.0
     return hip_height, leg_length

@@ -1,12 +1,21 @@
-"""Video -> an animated pose (B12): one tracked person, solved frame by frame.
+"""Video -> an animated pose (B12): tracked people, solved frame by frame.
 
 - Tracking (BlazePose.track): the detector runs on the first frame and
   whenever the person is lost; every other frame crops where the previous
   frame's landmarks say the person is -- one landmark inference per frame,
   as in MediaPipe's VIDEO mode.
+- Several people (MultiPersonTracker, when max_people > 1): each person keeps
+  a stable track ID. Every tracked person is followed the same way; the
+  detector runs on the first frame, whenever someone is lost or nobody is
+  tracked, and every
+  REDETECT_EVERY_FRAMES frames while fewer than max_people are tracked. A new
+  detection that overlaps a tracked person is ignored; the rest are matched
+  to recently lost tracks by keypoint distance (re-identified), and only then
+  become new IDs. Two tracks that converge on one person are merged.
 - Smoothing: a One Euro filter (Casiez et al., CHI 2012) on the world
-  landmarks, per coordinate -- strong smoothing when the body is still, little
-  lag when it moves fast. `min_cutoff` (Hz) lowers jitter, `beta` lowers lag.
+  landmarks, per coordinate and per person -- strong smoothing when the body
+  is still, little lag when it moves fast. `min_cutoff` (Hz) lowers jitter,
+  `beta` lowers lag.
 - Ground contact and foot locking: each frame's hips are lifted to stand the
   pose on the floor (skeleton.hip_height_above_floor), and while a foot rests
   on the floor the root moves so that foot stays put (foot_locked_root_xz) --
@@ -131,10 +140,193 @@ def foot_locked_root_xz(
     return roots
 
 
+# -- multi-person identity tracking (B12) ----------------------------------------
+
+# While fewer than max_people are tracked, the detector looks for newcomers
+# this often (and always when someone is lost).
+REDETECT_EVERY_FRAMES = 10
+# A lost person can be re-identified this many frames later; after that a
+# detection of them gets a new ID.
+MAX_MISSED_FRAMES = 30
+# Matching a detection to a lost track: the mean distance between their
+# corresponding landmarks, over the lost person's box diagonal, must be under this.
+MATCH_MAX_COST = 0.75
+# Two people whose landmark boxes overlap this much are one person.
+DUPLICATE_IOU = 0.6
+_BOX_MIN_VISIBILITY = 0.3
+
+
+def landmark_box(image_xy: np.ndarray, visibility: np.ndarray | None = None) -> np.ndarray:
+    """(xmin, ymin, xmax, ymax) of a person's visible landmarks (all of them
+    when fewer than four are visible)."""
+    points = np.asarray(image_xy, dtype=float)
+    if visibility is not None:
+        visible = points[np.asarray(visibility) >= _BOX_MIN_VISIBILITY]
+        if len(visible) >= 4:
+            points = visible
+    return np.concatenate([points.min(axis=0), points.max(axis=0)])
+
+
+def box_iou(a: np.ndarray, b: np.ndarray) -> float:
+    ix = min(a[2], b[2]) - max(a[0], b[0])
+    iy = min(a[3], b[3]) - max(a[1], b[1])
+    if ix <= 0 or iy <= 0:
+        return 0.0
+    inter = ix * iy
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return float(inter / union) if union > 0 else 0.0
+
+
+def match_cost(previous, current) -> float:
+    """How far `current` (a PoseResult) is from a track's last `previous`
+    one: the mean image distance between landmarks visible in both, over
+    the previous landmark box's diagonal."""
+    both = (np.asarray(previous.visibility) >= _BOX_MIN_VISIBILITY) & (
+        np.asarray(current.visibility) >= _BOX_MIN_VISIBILITY
+    )
+    if both.sum() < 4:
+        both = np.ones(len(previous.image_xy), dtype=bool)
+    box = landmark_box(previous.image_xy, previous.visibility)
+    diagonal = max(float(np.hypot(box[2] - box[0], box[3] - box[1])), 1e-6)
+    distances = np.linalg.norm(np.asarray(previous.image_xy)[both] - np.asarray(current.image_xy)[both], axis=1)
+    return float(distances.mean()) / diagonal
+
+
+def greedy_assignment(costs: np.ndarray, max_cost: float) -> list[tuple[int, int]]:
+    """(row, column) pairs, cheapest first, each row and column used once,
+    every pair under max_cost."""
+    pairs: list[tuple[int, int]] = []
+    if costs.size == 0:
+        return pairs
+    used_rows, used_columns = set(), set()
+    for flat in np.argsort(costs, axis=None, kind="stable"):
+        row, column = divmod(int(flat), costs.shape[1])
+        if costs[row, column] >= max_cost:
+            break
+        if row in used_rows or column in used_columns:
+            continue
+        pairs.append((row, column))
+        used_rows.add(row)
+        used_columns.add(column)
+    return pairs
+
+
+@dataclasses.dataclass
+class _Track:
+    id: int
+    last: object  # PoseResult
+    missed: int = 0  # frames since last seen
+
+
+class MultiPersonTracker:
+    """Stable person IDs across video frames (see the module docstring).
+    `pose` is an onnx_pose.BlazePose (anything with detect_rois and
+    landmarks_for_roi). step() takes one prepared RGB frame and returns
+    {track id: PoseResult} for the people found in it. IDs start at 0, given
+    left to right among the people first seen together."""
+
+    def __init__(
+        self,
+        pose,
+        max_people: int,
+        redetect_every: int = REDETECT_EVERY_FRAMES,
+        max_missed: int = MAX_MISSED_FRAMES,
+        min_detection_confidence: float = 0.5,
+        min_presence_confidence: float = 0.5,
+    ):
+        self._pose = pose
+        self.max_people = max(1, int(max_people))
+        self.redetect_every = max(1, int(redetect_every))
+        self.max_missed = max_missed
+        self.min_detection_confidence = min_detection_confidence
+        self.min_presence_confidence = min_presence_confidence
+        self._tracks: list[_Track] = []
+        self._next_id = 0
+        self._frame = 0
+        self.detector_runs = 0
+
+    @staticmethod
+    def _box(result) -> np.ndarray:
+        return landmark_box(result.image_xy, result.visibility)
+
+    def _overlaps(self, result, others) -> bool:
+        box = self._box(result)
+        return any(box_iou(box, self._box(other)) > DUPLICATE_IOU for other in others)
+
+    def step(self, image_rgb: np.ndarray) -> dict:
+        image_rgb = np.ascontiguousarray(image_rgb)
+        h, w = image_rgb.shape[:2]
+        current: dict = {}
+        lost_now = False
+        # 1. Follow everyone seen in the previous frame from their own landmarks.
+        for track in self._tracks:
+            if track.missed:
+                continue
+            roi = track.last.next_roi(w, h)
+            result = None if roi is None else self._pose.landmarks_for_roi(image_rgb, roi, self.min_presence_confidence)
+            if result is None:
+                lost_now = True
+            else:
+                current[track.id] = result
+        # 2. Two tracks that drifted onto one person: the older ID keeps them.
+        for track_id in sorted(current):
+            if self._overlaps(current[track_id], [current[o] for o in current if o < track_id]):
+                del current[track_id]
+                lost_now = True
+        # 3. Look for newcomers and lost people.
+        if self._frame == 0 or not current or (
+            len(current) < self.max_people and (lost_now or self._frame % self.redetect_every == 0)
+        ):
+            self.detector_runs += 1
+            candidates = []
+            for roi in self._pose.detect_rois(image_rgb, self.max_people, self.min_detection_confidence):
+                result = self._pose.landmarks_for_roi(image_rgb, roi, self.min_presence_confidence)
+                if result is None or self._overlaps(result, list(current.values()) + candidates):
+                    continue
+                candidates.append(result)
+            lost = [t for t in self._tracks if t.id not in current and t.missed < self.max_missed]
+            costs = np.array([[match_cost(t.last, c) for c in candidates] for t in lost], dtype=float)
+            costs = costs.reshape(len(lost), len(candidates))
+            used = set()
+            for row, column in greedy_assignment(costs, MATCH_MAX_COST):
+                if len(current) >= self.max_people:
+                    break
+                current[lost[row].id] = candidates[column]
+                used.add(column)
+            newcomers = sorted(
+                (c for i, c in enumerate(candidates) if i not in used), key=lambda r: float(np.mean(r.image_xy[:, 0]))
+            )
+            for result in newcomers:
+                if len(current) >= self.max_people:
+                    break
+                self._tracks.append(_Track(self._next_id, result))
+                current[self._next_id] = result
+                self._next_id += 1
+        # 4. Bookkeeping: seen tracks reset, the rest age and eventually expire.
+        for track in self._tracks:
+            if track.id in current:
+                track.last, track.missed = current[track.id], 0
+            else:
+                track.missed += 1
+        self._tracks = [t for t in self._tracks if t.missed <= self.max_missed]
+        self._frame += 1
+        return current
+
+
 @dataclasses.dataclass
 class VideoFrame:
     index: int
-    person: DetectedPerson | None  # smoothed landmarks; None when nobody was found
+    # The lowest-numbered person tracked in this frame (smoothed landmarks);
+    # None when nobody was found. Kept for single-person callers.
+    person: DetectedPerson | None = None
+    # Everyone tracked in this frame: track ID -> smoothed landmarks.
+    people: dict | None = None
+
+    def __post_init__(self):
+        if self.people is None:
+            self.people = {} if self.person is None else {0: self.person}
+        elif self.person is None and self.people:
+            self.person = self.people[min(self.people)]
 
 
 @dataclasses.dataclass
@@ -144,8 +336,19 @@ class VideoSolve:
     frame_size: tuple[int, int]  # (width, height)
     frames: list[VideoFrame]
 
-    def solved_frames(self) -> list[VideoFrame]:
-        return [frame for frame in self.frames if frame.person is not None]
+    def solved_frames(self, track_id: int | None = None) -> list[VideoFrame]:
+        """Frames with anybody in them, or with person `track_id`."""
+        if track_id is None:
+            return [frame for frame in self.frames if frame.people]
+        return [frame for frame in self.frames if track_id in frame.people]
+
+    def track_ids(self) -> list[int]:
+        """Every person tracked anywhere in the video, by ID."""
+        return sorted({track_id for frame in self.frames for track_id in frame.people})
+
+    def people_of(self, track_id: int) -> list[DetectedPerson]:
+        """One person's landmarks in every frame they were found in."""
+        return [frame.people[track_id] for frame in self.frames if track_id in frame.people]
 
 
 def smooth_people(
@@ -173,19 +376,37 @@ def smooth_people(
     return smoothed
 
 
+def smooth_tracks(
+    frames_people: list[dict], fps: float, min_cutoff: float = DEFAULT_MIN_CUTOFF, beta: float = DEFAULT_BETA
+) -> list[dict]:
+    """smooth_people for every person separately: a list of {track id:
+    DetectedPerson} per frame in, the same smoothed out (each person has their
+    own filter, restarted wherever that person is missing)."""
+    smoothed: list[dict] = [{} for _ in frames_people]
+    for track_id in sorted({tid for people in frames_people for tid in people}):
+        series = smooth_people([people.get(track_id) for people in frames_people], fps, min_cutoff, beta)
+        for index, person in enumerate(series):
+            if person is not None:
+                smoothed[index][track_id] = person
+    return smoothed
+
+
 def solve_video(
     path: str | Path,
     estimator: PoseEstimator,
     *,
+    max_people: int = 1,
     min_cutoff: float = DEFAULT_MIN_CUTOFF,
     beta: float = DEFAULT_BETA,
     max_frames: int | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> VideoSolve:
-    """Decodes `path` with OpenCV and tracks one person through it (the
-    leftmost one found first), smoothing their landmarks. Raises OSError if the
-    file can't be opened, InterruptedError when should_cancel() turns true."""
+    """Decodes `path` with OpenCV and tracks up to `max_people` people through
+    it -- one (the best detection) with the estimator's own track(), several
+    with a MultiPersonTracker (estimator.new_tracker), each with a stable ID
+    -- smoothing each person's landmarks. Raises OSError if the file can't be
+    opened, InterruptedError when should_cancel() turns true."""
     import cv2
 
     capture = cv2.VideoCapture(str(path))
@@ -200,31 +421,37 @@ def solve_video(
             total = min(total, max_frames) if total else max_frames
         width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        raw: list[DetectedPerson | None] = []
+        raw: list[dict] = []
         previous = None
+        tracker = estimator.new_tracker(max_people) if max_people > 1 else None
         while max_frames is None or len(raw) < max_frames:
             if should_cancel is not None and should_cancel():
                 raise InterruptedError("video solve cancelled")
             ok, frame = capture.read()
             if not ok:
                 break
-            result = estimator.track(prepare_input_rgb(frame), previous)
-            previous = result
+            image_rgb = prepare_input_rgb(frame)
+            if tracker is None:
+                previous = estimator.track(image_rgb, previous)
+                results = {} if previous is None else {0: previous}
+            else:
+                results = tracker.step(image_rgb)
             raw.append(
-                None
-                if result is None
-                else DetectedPerson(
-                    landmarks=_world_to_engine(result.world),
-                    image_landmarks_xy=result.image_xy,
-                    visibility=result.visibility,
-                )
+                {
+                    track_id: DetectedPerson(
+                        landmarks=_world_to_engine(result.world),
+                        image_landmarks_xy=result.image_xy,
+                        visibility=result.visibility,
+                    )
+                    for track_id, result in results.items()
+                }
             )
             if on_progress is not None:
                 on_progress(len(raw), total)
     finally:
         capture.release()
-    people = smooth_people(raw, fps, min_cutoff, beta)
-    return VideoSolve(str(path), fps, (width, height), [VideoFrame(i, p) for i, p in enumerate(people)])
+    people = smooth_tracks(raw, fps, min_cutoff, beta)
+    return VideoSolve(str(path), fps, (width, height), [VideoFrame(i, people=p) for i, p in enumerate(people)])
 
 
 def animation_root_positions(

@@ -265,14 +265,14 @@ def detector_input(image_rgb: np.ndarray) -> tuple[np.ndarray, tuple[float, floa
     return tensor[None], pad
 
 
-def landmark_input(image_rgb: np.ndarray, roi: NormRect) -> np.ndarray:
+def landmark_input(image_rgb: np.ndarray, roi: NormRect, size: int = LANDMARK_INPUT_SIZE) -> np.ndarray:
     h, w = image_rgb.shape[:2]
     crop = _warp_rotated_rect(
         image_rgb,
         (roi.x_center * w, roi.y_center * h),
         (roi.width * w, roi.height * h),
         roi.rotation,
-        LANDMARK_INPUT_SIZE,
+        size,
         cv2.BORDER_REPLICATE,
     )
     return (crop.astype(np.float32) / 255.0)[None]
@@ -738,3 +738,136 @@ class BlazePose:
         if not results and tiled is None:
             results = solve(True)
         return results
+
+
+# -- hands (B11) ----------------------------------------------------------------
+#
+# MediaPipe Holistic's way of finding a hand: no palm detector, the crop comes
+# from the pose's wrist, index and pinky landmarks (HandDetectionsFromPoseToRects
+# + RectTransformation, scale 2.7, shift -0.1), then the 21-point hand landmark
+# model runs on it. One refinement pass re-crops from the hand's own landmarks
+# (HandLandmarksToRect + RectTransformation, scale 2.0, shift -0.1, MediaPipe's
+# hand-tracking crop) and runs the model again; Holistic uses a separate
+# re-crop model for that step, which this doesn't need.
+
+HAND_LANDMARK_INPUT_SIZE = 224
+NUM_HAND_LANDMARKS = 21
+HAND_ROI_FROM_POSE_SCALE = 2.7
+HAND_ROI_FROM_LANDMARKS_SCALE = 2.0
+HAND_ROI_SHIFT_Y = -0.1
+MIN_HAND_PRESENCE = 0.5
+# The hand landmarks the re-crop box is fitted to (HandLandmarksToRect's
+# partial set: the wrist and the two lower joints of each finger).
+_HAND_RECROP_LANDMARKS = [0, 1, 2, 3, 5, 6, 9, 10, 13, 14, 17, 18]
+
+
+def transform_rect(
+    rect: NormRect, image_w: int, image_h: int, scale: float, shift_y: float = 0.0, square_long: bool = True
+) -> NormRect:
+    """RectTransformationCalculator for a NormalizedRect: shift along the rect's
+    own (rotated) y axis by shift_y of its height, make it square on its long
+    side in pixels, then scale it."""
+    width, height, rotation = rect.width, rect.height, rect.rotation
+    x_shift = -(image_h * height * shift_y * math.sin(rotation)) / image_w
+    y_shift = (image_h * height * shift_y * math.cos(rotation)) / image_h
+    if square_long:
+        long_side = max(width * image_w, height * image_h)
+        width, height = long_side / image_w, long_side / image_h
+    return NormRect(rect.x_center + x_shift, rect.y_center + y_shift, width * scale, height * scale, rotation)
+
+
+def hand_roi_from_pose(wrist_xy, index_xy, pinky_xy, image_w: int, image_h: int) -> NormRect | None:
+    """The hand crop from one side's pose landmarks (normalized x/y): centred on
+    an estimated middle knuckle ((2 * index + pinky) / 3), twice its distance
+    from the wrist across, rotated so wrist -> knuckle points up, then
+    transformed as MediaPipe Holistic does. None when the points coincide."""
+    size = np.array([image_w, image_h], dtype=np.float64)
+    wrist = np.asarray(wrist_xy, dtype=np.float64) * size
+    middle = (2.0 * np.asarray(index_xy, dtype=np.float64) + np.asarray(pinky_xy, dtype=np.float64)) / 3.0 * size
+    box_size = 2.0 * float(np.hypot(*(middle - wrist)))
+    if box_size < 1e-6:
+        return None
+    rotation = _normalize_radians(math.pi / 2 - math.atan2(-(middle[1] - wrist[1]), middle[0] - wrist[0]))
+    rect = NormRect(middle[0] / image_w, middle[1] / image_h, box_size / image_w, box_size / image_h, rotation)
+    return transform_rect(rect, image_w, image_h, HAND_ROI_FROM_POSE_SCALE, HAND_ROI_SHIFT_Y)
+
+
+def hand_roi_from_landmarks(hand_xy: np.ndarray, image_w: int, image_h: int) -> NormRect:
+    """HandLandmarksToRectCalculator + its RectTransformation: the next crop for
+    a hand from its own (21, 2) normalized landmarks."""
+    xy = np.asarray(hand_xy, dtype=np.float64)
+    x0, y0 = xy[0, 0] * image_w, xy[0, 1] * image_h
+    x1 = ((xy[5, 0] + xy[13, 0]) / 2.0 + xy[9, 0]) / 2.0 * image_w
+    y1 = ((xy[5, 1] + xy[13, 1]) / 2.0 + xy[9, 1]) / 2.0 * image_h
+    rotation = _normalize_radians(math.pi / 2 - math.atan2(-(y1 - y0), x1 - x0))
+    points = xy[_HAND_RECROP_LANDMARKS]
+    center = (points.min(axis=0) + points.max(axis=0)) / 2.0
+    offsets = (points - center) * np.array([image_w, image_h])
+    reverse = _normalize_radians(-rotation)
+    cos_r, sin_r = math.cos(reverse), math.sin(reverse)
+    projected = np.stack(
+        [offsets[:, 0] * cos_r - offsets[:, 1] * sin_r, offsets[:, 0] * sin_r + offsets[:, 1] * cos_r], axis=1
+    )
+    low, high = projected.min(axis=0), projected.max(axis=0)
+    mid = (low + high) / 2.0
+    cos_f, sin_f = math.cos(rotation), math.sin(rotation)
+    center_x = mid[0] * cos_f - mid[1] * sin_f + image_w * center[0]
+    center_y = mid[0] * sin_f + mid[1] * cos_f + image_h * center[1]
+    rect = NormRect(
+        center_x / image_w, center_y / image_h, (high[0] - low[0]) / image_w, (high[1] - low[1]) / image_h, rotation
+    )
+    return transform_rect(rect, image_w, image_h, HAND_ROI_FROM_LANDMARKS_SCALE, HAND_ROI_SHIFT_Y)
+
+
+@dataclasses.dataclass
+class HandResult:
+    image_xy: np.ndarray  # (21, 2) normalized image coordinates
+    world: np.ndarray  # (21, 3) meters, MediaPipe's world frame (around the hand's centre, +y down)
+    presence: float
+
+
+class HandLandmarker:
+    """MediaPipe's 21-point hand landmark model on ONNX Runtime, run on crops
+    derived from the pose (see hand_roi_from_pose). Same device rules as
+    BlazePose: a GPU session is kept only if it matches the CPU."""
+
+    def __init__(self, model_path: Path, use_gpu: bool = True):
+        self._session = create_session(model_path, use_gpu)
+        reason = gpu_session_problem(self._session, model_path) if use_gpu else None
+        if reason:
+            log.warning("not using the GPU for the hand model: %s", reason)
+            self._session = create_session(model_path, use_gpu=False)
+        self._input = self._session.get_inputs()[0].name
+        self._outputs = [o.name for o in self._session.get_outputs()]
+
+    def landmarks_for_roi(self, image_rgb: np.ndarray, roi: NormRect, min_presence: float = MIN_HAND_PRESENCE) -> HandResult | None:
+        tensor = landmark_input(image_rgb, roi, HAND_LANDMARK_INPUT_SIZE)
+        outputs = dict(zip(self._outputs, self._session.run(None, {self._input: tensor})))
+        # Identity = landmarks (x, y, z in input pixels), Identity_1 = hand
+        # presence (already a sigmoid), Identity_2 = handedness (unused: the
+        # side comes from the pose), Identity_3 = world landmarks (meters).
+        presence = float(outputs["Identity_1"].reshape(-1)[0])
+        if presence < min_presence:
+            return None
+        raw = outputs["Identity"].reshape(NUM_HAND_LANDMARKS, 3)
+        xy = raw[:, :2] / HAND_LANDMARK_INPUT_SIZE
+        world = rotate_world(outputs["Identity_3"].reshape(NUM_HAND_LANDMARKS, 3), roi.rotation)
+        return HandResult(
+            image_xy=project_to_image(xy, roi).astype(np.float64), world=world.astype(np.float64), presence=presence
+        )
+
+    def detect(self, image_rgb: np.ndarray, wrist_xy, index_xy, pinky_xy, refine: bool = True) -> HandResult | None:
+        """One hand from its pose landmarks (normalized x/y), or None when the
+        model doesn't see a hand there. With `refine`, a second pass on the
+        crop the first pass's own landmarks give (kept if it still sees the hand)."""
+        image_rgb = np.ascontiguousarray(image_rgb)
+        h, w = image_rgb.shape[:2]
+        roi = hand_roi_from_pose(wrist_xy, index_xy, pinky_xy, w, h)
+        if roi is None:
+            return None
+        result = self.landmarks_for_roi(image_rgb, roi)
+        if result is not None and refine:
+            refined = self.landmarks_for_roi(image_rgb, hand_roi_from_landmarks(result.image_xy, w, h))
+            if refined is not None:
+                result = refined
+        return result

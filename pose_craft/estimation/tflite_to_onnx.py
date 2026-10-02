@@ -505,11 +505,18 @@ def convert_tflite_bytes(tflite_bytes: bytes):
 
 
 TASK_BUNDLE_MEMBERS = {"detector": "pose_detector.tflite", "landmarks": "pose_landmarks_detector.tflite"}
+# The hand landmarker bundle (B11): only the 21-point landmark model is used --
+# the hand crop comes from the pose's wrist and knuckle landmarks, as in
+# MediaPipe Holistic, so the palm detector is never converted.
+HAND_TASK_BUNDLE_MEMBERS = {"landmarks": "hand_landmarks_detector.tflite"}
 
 
-def convert_task_bundle(task_path: Path, dest_paths: dict[str, Path]) -> dict[str, Path]:
-    """Extracts and converts both graphs of a pose-landmarker `.task` bundle to
-    `dest_paths` ({"detector": ..., "landmarks": ...}), returning it.
+def convert_task_bundle(
+    task_path: Path, dest_paths: dict[str, Path], members: dict[str, str] | None = None
+) -> dict[str, Path]:
+    """Extracts and converts the graphs of a `.task` bundle to `dest_paths`
+    (by default both of a pose-landmarker bundle: {"detector": ...,
+    "landmarks": ...}; `members` maps each key to its bundle member), returning it.
 
     Each file is written to a temp name and renamed into place only once complete,
     so an interrupted conversion can never leave behind a file a later run would trust.
@@ -517,7 +524,7 @@ def convert_task_bundle(task_path: Path, dest_paths: dict[str, Path]) -> dict[st
     import onnx
 
     with zipfile.ZipFile(task_path) as bundle:
-        for key, member in TASK_BUNDLE_MEMBERS.items():
+        for key, member in (TASK_BUNDLE_MEMBERS if members is None else members).items():
             dest = dest_paths[key]
             dest.parent.mkdir(parents=True, exist_ok=True)
             tmp = dest.with_name(dest.name + ".part")

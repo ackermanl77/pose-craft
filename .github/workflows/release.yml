@@ -82,7 +82,7 @@ jobs:
         env:
           POSECRAFT_MODEL_DIR: dist/PoseCraft/_internal/models
         run: |
-          python -c "from pose_craft.estimation.landmarker import bundled_onnx_paths as b; import sys; missing = [v for v in ('lite', 'full', 'heavy') if b(v) is None]; sys.exit(f'missing bundled models: {missing}' if missing else 0)"
+          python -c "from pose_craft.estimation.landmarker import bundled_onnx_paths as b; import sys; from pose_craft.estimation.landmarker import bundled_hand_onnx_path as h; missing = [v for v in ('lite', 'full', 'heavy') if b(v) is None] + ([] if h() else ['hand']); sys.exit(f'missing bundled models: {missing}' if missing else 0)"
 
       - name: Zip
         shell: pwsh

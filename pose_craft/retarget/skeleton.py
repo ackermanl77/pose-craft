@@ -36,6 +36,14 @@ knuckles) keeps the roll carried from its parent with no twist of its own
 rigid rotation of the whole body changes the root and nothing else. The
 per-bone confidence score (see `bone_confidence`) is about landmark
 visibility, not about how well a bone's roll was measured.
+
+Fingers (B11, optional): with a hand's 21 MediaPipe hand landmarks (see
+`FINGER_BONES`), the hand bone is measured from the palm (wrist -> middle
+knuckle, rolled by the index-pinky knuckle line) and each hand gets 15 finger
+bones in Rigify's names (thumb.01-03, f_index/f_middle/f_ring/f_pinky.01-03).
+The first segment of each finger is framed by the knuckle line (the thumb by
+the back-of-hand normal), the other two are pure hinges. Without hand
+landmarks nothing changes: the 15 body bones, solved exactly as before.
 """
 from __future__ import annotations
 
@@ -171,6 +179,91 @@ BONES: list[BoneSpec] = [
 BONE_NAMES = [b.name for b in BONES]
 _BONES_BY_NAME: dict[str, BoneSpec] = {b.name: b for b in BONES}
 
+# -- hand landmarks and finger bones (B11) -------------------------------------
+
+# MediaPipe's 21 hand landmarks: 0 wrist; thumb 1-4 (CMC, MCP, IP, tip); index
+# 5-8 (MCP, PIP, DIP, tip); middle 9-12; ring 13-16; pinky 17-20.
+NUM_HAND_LANDMARKS = 21
+HAND_WRIST = 0
+HAND_INDEX_MCP, HAND_MIDDLE_MCP, HAND_PINKY_MCP = 5, 9, 17
+HAND_SIDES = ("L", "R")
+
+FINGERS = ("thumb", "f_index", "f_middle", "f_ring", "f_pinky")
+_FINGER_FIRST_LANDMARK = {"thumb": 1, "f_index": 5, "f_middle": 9, "f_ring": 13, "f_pinky": 17}
+
+
+@dataclass(frozen=True)
+class FingerBoneSpec:
+    """One finger segment: head/tail are hand-landmark indices (not pose ones)."""
+
+    name: str
+    parent: str
+    side: str
+    finger: str
+    segment: int  # 1 (knuckle) .. 3 (tip)
+    rest_direction: np.ndarray
+    head_index: int
+    tail_index: int
+
+
+def _finger_rest_direction(finger: str, side: str) -> np.ndarray:
+    """Rest-pose finger directions on a palm-down T-pose hand: the four fingers
+    straight along the arm, the thumb 45 degrees forward (toward the index side,
+    +Z) -- conventions, like the rest of the rest skeleton."""
+    sign = 1.0 if side == "L" else -1.0
+    if finger == "thumb":
+        return np.array([sign, 0.0, 1.0]) / np.sqrt(2.0)
+    return np.array([sign, 0.0, 0.0])
+
+
+FINGER_BONES: list[FingerBoneSpec] = [
+    FingerBoneSpec(
+        name=f"{finger}.0{segment}.{side}",
+        parent=f"hand.{side}" if segment == 1 else f"{finger}.0{segment - 1}.{side}",
+        side=side,
+        finger=finger,
+        segment=segment,
+        rest_direction=_finger_rest_direction(finger, side),
+        head_index=_FINGER_FIRST_LANDMARK[finger] + segment - 1,
+        tail_index=_FINGER_FIRST_LANDMARK[finger] + segment,
+    )
+    for side in HAND_SIDES
+    for finger in FINGERS
+    for segment in (1, 2, 3)
+]
+FINGER_BONE_NAMES = [b.name for b in FINGER_BONES]
+_FINGERS_BY_NAME: dict[str, FingerBoneSpec] = {b.name: b for b in FINGER_BONES}
+ALL_BONE_NAMES = BONE_NAMES + FINGER_BONE_NAMES
+
+
+def bone_parent(name: str) -> str | None:
+    """The parent of any bone, body or finger."""
+    if name in _BONES_BY_NAME:
+        return _BONES_BY_NAME[name].parent
+    return _FINGERS_BY_NAME[name].parent
+
+
+def bone_rest_direction(name: str) -> np.ndarray:
+    """The rest (head -> tail) direction of any bone, body or finger."""
+    if name in _BONES_BY_NAME:
+        return _BONES_BY_NAME[name].rest_direction
+    return _FINGERS_BY_NAME[name].rest_direction
+
+
+def _check_hands(hands: dict | None, columns: int) -> dict[str, np.ndarray]:
+    """Validates an optional {"L"/"R": (21, columns)} hand-landmark dict."""
+    checked: dict[str, np.ndarray] = {}
+    for side, points in (hands or {}).items():
+        if points is None:
+            continue
+        if side not in HAND_SIDES:
+            raise ValueError(f"hand side must be 'L' or 'R', got {side!r}")
+        points = np.asarray(points, dtype=float)
+        if points.shape != (NUM_HAND_LANDMARKS, columns):
+            raise ValueError(f"expected ({NUM_HAND_LANDMARKS}, {columns}) hand landmarks, got {points.shape}")
+        checked[side] = points
+    return checked
+
 # Each bone's rest-pose secondary axis (perpendicular to its rest_direction):
 # the zero-roll reference that the measured secondary axis is compared against.
 # - spine/neck/head: the subject's left (hip, shoulder and ear lines).
@@ -189,6 +282,11 @@ _REST_SECONDARY: dict[str, np.ndarray] = {
     "thigh.L": LEFT_X, "shin.L": LEFT_X, "foot.L": LEFT_X,
     "thigh.R": LEFT_X, "shin.R": LEFT_X, "foot.R": LEFT_X,
 }
+# Fingers: the knuckle line (index minus pinky knuckle, +Z on a palm-down hand,
+# the axis a finger curls about); the thumb: the back-of-hand normal (+Y).
+for _finger_bone in FINGER_BONES:
+    _REST_SECONDARY[_finger_bone.name] = UP if _finger_bone.finger == "thumb" else FORWARD
+del _finger_bone
 
 # How much of the head's twist about the neck goes into the neck bone; the head
 # takes the rest. Real necks share a head turn roughly this way, and it avoids
@@ -208,10 +306,21 @@ FULL_BEND_DEG = 30.0
 HEEL_MIN_VISIBILITY = 0.5
 
 
-def joint_positions(landmarks: np.ndarray) -> dict[str, np.ndarray]:
+def _finger_points(hands: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    points: dict[str, np.ndarray] = {}
+    for bone in FINGER_BONES:
+        if bone.side in hands:
+            points[f"{bone.name}.head"] = hands[bone.side][bone.head_index]
+            points[f"{bone.name}.tail"] = hands[bone.side][bone.tail_index]
+    return points
+
+
+def joint_positions(landmarks: np.ndarray, hands: dict | None = None) -> dict[str, np.ndarray]:
     """Returns every bone's head/tail joint position, keyed as '<bone>.head' / '<bone>.tail'.
 
     Used by the 3D viewport to draw the skeleton without duplicating the BONES table.
+    hands: optional {"L"/"R": (21, 3)} hand landmarks in the same frame; adds
+    the finger bones of each hand given.
     """
     if landmarks.shape != (NUM_LANDMARKS, 3):
         raise ValueError(f"expected ({NUM_LANDMARKS}, 3) landmarks, got {landmarks.shape}")
@@ -219,6 +328,7 @@ def joint_positions(landmarks: np.ndarray) -> dict[str, np.ndarray]:
     for bone in BONES:
         points[f"{bone.name}.head"] = bone.head_fn(landmarks)
         points[f"{bone.name}.tail"] = bone.tail_fn(landmarks)
+    points.update(_finger_points(_check_hands(hands, 3)))
     return points
 
 
@@ -239,14 +349,15 @@ def _head_top_2d(lm: np.ndarray) -> np.ndarray:
 _BONE_2D_TAIL_OVERRIDES = {"head": _head_top_2d}
 
 
-def image_joint_positions_2d(image_landmarks_xy: np.ndarray) -> dict[str, np.ndarray]:
+def image_joint_positions_2d(image_landmarks_xy: np.ndarray, hands_xy: dict | None = None) -> dict[str, np.ndarray]:
     """2D-image-space analogue of joint_positions(), for drawing the solved
     skeleton directly on the source photo (gui/photo_view.py) rather than only
     in the 3D viewport. Reuses BONES' head/tail landmark lookups where they're
     dimension-agnostic (plain indexing or midpoint averaging, which work the
     same regardless of how many columns `landmarks` has) -- only the head
     bone's extrapolated top-of-skull point needs a 2D-specific version, since
-    the 3D one uses a cross product.
+    the 3D one uses a cross product. hands_xy: optional {"L"/"R": (21, 2)}
+    normalized hand landmarks, adding each given hand's finger bones.
     """
     if image_landmarks_xy.shape != (NUM_LANDMARKS, 2):
         raise ValueError(f"expected ({NUM_LANDMARKS}, 2) landmarks, got {image_landmarks_xy.shape}")
@@ -255,10 +366,11 @@ def image_joint_positions_2d(image_landmarks_xy: np.ndarray) -> dict[str, np.nda
         points[f"{bone.name}.head"] = bone.head_fn(image_landmarks_xy)
         tail_fn = _BONE_2D_TAIL_OVERRIDES.get(bone.name, bone.tail_fn)
         points[f"{bone.name}.tail"] = tail_fn(image_landmarks_xy)
+    points.update(_finger_points(_check_hands(hands_xy, 2)))
     return points
 
 
-def bone_confidence(visibility: np.ndarray) -> dict[str, float]:
+def bone_confidence(visibility: np.ndarray, hand_presence: dict[str, float] | None = None) -> dict[str, float]:
     """Per-bone confidence from MediaPipe's per-landmark visibility scores: the
     lowest visibility among the raw landmarks a bone's position depends on.
 
@@ -266,10 +378,18 @@ def bone_confidence(visibility: np.ndarray) -> dict[str, float]:
     too little to work with" case) ends up with a low score here, which
     export/blender_pose.py surfaces as "low_confidence" per bone so the export
     itself flags what's likely to need manual correction in Blender.
+
+    hand_presence: optional {"L"/"R": hand-landmark model presence score}; each
+    given hand's finger bones score min(presence, the pose wrist's visibility).
     """
     if visibility.shape != (NUM_LANDMARKS,):
         raise ValueError(f"expected ({NUM_LANDMARKS},) visibility, got {visibility.shape}")
-    return {bone.name: float(min(visibility[i] for i in bone.visibility_landmarks)) for bone in BONES}
+    scores = {bone.name: float(min(visibility[i] for i in bone.visibility_landmarks)) for bone in BONES}
+    wrists = {"L": LEFT_WRIST, "R": RIGHT_WRIST}
+    for bone in FINGER_BONES:
+        if hand_presence and bone.side in hand_presence:
+            scores[bone.name] = float(min(hand_presence[bone.side], visibility[wrists[bone.side]]))
+    return scores
 
 
 def _swing_rotation(rest_direction: np.ndarray, current_direction: np.ndarray) -> Rotation:
@@ -442,6 +562,23 @@ def mirror_landmarks(landmarks: np.ndarray) -> np.ndarray:
     return mirrored
 
 
+def mirror_hands(hands: dict | None) -> dict:
+    """mirror_landmarks for a {"L"/"R": hand landmarks} dict: the sides swap
+    and the lateral coordinate is reflected the same way (X -> -X for (21, 3),
+    x -> 1 - x for (21, 2); a scalar per side, e.g. a presence score, just
+    swaps)."""
+    mirrored = {}
+    for side, value in (hands or {}).items():
+        other = "R" if side == "L" else "L"
+        array = np.array(value, dtype=float, copy=True)
+        if array.ndim == 2 and array.shape[1] == 3:
+            array[:, 0] = -array[:, 0]
+        elif array.ndim == 2 and array.shape[1] == 2:
+            array[:, 0] = 1.0 - array[:, 0]
+        mirrored[other] = array if array.ndim else float(array)
+    return mirrored
+
+
 # The one bone with parent=None -- see apply_orientation_correction.
 ROOT_BONE = BONES[0].name
 
@@ -503,11 +640,39 @@ def rotate_joint_positions(
     return {name: pivot + correction.apply(point - pivot) for name, point in points.items()}
 
 
-def _solve_world_rotations(landmarks: np.ndarray, visibility: np.ndarray | None) -> dict[str, Rotation]:
+def _solve_fingers(hand_world: Rotation, hand: np.ndarray, side: str) -> dict[str, Rotation]:
+    """World rotations of one hand's 15 finger bones from its 21 landmarks: the
+    first segment framed by the knuckle line (the thumb by the back-of-hand
+    normal, which points +Y on a palm-down hand), the next two as hinges
+    carried from their parent -- a finger joint is close to a 1-DOF hinge."""
+    # The palm's own axes (from the hand bone's frame, so they're orthogonal to
+    # the palm direction): a finger curls about the lateral one exactly.
+    knuckles = hand_world.apply(FORWARD)
+    back = hand_world.apply(UP)
+    world: dict[str, Rotation] = {}
+    for bone in FINGER_BONES:
+        if bone.side != side:
+            continue
+        parent_world = hand_world if bone.segment == 1 else world[bone.parent]
+        direction = hand[bone.tail_index] - hand[bone.head_index]
+        carried = _carried(parent_world, bone.rest_direction, direction)
+        if bone.segment == 1:
+            secondary = back if bone.finger == "thumb" else knuckles
+            frame = _frame_rotation(bone.rest_direction, _REST_SECONDARY[bone.name], direction, secondary)
+            world[bone.name] = frame if frame is not None else carried
+        else:
+            world[bone.name] = carried
+    return world
+
+
+def _solve_world_rotations(
+    landmarks: np.ndarray, visibility: np.ndarray | None, hands: dict[str, np.ndarray] | None = None
+) -> dict[str, Rotation]:
     """Every bone's world rotation (engine frame, relative to the T-pose rest
     skeleton), parents before children. See the module docstring for the
     secondary axis each bone uses."""
     lm = landmarks
+    hands = hands or {}
 
     def direction(name: str) -> np.ndarray:
         bone = _BONES_BY_NAME[name]
@@ -558,10 +723,23 @@ def _solve_world_rotations(landmarks: np.ndarray, visibility: np.ndarray | None)
 
         forearm_rest = _BONES_BY_NAME[forearm].rest_direction
         forearm_hinged = _carried(world[upper], forearm_rest, direction(forearm))
-        knuckles = lm[_SIDE_LANDMARKS[suffix]["INDEX"]] - lm[_SIDE_LANDMARKS[suffix]["PINKY"]]
-        world[hand] = frame_or(hand, _carried(forearm_hinged, _BONES_BY_NAME[hand].rest_direction, direction(hand)), knuckles)
+        hand_rest = _BONES_BY_NAME[hand].rest_direction
+        if suffix in hands:
+            # B11: the hand model's palm is far better than the pose model's
+            # two knuckle points -- wrist -> middle knuckle, rolled by the
+            # index-pinky knuckle line.
+            palm = hands[suffix]
+            hand_direction = palm[HAND_MIDDLE_MCP] - palm[HAND_WRIST]
+            knuckles = palm[HAND_INDEX_MCP] - palm[HAND_PINKY_MCP]
+            frame = _frame_rotation(hand_rest, _REST_SECONDARY[hand], hand_direction, knuckles)
+            world[hand] = frame if frame is not None else _carried(forearm_hinged, hand_rest, hand_direction)
+        else:
+            knuckles = lm[_SIDE_LANDMARKS[suffix]["INDEX"]] - lm[_SIDE_LANDMARKS[suffix]["PINKY"]]
+            world[hand] = frame_or(hand, _carried(forearm_hinged, hand_rest, direction(hand)), knuckles)
         pronation = _twist_angle_about(forearm_hinged.inv() * world[hand], forearm_rest)
         world[forearm] = forearm_hinged * Rotation.from_rotvec(forearm_rest * FOREARM_TWIST_SHARE * pronation)
+        if suffix in hands:
+            world.update(_solve_fingers(world[hand], hands[suffix], suffix))
 
         # Leg: the same bend-plane roll and hinge, from the knee.
         hips = _torso_attachment(world["spine"], spine_direction, hip_line)
@@ -586,7 +764,9 @@ def _solve_world_rotations(landmarks: np.ndarray, visibility: np.ndarray | None)
     return world
 
 
-def solve_bone_rotations(landmarks: np.ndarray, visibility: np.ndarray | None = None) -> dict[str, Rotation]:
+def solve_bone_rotations(
+    landmarks: np.ndarray, visibility: np.ndarray | None = None, hands: dict | None = None
+) -> dict[str, Rotation]:
     """Computes each bone's LOCAL (parent-relative) rotation from a (33, 3)
     landmark array in the engine frame (see module docstring): a full frame per
     bone, direction plus roll. Returns bone name -> scipy Rotation; the root
@@ -596,30 +776,41 @@ def solve_bone_rotations(landmarks: np.ndarray, visibility: np.ndarray | None = 
     today: a heel below HEEL_MIN_VISIBILITY is ignored and that foot falls back
     to its ankle -> toe line (see FOOT_REST_PITCH_DEG). Without it, an
     implausibly placed heel still triggers the same fallback.
+
+    hands: optional {"L"/"R": (21, 3)} hand landmarks in the engine frame (B11;
+    only their directions matter, so they needn't be anchored at the wrist).
+    Each given hand also gets its 15 finger bones, and its hand bone is
+    measured from the palm. Without it the result is exactly the 15 body bones.
     """
     if landmarks.shape != (NUM_LANDMARKS, 3):
         raise ValueError(f"expected ({NUM_LANDMARKS}, 3) landmarks, got {landmarks.shape}")
     if visibility is not None and np.shape(visibility) != (NUM_LANDMARKS,):
         raise ValueError(f"expected ({NUM_LANDMARKS},) visibility, got {np.shape(visibility)}")
 
-    world_rotations = _solve_world_rotations(np.asarray(landmarks, dtype=float), visibility)
+    world_rotations = _solve_world_rotations(np.asarray(landmarks, dtype=float), visibility, _check_hands(hands, 3))
     local_rotations: dict[str, Rotation] = {}
     for bone in BONES:
         if bone.parent is None:
             local_rotations[bone.name] = world_rotations[bone.name]
         else:
             local_rotations[bone.name] = world_rotations[bone.parent].inv() * world_rotations[bone.name]
+    for finger in FINGER_BONES:
+        if finger.name in world_rotations:
+            local_rotations[finger.name] = world_rotations[finger.parent].inv() * world_rotations[finger.name]
     return local_rotations
 
 
 def world_rotations_from_local(local_rotations: dict[str, Rotation]) -> dict[str, Rotation]:
     """Composes parent-relative rotations back into world (T-pose-relative)
-    rotations down the BONES hierarchy. A bone missing from the dict counts as
-    identity."""
+    rotations down the BONES hierarchy. A body bone missing from the dict
+    counts as identity; finger bones are included only when given."""
     world: dict[str, Rotation] = {}
     for bone in BONES:
         local = local_rotations.get(bone.name, Rotation.identity())
         world[bone.name] = local if bone.parent is None else world[bone.parent] * local
+    for finger in FINGER_BONES:
+        if finger.name in local_rotations:
+            world[finger.name] = world[finger.parent] * local_rotations[finger.name]
     return world
 
 
@@ -665,13 +856,60 @@ _ATTACHMENTS: dict[str, tuple[str, str, np.ndarray]] = {
 }
 
 
+# Finger segment lengths and where each finger's first segment starts (its
+# knuckle, or the thumb's base), relative to the wrist in the rest hand's own
+# frame (left hand: +X along the hand, +Z toward the index side, +Y the back of
+# the hand; the right hand mirrors X). Typical adult proportions, in cm, for a
+# palm (wrist -> middle knuckle) of REST_PALM_LENGTH_CM; a measured hand scales
+# them by its own palm length (the "palm.L"/"palm.R" entries measured_proportions
+# adds).
+REST_PALM_LENGTH_CM = 9.3
+FINGER_LENGTHS_CM: dict[str, tuple[float, float, float]] = {
+    "thumb": (3.8, 3.0, 2.6),
+    "f_index": (4.0, 2.4, 2.0),
+    "f_middle": (4.4, 2.8, 2.2),
+    "f_ring": (4.1, 2.6, 2.1),
+    "f_pinky": (3.2, 2.0, 1.9),
+}
+FINGER_BASE_OFFSETS_CM: dict[str, tuple[float, float, float]] = {
+    "thumb": (2.0, -1.0, 2.0),
+    "f_index": (9.0, 0.0, 2.0),
+    "f_middle": (9.3, 0.0, 0.0),  # on the hand bone's own axis (wrist -> middle knuckle)
+    "f_ring": (8.8, 0.0, -1.8),
+    "f_pinky": (8.0, 0.0, -3.6),
+}
+
+
+def _palm_scale(lengths: dict[str, float], side: str) -> float:
+    """Measured palm length / the rest one (1 for the cm rest skeleton)."""
+    return float(lengths.get(f"palm.{side}", REST_PALM_LENGTH_CM)) / REST_PALM_LENGTH_CM
+
+
+def bone_length(lengths: dict[str, float], name: str) -> float:
+    """A bone's length from `lengths`, with fingers falling back to
+    FINGER_LENGTHS_CM scaled to the measured palm (if any)."""
+    if name in lengths:
+        return float(lengths[name])
+    finger = _FINGERS_BY_NAME[name]
+    return FINGER_LENGTHS_CM[finger.finger][finger.segment - 1] * _palm_scale(lengths, finger.side)
+
+
+def _finger_base_offset(lengths: dict[str, float], finger: FingerBoneSpec) -> np.ndarray:
+    """Rest offset of a finger's first segment's head from the wrist."""
+    offset = np.array(FINGER_BASE_OFFSETS_CM[finger.finger], dtype=float)
+    if finger.side == "R":
+        offset[0] = -offset[0]
+    return offset * _palm_scale(lengths, finger.side)
+
+
 def rest_head_positions(
     bone_lengths: dict[str, float] | None = None,
     shoulder_half_width: float = SHOULDER_HALF_WIDTH_CM,
     hip_half_width: float = HIP_HALF_WIDTH_CM,
 ) -> dict[str, np.ndarray]:
     """Every bone's head position in the rest (T-pose) skeleton, root at the
-    origin. BONES lists every parent before its children, so one pass suffices."""
+    origin, finger bones included. BONES lists every parent before its
+    children, so one pass suffices."""
     lengths = BONE_LENGTHS_CM if bone_lengths is None else bone_lengths
     half_widths = {"shoulder": shoulder_half_width, "hip": hip_half_width}
     heads: dict[str, np.ndarray] = {}
@@ -686,17 +924,33 @@ def rest_head_positions(
             anchor = anchor + parent.rest_direction * lengths[parent.name]
         lateral = lateral_direction * half_widths[width] if width is not None else np.zeros(3)
         heads[bone.name] = anchor + lateral
+    for finger in FINGER_BONES:
+        if finger.segment == 1:
+            heads[finger.name] = heads[finger.parent] + _finger_base_offset(lengths, finger)
+        else:
+            parent = _FINGERS_BY_NAME[finger.parent]
+            heads[finger.name] = heads[parent.name] + parent.rest_direction * bone_length(lengths, parent.name)
     return heads
 
 
-def measured_proportions(landmarks: np.ndarray) -> tuple[dict[str, float], float, float]:
+def measured_proportions(
+    landmarks: np.ndarray, hands: dict | None = None
+) -> tuple[dict[str, float], float, float]:
     """A subject's own (bone_lengths, shoulder_half_width, hip_half_width), in
     the landmarks' units, for forward_kinematics(): with these, the FK skeleton
-    lands on the landmarks wherever the solved rotations reproduce them."""
+    lands on the landmarks wherever the solved rotations reproduce them.
+    hands: optional {"L"/"R": (21, 3)} hand landmarks, adding each given hand's
+    finger lengths and its palm length ("palm.L"/"palm.R", which scales the
+    rest hand's knuckle positions)."""
     points = joint_positions(landmarks)
     lengths = {
         bone.name: float(np.linalg.norm(points[f"{bone.name}.tail"] - points[f"{bone.name}.head"])) for bone in BONES
     }
+    for side, hand in _check_hands(hands, 3).items():
+        lengths[f"palm.{side}"] = float(np.linalg.norm(hand[HAND_MIDDLE_MCP] - hand[HAND_WRIST]))
+        for finger in FINGER_BONES:
+            if finger.side == side:
+                lengths[finger.name] = float(np.linalg.norm(hand[finger.tail_index] - hand[finger.head_index]))
     shoulder_half = float(np.linalg.norm(landmarks[LEFT_SHOULDER] - landmarks[RIGHT_SHOULDER])) / 2.0
     hip_half = float(np.linalg.norm(landmarks[LEFT_HIP] - landmarks[RIGHT_HIP])) / 2.0
     return lengths, shoulder_half, hip_half
@@ -728,6 +982,15 @@ def forward_kinematics(
             head = points[f"{bone.parent}.head"] + world[bone.parent].apply(offset)
         points[f"{bone.name}.head"] = head
         points[f"{bone.name}.tail"] = head + world[bone.name].apply(bone.rest_direction * lengths[bone.name])
+    for finger in FINGER_BONES:
+        if finger.name not in world:
+            continue
+        offset = rest_heads[finger.name] - rest_heads[finger.parent]
+        head = points[f"{finger.parent}.head"] + world[finger.parent].apply(offset)
+        points[f"{finger.name}.head"] = head
+        points[f"{finger.name}.tail"] = head + world[finger.name].apply(
+            finger.rest_direction * bone_length(lengths, finger.name)
+        )
     return points
 
 
@@ -758,7 +1021,25 @@ def bone_lateral_axes(local_rotations: dict[str, Rotation]) -> dict[str, np.ndar
     carried by its world rotation), engine frame -- what the 3D preview turns
     each bone's octahedral body by, so roll is visible."""
     world = world_rotations_from_local(local_rotations)
-    return {name: world[name].apply(_REST_SECONDARY[name]) for name in BONE_NAMES}
+    return {name: rotation.apply(_REST_SECONDARY[name]) for name, rotation in world.items()}
+
+
+def _bone_axes_basis(bone_name: str) -> Rotation:
+    """The bone's rest frame as Blender-style bone axes: Y along the bone, X its
+    secondary axis (see _REST_SECONDARY), Z completing a right-handed frame."""
+    y = bone_rest_direction(bone_name) / np.linalg.norm(bone_rest_direction(bone_name))
+    x = _REST_SECONDARY[bone_name] - y * np.dot(_REST_SECONDARY[bone_name], y)
+    x = x / np.linalg.norm(x)
+    return Rotation.from_matrix(np.column_stack([x, y, np.cross(x, y)]))
+
+
+def bone_local_euler_deg(bone_name: str, local_rotation: Rotation) -> tuple[float, float, float]:
+    """A bone's local (parent-relative) rotation as X, Y, Z Euler degrees about
+    its own bone axes (Y along the bone, as in Blender) -- the inverse of
+    bone_axes_rotation, for the 3D view's hover label (F9)."""
+    basis = _bone_axes_basis(bone_name)
+    x, y, z = (basis.inv() * local_rotation * basis).as_euler("xyz", degrees=True)
+    return float(x), float(y), float(z)
 
 
 # -- manual correction ---------------------------------------------------------
@@ -798,17 +1079,136 @@ def flip_limb_depth(landmarks: np.ndarray, bone_name: str) -> np.ndarray:
     return flipped
 
 
+def flip_hand_depth(landmarks: np.ndarray, hands: dict | None, bone_name: str) -> dict:
+    """The hand-landmark part of flip_limb_depth: a flip of an arm bone also
+    reflects that side's hand landmarks (B11) about the same plane through the
+    bone's head. `landmarks` are the pose landmarks before the flip. Returns a
+    new dict; other hands (and leg flips) leave it unchanged."""
+    if bone_name not in _LIMB_DOWNSTREAM:
+        raise ValueError(f"{bone_name!r} isn't a limb bone (one of {FLIPPABLE_BONES})")
+    flipped = {side: np.array(points, dtype=float, copy=True) for side, points in (hands or {}).items()}
+    side = bone_name.rsplit(".", 1)[1]
+    if bone_name.split(".")[0] in ("upper_arm", "forearm", "hand") and side in flipped:
+        head_z = _BONES_BY_NAME[bone_name].head_fn(np.asarray(landmarks, dtype=float))[2]
+        flipped[side][:, 2] = 2.0 * head_z - flipped[side][:, 2]
+    return flipped
+
+
+# Joints that can be dragged on the photo (F4), each with the joint its bone
+# hangs from (None: no single parent bone -- a shoulder or hip just moves), and
+# the landmarks that move rigidly with it (a wrist carries the hand, an ankle
+# the foot).
+DRAGGABLE_JOINTS: dict[int, int | None] = {
+    LEFT_SHOULDER: None, RIGHT_SHOULDER: None,
+    LEFT_ELBOW: LEFT_SHOULDER, RIGHT_ELBOW: RIGHT_SHOULDER,
+    LEFT_WRIST: LEFT_ELBOW, RIGHT_WRIST: RIGHT_ELBOW,
+    LEFT_HIP: None, RIGHT_HIP: None,
+    LEFT_KNEE: LEFT_HIP, RIGHT_KNEE: RIGHT_HIP,
+    LEFT_ANKLE: LEFT_KNEE, RIGHT_ANKLE: RIGHT_KNEE,
+}
+_JOINT_FOLLOWERS: dict[int, tuple[int, ...]] = {
+    LEFT_WRIST: (LEFT_PINKY, LEFT_INDEX, LEFT_THUMB),
+    RIGHT_WRIST: (RIGHT_PINKY, RIGHT_INDEX, RIGHT_THUMB),
+    LEFT_ANKLE: (LEFT_HEEL, LEFT_FOOT_INDEX),
+    RIGHT_ANKLE: (RIGHT_HEEL, RIGHT_FOOT_INDEX),
+}
+_WRIST_HAND_SIDE = {LEFT_WRIST: "L", RIGHT_WRIST: "R"}
+JOINT_LABELS: dict[int, str] = {
+    LEFT_SHOULDER: "left shoulder", RIGHT_SHOULDER: "right shoulder",
+    LEFT_ELBOW: "left elbow", RIGHT_ELBOW: "right elbow",
+    LEFT_WRIST: "left wrist", RIGHT_WRIST: "right wrist",
+    LEFT_HIP: "left hip", RIGHT_HIP: "right hip",
+    LEFT_KNEE: "left knee", RIGHT_KNEE: "right knee",
+    LEFT_ANKLE: "left ankle", RIGHT_ANKLE: "right ankle",
+}
+
+
+def image_to_world_scale(
+    landmarks: np.ndarray, image_xy: np.ndarray, aspect: float = 1.0, visibility: np.ndarray | None = None
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """A weak-perspective camera fitted to one person: (scale, world_center,
+    image_center) with u = aspect * x, v = y (image units of the photo's
+    height) ~ image_center + scale * (X, -Y) - scale * world_center(X, -Y).
+    The world landmarks are camera-aligned (the crop rotation is undone), so
+    only a scale and an offset separate them from the image. Least squares,
+    weighted by visibility. Used to turn a 2D drag into a 3D move (F4) and to
+    place the photo behind the 3D preview (F9)."""
+    world = np.asarray(landmarks, dtype=float)[:, :2] * np.array([1.0, -1.0])
+    image = np.asarray(image_xy, dtype=float) * np.array([aspect, 1.0])
+    weights = np.ones(len(world)) if visibility is None else np.clip(np.asarray(visibility, dtype=float), 0.05, 1.0)
+    weights = weights / weights.sum()
+    world_center = (world * weights[:, None]).sum(axis=0)
+    image_center = (image * weights[:, None]).sum(axis=0)
+    w, i = world - world_center, image - image_center
+    denominator = float((weights[:, None] * w * w).sum())
+    scale = float((weights[:, None] * w * i).sum()) / denominator if denominator > 1e-12 else 0.0
+    return scale, world_center * np.array([1.0, -1.0]), image_center
+
+
+def move_joint(
+    landmarks: np.ndarray,
+    image_xy: np.ndarray,
+    joint: int,
+    new_xy,
+    aspect: float = 1.0,
+    visibility: np.ndarray | None = None,
+    hands: dict | None = None,
+    hands_xy: dict | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict, dict]:
+    """Moves one joint to a new normalized image position (F4: a 2D drag on the
+    photo) and lifts the move into 3D: the image displacement becomes a world
+    one through image_to_world_scale; a joint with a parent bone keeps that
+    bone's length and which side of its parent it lies in depth (the bone
+    swings to the new image direction), others keep their depth. The joint's
+    followers (hand or foot landmarks, and the hand landmarks of a wrist) move
+    with it. Returns new (landmarks, image_xy, hands, hands_xy)."""
+    if joint not in DRAGGABLE_JOINTS:
+        raise ValueError(f"landmark {joint} can't be dragged (one of {sorted(DRAGGABLE_JOINTS)})")
+    landmarks = np.array(landmarks, dtype=float, copy=True)
+    image_xy = np.array(image_xy, dtype=float, copy=True)
+    hands = {side: np.array(points, dtype=float, copy=True) for side, points in (hands or {}).items()}
+    hands_xy = {side: np.array(points, dtype=float, copy=True) for side, points in (hands_xy or {}).items()}
+    new_xy = np.asarray(new_xy, dtype=float)
+    scale, _world_center, _image_center = image_to_world_scale(landmarks, image_xy, aspect, visibility)
+    if scale <= 1e-9:
+        return landmarks, image_xy, hands, hands_xy
+
+    delta_image = new_xy - image_xy[joint]
+    planar_delta = np.array([delta_image[0] * aspect, -delta_image[1]]) / scale
+    old = landmarks[joint].copy()
+    parent = DRAGGABLE_JOINTS[joint]
+    if parent is None:
+        new = old + np.array([planar_delta[0], planar_delta[1], 0.0])
+    else:
+        bone = old - landmarks[parent]
+        length = float(np.linalg.norm(bone))
+        planar = bone[:2] + planar_delta
+        planar_length = float(np.linalg.norm(planar))
+        depth = 0.0
+        if planar_length < length:
+            depth = np.sqrt(length * length - planar_length * planar_length) * (1.0 if bone[2] >= 0 else -1.0)
+        new = landmarks[parent] + np.array([planar[0], planar[1], depth])
+    shift = new - old
+    landmarks[joint] = new
+    image_xy[joint] = new_xy
+    for follower in _JOINT_FOLLOWERS.get(joint, ()):
+        landmarks[follower] += shift
+        image_xy[follower] += delta_image
+    side = _WRIST_HAND_SIDE.get(joint)
+    if side in hands:
+        hands[side] += shift
+    if side in hands_xy:
+        hands_xy[side] += delta_image
+    return landmarks, image_xy, hands, hands_xy
+
+
 def bone_axes_rotation(bone_name: str, angles_deg: tuple[float, float, float]) -> Rotation:
     """A manual adjustment of `bone_name` as a rotation in its own rest frame,
     from (X, Y, Z) degrees about Blender-style bone axes: Y runs along the bone
     (a twist), X is its secondary axis (see _REST_SECONDARY) and Z completes
     the right-handed frame -- so "Y" twists any bone, whichever way the engine
     frame's own axes happen to point along it."""
-    bone = _BONES_BY_NAME[bone_name]
-    y = bone.rest_direction / np.linalg.norm(bone.rest_direction)
-    x = _REST_SECONDARY[bone_name] - y * np.dot(_REST_SECONDARY[bone_name], y)
-    x = x / np.linalg.norm(x)
-    basis = Rotation.from_matrix(np.column_stack([x, y, np.cross(x, y)]))
+    basis = _bone_axes_basis(bone_name)
     return basis * Rotation.from_euler("xyz", angles_deg, degrees=True) * basis.inv()
 
 

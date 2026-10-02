@@ -41,6 +41,12 @@ which composes exactly the way BVH's channel order is meant to be read: first
 rotate about local Z, then about the new local X, then about the newest local
 Y), so the CHANNELS line and the MOTION values paired with it are always
 self-consistent.
+
+Fingers (B11): when the rotations include finger bones (the app's "Hands and
+fingers" option), each hand JOINT gets its fingers as child JOINTs (thumb.01
+-> .02 -> .03, f_index.01 ..., with End Sites at the tips), placed from
+skeleton.FINGER_BASE_OFFSETS_CM / FINGER_LENGTHS_CM. Without finger bones the
+file is exactly the 15-joint one.
 """
 from __future__ import annotations
 
@@ -53,9 +59,13 @@ from scipy.spatial.transform import Rotation
 from pose_craft.retarget.skeleton import (  # noqa: F401 -- the size constants are re-exported
     BONE_LENGTHS_CM,
     BONES,
+    FINGER_BONES,
     HIP_HALF_WIDTH_CM,
     SHOULDER_HALF_WIDTH_CM,
     BoneSpec,
+    bone_length,
+    bone_parent,
+    bone_rest_direction,
     hip_height_above_floor,
     rest_head_positions,
 )
@@ -83,15 +93,20 @@ _CHILDREN: dict[str, list[str]] = {b.name: [] for b in BONES}
 for _bone in BONES:
     if _bone.parent is not None:
         _CHILDREN[_bone.parent].append(_bone.name)
+# The same, with every hand's fingers attached (used when fingers were solved).
+_CHILDREN_WITH_FINGERS: dict[str, list[str]] = {name: list(kids) for name, kids in _CHILDREN.items()}
+for _finger in FINGER_BONES:
+    _CHILDREN_WITH_FINGERS.setdefault(_finger.name, [])
+    _CHILDREN_WITH_FINGERS[_finger.parent].append(_finger.name)
 
 _ROOT_BONE = next(b.name for b in BONES if b.parent is None)
 
 
 def _bone_vector(bone_name: str) -> np.ndarray:
     """The bone's own rest vector (head -> tail): rest_direction scaled to its length."""
-    bone = _BONES_BY_NAME[bone_name]
-    direction = bone.rest_direction / np.linalg.norm(bone.rest_direction)
-    return direction * BONE_LENGTHS_CM[bone_name]
+    rest_direction = bone_rest_direction(bone_name)
+    direction = rest_direction / np.linalg.norm(rest_direction)
+    return direction * bone_length(BONE_LENGTHS_CM, bone_name)
 
 
 _REST_HEADS = rest_head_positions()
@@ -100,7 +115,7 @@ _REST_HEADS = rest_head_positions()
 def _offset(bone_name: str) -> np.ndarray:
     """BVH OFFSET for a JOINT/ROOT: its rest head relative to its parent's rest
     head (zero for the root, which is placed by the root position channels)."""
-    parent = _BONES_BY_NAME[bone_name].parent
+    parent = bone_parent(bone_name)
     if parent is None:
         return np.zeros(3)
     return _REST_HEADS[bone_name] - _REST_HEADS[parent]
@@ -110,7 +125,7 @@ def _fmt(value: float) -> str:
     return f"{value:.6f}"
 
 
-def _write_joint(lines: list[str], name: str, indent: int, is_root: bool) -> None:
+def _write_joint(lines: list[str], name: str, indent: int, is_root: bool, children_of=None) -> None:
     pad = "  " * indent
     keyword = "ROOT" if is_root else "JOINT"
     lines.append(f"{pad}{keyword} {name}")
@@ -122,10 +137,11 @@ def _write_joint(lines: list[str], name: str, indent: int, is_root: bool) -> Non
     else:
         lines.append(f"{pad}  CHANNELS 3 Zrotation Xrotation Yrotation")
 
-    children = _CHILDREN[name]
+    children_of = _CHILDREN if children_of is None else children_of
+    children = children_of[name]
     if children:
         for child in children:
-            _write_joint(lines, child, indent + 1, is_root=False)
+            _write_joint(lines, child, indent + 1, is_root=False, children_of=children_of)
     else:
         # A leaf JOINT (hand/foot/head -- no further bone in our 15-bone set)
         # still needs a terminating End Site so BVH readers know where its own
@@ -139,15 +155,16 @@ def _write_joint(lines: list[str], name: str, indent: int, is_root: bool) -> Non
     lines.append(f"{pad}}}")
 
 
-def _channel_order() -> list[str]:
+def _channel_order(children_of=None) -> list[str]:
     """The joint traversal order MOTION values must be written in -- must match
     the HIERARCHY block's own depth-first traversal exactly, which it does by
-    construction: both walk _CHILDREN starting from _ROOT_BONE."""
+    construction: both walk the same children table starting from _ROOT_BONE."""
+    children_of = _CHILDREN if children_of is None else children_of
     order: list[str] = []
 
     def visit(name: str) -> None:
         order.append(name)
-        for child in _CHILDREN[name]:
+        for child in children_of[name]:
             visit(child)
 
     visit(_ROOT_BONE)
@@ -187,15 +204,19 @@ def build_bvh_animation(
     """A multi-frame BVH: the same HIERARCHY as build_bvh_document, and one
     MOTION line per entry of `frames` (each a bone name -> local Rotation dict,
     missing bones identity). root_positions: one per frame (default: all at
-    the origin)."""
+    the origin). Finger joints are written when any frame has finger bones
+    (frames without them keep their fingers straight)."""
     if not frames:
         raise ValueError("a BVH needs at least one frame")
     if root_positions is not None and len(root_positions) != len(frames):
         raise ValueError(f"{len(root_positions)} root positions for {len(frames)} frames")
+    finger_names = {finger.name for finger in FINGER_BONES}
+    with_fingers = any(finger_names & set(rotations) for rotations in frames)
+    children_of = _CHILDREN_WITH_FINGERS if with_fingers else _CHILDREN
     hierarchy_lines: list[str] = ["HIERARCHY"]
-    _write_joint(hierarchy_lines, _ROOT_BONE, indent=0, is_root=True)
+    _write_joint(hierarchy_lines, _ROOT_BONE, indent=0, is_root=True, children_of=children_of)
 
-    order = _channel_order()
+    order = _channel_order(children_of)
     positions = root_positions if root_positions is not None else [(0.0, 0.0, 0.0)] * len(frames)
     lines = hierarchy_lines + [
         "MOTION",

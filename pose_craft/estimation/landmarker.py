@@ -53,6 +53,13 @@ MODEL_SHA256 = {
     "heavy": ("64437af838a65d18e5ba7a0d39b465540069bc8aae8308de3e318aad31fcbc7b",),
 }
 
+# The hand landmarker (B11, the "Hands and fingers" option), pinned and checked
+# the same way. Only its 21-point landmark model is used (see onnx_pose's hand
+# section); the bundle's palm detector is never converted.
+HAND_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+HAND_MODEL_SHA256 = ("fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1",)
+HAND_MODEL_FILENAME = "hand_landmarker.task"
+
 # A real .task model is several MB; anything smaller almost certainly means a
 # truncated download or an HTML error page saved under the expected filename.
 MIN_MODEL_BYTES = 1_000_000
@@ -96,6 +103,15 @@ def _checksum_ok(variant: str, path: Path) -> bool:
     return not expected or file_sha256(path) in expected
 
 
+def hand_model_cache_path() -> Path:
+    """Where the hand landmarker bundle lives (or would be downloaded to)."""
+    return CACHE_DIR / HAND_MODEL_FILENAME
+
+
+def _cached_file_ok(path: Path, accepted: tuple[str, ...]) -> bool:
+    return path.exists() and path.stat().st_size >= MIN_MODEL_BYTES and (not accepted or file_sha256(path) in accepted)
+
+
 def ensure_model_downloaded(
     variant: str = "full",
     on_progress: Callable[[int, int], None] | None = None,
@@ -114,8 +130,33 @@ def ensure_model_downloaded(
     again rather than trusted.
     """
     dest = model_cache_path(variant)
+    accepted = tuple(MODEL_SHA256.get(variant) or ())
+    return _download_verified(MODEL_URLS[variant], dest, accepted, f"{variant!r} pose", on_progress, should_cancel)
+
+
+def ensure_hand_model_downloaded(
+    on_progress: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> Path:
+    """The hand landmarker bundle, downloaded once and SHA-256-checked exactly
+    like the pose models (see ensure_model_downloaded)."""
+    return _download_verified(
+        HAND_MODEL_URL, hand_model_cache_path(), HAND_MODEL_SHA256, "hand", on_progress, should_cancel
+    )
+
+
+def _download_verified(
+    url: str,
+    dest: Path,
+    accepted: tuple[str, ...],
+    label: str,
+    on_progress: Callable[[int, int], None] | None,
+    should_cancel: Callable[[], bool] | None,
+) -> Path:
+    """Downloads `url` to `dest` unless a cached copy hashing to one of
+    `accepted` is there already (any hash, when `accepted` is empty)."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    if dest.exists() and dest.stat().st_size >= MIN_MODEL_BYTES and _checksum_ok(variant, dest):
+    if _cached_file_ok(dest, accepted):
         return dest
 
     # Download to a temp file in the same directory (so the final os.replace is an
@@ -131,14 +172,14 @@ def ensure_model_downloaded(
         # no timeout, so a stalled connection used to hang the solve forever
         # (and closing the window with it). The timeout applies to each network
         # operation; `should_cancel` is checked before every chunk.
-        with urllib.request.urlopen(MODEL_URLS[variant], timeout=DOWNLOAD_TIMEOUT_SECONDS) as response, open(
+        with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response, open(
             tmp_path, "wb"
         ) as out:
             total = int(response.headers.get("Content-Length") or 0)
             downloaded = 0
             while True:
                 if should_cancel is not None and should_cancel():
-                    raise DownloadCancelled(f"download of the {variant!r} model was cancelled")
+                    raise DownloadCancelled(f"download of the {label} model was cancelled")
                 chunk = response.read(DOWNLOAD_CHUNK_BYTES)
                 if not chunk:
                     break
@@ -147,10 +188,10 @@ def ensure_model_downloaded(
                 if on_progress is not None:
                     on_progress(min(downloaded, total) if total > 0 else downloaded, total)
         if tmp_path.stat().st_size < MIN_MODEL_BYTES:
-            raise OSError(f"downloaded model for variant {variant!r} looks truncated ({tmp_path.stat().st_size} bytes)")
-        if not _checksum_ok(variant, tmp_path):
+            raise OSError(f"downloaded {label} model looks truncated ({tmp_path.stat().st_size} bytes)")
+        if accepted and file_sha256(tmp_path) not in accepted:
             raise ModelChecksumError(
-                f"the downloaded {variant!r} pose model doesn't match its pinned SHA-256 -- the download was "
+                f"the downloaded {label} model doesn't match its pinned SHA-256 -- the download was "
                 "corrupted or the file on the server changed; nothing was saved"
             )
         tmp_path.replace(dest)
@@ -161,10 +202,30 @@ def ensure_model_downloaded(
 
 
 @dataclasses.dataclass
+class HandLandmarks:
+    """One hand's 21 landmarks (B11)."""
+
+    world: np.ndarray  # (21, 3) engine frame, meters, the wrist on the pose's wrist landmark
+    image_xy: np.ndarray  # (21, 2) normalized image x/y
+    presence: float  # the hand model's presence score, 0..1
+
+
+@dataclasses.dataclass
 class DetectedPerson:
     landmarks: np.ndarray  # (33, 3) in the engine's Y-up, +Z-toward-camera frame
     image_landmarks_xy: np.ndarray  # (33, 2) normalized [0, 1] image-space x/y, for click-to-select
     visibility: np.ndarray  # (33,) BlazePose's per-landmark visibility score, 0..1
+    # "L"/"R" -> HandLandmarks, only with the "Hands and fingers" option (B11).
+    hands: dict = dataclasses.field(default_factory=dict)
+
+    def hand_world(self) -> dict[str, np.ndarray]:
+        return {side: hand.world for side, hand in self.hands.items()}
+
+    def hand_image_xy(self) -> dict[str, np.ndarray]:
+        return {side: hand.image_xy for side, hand in self.hands.items()}
+
+    def hand_presence(self) -> dict[str, float]:
+        return {side: hand.presence for side, hand in self.hands.items()}
 
     def centroid_xy(self) -> tuple[float, float]:
         return float(np.mean(self.image_landmarks_xy[:, 0])), float(np.mean(self.image_landmarks_xy[:, 1]))
@@ -198,6 +259,24 @@ def onnx_model_paths(model_path: Path) -> dict[str, Path]:
 
     stem = f"{model_path.stem}.v{CONVERTER_VERSION}"
     return {key: model_path.with_name(f"{stem}.{key}.onnx") for key in ("detector", "landmarks")}
+
+
+def hand_onnx_model_path(task_path: Path) -> Path:
+    """Where the hand landmark model's ONNX conversion is cached (next to the bundle)."""
+    from pose_craft.estimation.tflite_to_onnx import CONVERTER_VERSION
+
+    return task_path.with_name(f"{task_path.stem}.v{CONVERTER_VERSION}.landmarks.onnx")
+
+
+def ensure_hand_onnx_model(task_path: Path) -> Path:
+    """Converts the hand bundle's landmark model to ONNX once (the palm
+    detector is skipped), reusing the cached conversion afterwards."""
+    from pose_craft.estimation.tflite_to_onnx import HAND_TASK_BUNDLE_MEMBERS, convert_task_bundle
+
+    path = hand_onnx_model_path(task_path)
+    if not path.exists():
+        convert_task_bundle(task_path, {"landmarks": path}, HAND_TASK_BUNDLE_MEMBERS)
+    return path
 
 
 def ensure_onnx_models(model_path: Path) -> dict[str, Path]:
@@ -244,6 +323,37 @@ def bundled_onnx_paths(variant: str) -> dict[str, Path] | None:
     except (OSError, ValueError, KeyError, TypeError):
         return None
     return paths if all(path.is_file() for path in paths.values()) else None
+
+
+def bundled_hand_onnx_path() -> Path | None:
+    """The pre-converted hand landmark model from the bundled manifest (its
+    "hand" entry), or None."""
+    directory = bundled_model_dir()
+    if directory is None or not (directory / BUNDLED_MANIFEST).is_file():
+        return None
+    try:
+        manifest = json.loads((directory / BUNDLED_MANIFEST).read_text(encoding="utf-8"))
+        path = directory / manifest["hand"]["landmarks"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return path if path.is_file() else None
+
+
+def is_hand_model_available() -> bool:
+    """Whether the hand model can be loaded without any network access."""
+    return bundled_hand_onnx_path() is not None or _cached_file_ok(hand_model_cache_path(), HAND_MODEL_SHA256)
+
+
+def resolve_hand_onnx_model(
+    on_progress: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> Path:
+    """The hand landmark model: bundled when present, else downloaded and
+    converted once."""
+    bundled = bundled_hand_onnx_path()
+    if bundled is not None:
+        return bundled
+    return ensure_hand_onnx_model(ensure_hand_model_downloaded(on_progress=on_progress, should_cancel=should_cancel))
 
 
 def is_model_available(variant: str) -> bool:
@@ -294,6 +404,13 @@ def prepare_input_rgb(image_bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
 
+# Pose landmarks the hand crop is derived from, per side: wrist, index, pinky.
+_HAND_POSE_LANDMARKS = {"L": (15, 19, 17), "R": (16, 20, 18)}
+# A hand whose pose landmarks are less visible than this (out of frame,
+# hidden) isn't searched: the crop would be a guess.
+HAND_MIN_POSE_VISIBILITY = 0.5
+
+
 class PoseEstimator:
     """Owns one BlazePose model pair on ONNX Runtime -- on the GPU (DirectML or
     CUDA, whichever the installed onnxruntime build offers) when `use_gpu` is set
@@ -309,6 +426,9 @@ class PoseEstimator:
     """
 
     group_photo: bool = False
+    # B11, per call like group_photo: also run the hand landmark model on each
+    # person's hands (needs enable_hands() first, which loads the model).
+    hands: bool = False
 
     def __init__(
         self,
@@ -333,6 +453,7 @@ class PoseEstimator:
         self.variant = variant
         self.max_people = max_people
         self.use_gpu = use_gpu
+        self._hand_model = None
 
     @classmethod
     def for_variant(
@@ -354,6 +475,35 @@ class PoseEstimator:
             onnx_paths=paths,
             variant=variant,
         )
+
+    def enable_hands(
+        self,
+        on_progress: Callable[[int, int], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> None:
+        """Loads the hand landmark model (B11) on this estimator's device, once
+        -- downloading and converting it first in a source install."""
+        if self._hand_model is None:
+            from pose_craft.estimation.onnx_pose import HandLandmarker
+
+            path = resolve_hand_onnx_model(on_progress=on_progress, should_cancel=should_cancel)
+            self._hand_model = HandLandmarker(path, use_gpu=self.use_gpu)
+
+    def _find_hands(self, image_rgb: np.ndarray, person: DetectedPerson, result) -> None:
+        """Runs the hand model on both of `person`'s hands, from the pose's
+        wrist/index/pinky landmarks (a hand whose landmarks are barely visible
+        is skipped), storing what it finds in person.hands."""
+        for side, (wrist, index, pinky) in _HAND_POSE_LANDMARKS.items():
+            if min(result.visibility[i] for i in (wrist, index, pinky)) < HAND_MIN_POSE_VISIBILITY:
+                continue
+            hand = self._hand_model.detect(
+                image_rgb, result.image_xy[wrist], result.image_xy[index], result.image_xy[pinky]
+            )
+            if hand is None:
+                continue
+            world = _world_to_engine(hand.world)
+            world += person.landmarks[wrist] - world[0]  # put the hand's wrist on the pose's
+            person.hands[side] = HandLandmarks(world=world, image_xy=hand.image_xy, presence=hand.presence)
 
     def warm_up(self) -> None:
         """Runs one detector and one landmark inference on a blank image, so the
@@ -385,6 +535,15 @@ class PoseEstimator:
     def __exit__(self, *exc_info) -> None:
         self.close()
 
+    def new_tracker(self, max_people: int):
+        """A video.MultiPersonTracker (B12) on this estimator's models: stable
+        IDs for up to max_people people through a video."""
+        if self._pose is None:
+            raise RuntimeError("PoseEstimator is closed")
+        from pose_craft.estimation.video import MultiPersonTracker
+
+        return MultiPersonTracker(self._pose, max_people)
+
     def track(self, image_rgb: np.ndarray, previous):
         """One video frame (already prepare_input_rgb'd) for one tracked person:
         see onnx_pose.BlazePose.track. Returns a PoseResult or None."""
@@ -395,20 +554,24 @@ class PoseEstimator:
     def detect(self, image_bgr: np.ndarray) -> list[DetectedPerson]:
         if self._pose is None:
             raise RuntimeError("PoseEstimator is closed")
+        image_rgb = prepare_input_rgb(image_bgr)
         results = self._pose.detect(
-            prepare_input_rgb(image_bgr),
+            image_rgb,
             max_people=self.max_people,
             min_detection_confidence=0.5,
             min_presence_confidence=0.5,
             tiled=True if self.group_photo else None,
         )
-        people = [
-            DetectedPerson(
+        find_hands = self.hands and self._hand_model is not None
+        people = []
+        for result in results:
+            person = DetectedPerson(
                 landmarks=_world_to_engine(result.world),
                 image_landmarks_xy=result.image_xy,
                 visibility=result.visibility,
             )
-            for result in results
-        ]
+            if find_hands:
+                self._find_hands(image_rgb, person, result)
+            people.append(person)
         people.sort(key=lambda p: p.centroid_xy()[0])
         return people

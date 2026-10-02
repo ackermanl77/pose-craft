@@ -35,8 +35,15 @@ def fake_conversion(tmp_path, monkeypatch):
         paths["landmarks"].write_bytes(f"landmarks {variant}".encode())
         return paths
 
+    def fake_hand_onnx(task):
+        path = source / "hand.landmarks.onnx"
+        path.write_bytes(b"hand landmarks")
+        return path
+
     monkeypatch.setattr(landmarker, "ensure_model_downloaded", fake_download)
     monkeypatch.setattr(landmarker, "ensure_onnx_models", fake_onnx)
+    monkeypatch.setattr(landmarker, "ensure_hand_model_downloaded", lambda **_kwargs: source / "hand_landmarker.task")
+    monkeypatch.setattr(landmarker, "ensure_hand_onnx_model", fake_hand_onnx)
     return tmp_path / "models"
 
 
@@ -45,8 +52,10 @@ def test_conversion_stores_the_shared_detector_once(fake_conversion):
 
     assert {entry["detector"] for entry in manifest["variants"].values()} == {"pose_detector.onnx"}
     assert sorted(p.name for p in fake_conversion.glob("*.onnx")) == [
+        "hand_landmarks.onnx",
         "pose_detector.onnx", "pose_landmarks_full.onnx", "pose_landmarks_heavy.onnx", "pose_landmarks_lite.onnx",
     ]
+    assert manifest["hand"] == {"landmarks": "hand_landmarks.onnx"}
     on_disk = json.loads((fake_conversion / landmarker.BUNDLED_MANIFEST).read_text(encoding="utf-8"))
     assert on_disk == manifest
 
@@ -66,6 +75,18 @@ def test_bundled_models_are_used_without_any_download(fake_conversion, monkeypat
     }
     assert landmarker.is_model_available("full")
     assert landmarker.bundled_onnx_paths("heavy") is None  # not in this bundle: falls back to downloading
+    # B11: the hand model comes from the bundle too, never from the network.
+    monkeypatch.setattr(landmarker, "ensure_hand_model_downloaded", no_network)
+    assert landmarker.resolve_hand_onnx_model() == fake_conversion / "hand_landmarks.onnx"
+    assert landmarker.is_hand_model_available()
+
+
+def test_a_bundle_without_hands_still_serves_the_pose_models(fake_conversion, monkeypatch):
+    manifest = convert_models.convert(fake_conversion, ["lite"], hands=False)
+    monkeypatch.setenv("POSECRAFT_MODEL_DIR", str(fake_conversion))
+    assert "hand" not in manifest
+    assert landmarker.bundled_onnx_paths("lite") is not None
+    assert landmarker.bundled_hand_onnx_path() is None  # falls back to the pinned download
 
 
 def test_a_broken_bundle_is_ignored(tmp_path, monkeypatch):
