@@ -16,6 +16,13 @@ sources calculator by calculator:
 
 IMAGE running mode only (what this app uses): no tracking or smoothing between
 calls, exactly as MediaPipe's own IMAGE mode behaves.
+
+One addition MediaPipe doesn't have: group-photo tiling (`detect(..., tiled=)`).
+The detector always sees the whole photo letterboxed into 224x224, and its
+detections are driven by the face, so in a wide group shot each face can be a
+few pixels across and nobody is found. Tiling runs the same detector on
+overlapping tiles too (see tile_regions / merge_tile_detections); the landmark
+model still runs on the full image.
 """
 from __future__ import annotations
 
@@ -38,7 +45,24 @@ HEATMAP_KERNEL_SIZE = 7
 HEATMAP_MIN_CONFIDENCE = 0.5  # RefineLandmarksFromHeatmapCalculatorOptions' default
 
 CUDA_PROVIDER = "CUDAExecutionProvider"
+DML_PROVIDER = "DmlExecutionProvider"
 CPU_PROVIDER = "CPUExecutionProvider"
+
+# GPU execution providers in the order they're tried. DirectML first: on an
+# RTX 5080 it ran the pipeline in ~7 ms against CUDA's 10-17 ms and matched the
+# CPU to 0.03 px, and it also runs on AMD/Intel GPUs. The onnxruntime-directml
+# and onnxruntime-gpu wheels install the same `onnxruntime` module, so one
+# environment normally has only one of the two; the order matters only when a
+# custom build offers both.
+GPU_PREFERENCE = ("directml", "cuda")
+_GPU_PROVIDERS = {"directml": DML_PROVIDER, "cuda": CUDA_PROVIDER}
+
+# CUDA provider options. use_tf32=0: ONNX Runtime enables TF32 math by default
+# on Ampere and newer GPUs, which moved landmarks up to 12 px (lite), 3 px
+# (full) and 4 px (heavy) from the CPU result; with it off they match to
+# ~0.04 px. The heavy model gets slower (measured ~16-23 ms -> ~38-40 ms per
+# solve); DirectML avoids that trade-off.
+CUDA_PROVIDER_OPTIONS = {"cudnn_conv_algo_search": "HEURISTIC", "use_tf32": "0"}
 
 
 # -- detector -----------------------------------------------------------------
@@ -125,6 +149,56 @@ def weighted_nms(detections: list[Detection], threshold: float = MIN_SUPPRESSION
         output.append(Detection(best.score, box, keypoints))
         remaining = rest
     return output
+
+
+def remove_letterbox(det: Detection, pad: tuple[float, float], width: int, height: int) -> Detection:
+    """DetectionLetterboxRemoval, then scaled to pixels: a detection in the
+    letterboxed detector input's normalized coordinates -> pixel coordinates of
+    the image the detector saw (box and keypoints alike)."""
+    pad_x, pad_y = pad
+    scale = np.array([width / (1.0 - 2 * pad_x), height / (1.0 - 2 * pad_y)])
+    offset = np.array([pad_x, pad_y])
+    keypoints = (det.keypoints - offset) * scale
+    corners = (det.box.reshape(2, 2) - offset) * scale
+    return Detection(det.score, corners.reshape(4), keypoints)
+
+
+# Group-photo tiling: a GRID x GRID layout of tiles, each overlapping its
+# neighbours by TILE_OVERLAP of its own size, so a face on a tile border is
+# whole in at least one tile. Measured on a 2x2 collage of a two-person photo
+# (8 people): the whole-image pass found 1, the tiles 7.
+TILE_GRID = 2
+TILE_OVERLAP = 0.25
+
+
+def tile_regions(width: int, height: int, grid: int = TILE_GRID, overlap: float = TILE_OVERLAP) -> list[tuple[int, int, int, int]]:
+    """(x0, y0, x1, y1) pixel rectangles covering the image in a grid x grid
+    layout of equal, overlapping tiles with the image's aspect ratio."""
+    regions = []
+    tile_w = width / (1.0 + (grid - 1) * (1.0 - overlap))
+    tile_h = height / (1.0 + (grid - 1) * (1.0 - overlap))
+    for row in range(grid):
+        for col in range(grid):
+            x0 = col * tile_w * (1.0 - overlap)
+            y0 = row * tile_h * (1.0 - overlap)
+            regions.append((round(x0), round(y0), min(width, round(x0 + tile_w)), min(height, round(y0 + tile_h))))
+    return regions
+
+
+def merge_tile_detections(
+    primary: list[Detection], tiled: list[Detection], threshold: float = MIN_SUPPRESSION_THRESHOLD
+) -> list[Detection]:
+    """Adds the people the tiles found to the whole-image detections (all in the
+    same pixel coordinates). The tiles' own duplicates (one face seen by two
+    overlapping tiles) are merged with weighted NMS; a tile detection that
+    overlaps a whole-image one is dropped rather than averaged into it, since a
+    tile can cut a large person off and the whole-image detection is the better
+    estimate of their body. Sorted by score, best first."""
+    kept = [
+        det for det in weighted_nms(tiled, threshold)
+        if all(_iou(det.box, other.box) <= threshold for other in primary)
+    ]
+    return sorted(primary + kept, key=lambda d: d.score, reverse=True)
 
 
 @dataclasses.dataclass
@@ -252,6 +326,17 @@ class PoseResult:
     visibility: np.ndarray  # (33,)
     world: np.ndarray  # (33, 3) meters, MediaPipe's world frame (origin at hip center, +y down)
     presence: float
+    # The model's two ROI helper landmarks (hip center, body-scale point), image
+    # coordinates: where to look for this person in the next video frame.
+    aux_xy: np.ndarray | None = None
+
+    def next_roi(self, image_w: int, image_h: int) -> NormRect | None:
+        """MediaPipe VIDEO mode's PoseLandmarksToRoi: the next frame's crop for
+        this person, from the auxiliary landmarks -- the same alignment-point
+        rule the detector's keypoints go through (detection_to_roi)."""
+        if self.aux_xy is None:
+            return None
+        return detection_to_roi(self.aux_xy[:2], image_w, image_h)
 
 
 # -- sessions -----------------------------------------------------------------
@@ -283,18 +368,40 @@ def _preload_cuda_dlls() -> None:
         log.info("could not preload CUDA DLLs; ONNX Runtime will fall back to the CPU", exc_info=True)
 
 
-def create_session(model_path: Path, use_gpu: bool = True):
-    """An ONNX Runtime session on the CUDA provider when requested and usable,
-    otherwise the CPU provider. Check `session.get_providers()[0]` for which won."""
+def select_providers(
+    available: list[str], use_gpu: bool, preference: tuple[str, ...] = GPU_PREFERENCE
+) -> tuple[list, bool]:
+    """The provider list for an InferenceSession: the available GPU providers in
+    `preference` order (each with its options), then the CPU as the fallback
+    ONNX Runtime uses if a GPU provider fails to initialize. Returns (providers,
+    whether DirectML is among them -- it needs its own session options)."""
+    providers: list = []
+    if use_gpu:
+        for key in preference:
+            name = _GPU_PROVIDERS[key]
+            if name not in available:
+                continue
+            providers.append((name, dict(CUDA_PROVIDER_OPTIONS)) if name == CUDA_PROVIDER else name)
+    uses_dml = DML_PROVIDER in providers
+    return providers + [CPU_PROVIDER], uses_dml
+
+
+def create_session(model_path: Path, use_gpu: bool = True, preference: tuple[str, ...] = GPU_PREFERENCE):
+    """An ONNX Runtime session on the first usable GPU provider (see
+    select_providers) when requested, otherwise the CPU provider. Check
+    `session.get_providers()[0]` for which won."""
     import onnxruntime as ort
 
     options = ort.SessionOptions()
     options.log_severity_level = 3  # errors only -- keeps provider fallbacks from spamming stderr
-    providers = [CPU_PROVIDER]
     if use_gpu:
         _preload_cuda_dlls()
-        if CUDA_PROVIDER in ort.get_available_providers():
-            providers = [(CUDA_PROVIDER, {"cudnn_conv_algo_search": "HEURISTIC"}), CPU_PROVIDER]
+    providers, uses_dml = select_providers(ort.get_available_providers(), use_gpu, preference)
+    if uses_dml:
+        # Required by the DirectML provider (ONNX Runtime's DirectML docs):
+        # no memory-pattern optimization and no parallel execution.
+        options.enable_mem_pattern = False
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     return ort.InferenceSession(str(model_path), sess_options=options, providers=providers)
 
 
@@ -312,23 +419,52 @@ class BlazePose:
 
     @property
     def device(self) -> str:
-        """"GPU" when both models run on the CUDA provider, else "CPU"."""
-        on_gpu = all(s.get_providers()[0] == CUDA_PROVIDER for s in (self._detector, self._landmarks))
-        return "GPU" if on_gpu else "CPU"
+        """"GPU (DirectML)" or "GPU (CUDA)" when both models run on that provider,
+        else "CPU"."""
+        first = {s.get_providers()[0] for s in (self._detector, self._landmarks)}
+        if first == {DML_PROVIDER}:
+            return "GPU (DirectML)"
+        if first == {CUDA_PROVIDER}:
+            return "GPU (CUDA)"
+        return "CPU"
 
-    def detect_rois(self, image_rgb: np.ndarray, max_people: int, min_detection_confidence: float) -> list[NormRect]:
+    def warm_up(self) -> None:
+        """One inference through each model on a blank image (nothing is found):
+        a GPU provider does most of its setup on the first run."""
+        blank = np.zeros((LANDMARK_INPUT_SIZE, LANDMARK_INPUT_SIZE, 3), dtype=np.uint8)
+        self._run_detector(blank, 0.5)
+        self.landmarks_for_roi(blank, NormRect(0.5, 0.5, 1.0, 1.0, 0.0), min_presence=2.0)  # presence <= 1: no result
+
+    def _run_detector(self, image_rgb: np.ndarray, min_detection_confidence: float) -> list[Detection]:
+        """The detector on one (whole or tile) image, weighted-NMS'd, in that
+        image's pixel coordinates."""
         h, w = image_rgb.shape[:2]
-        tensor, (pad_x, pad_y) = detector_input(image_rgb)
+        tensor, pad = detector_input(image_rgb)
         raw_boxes, raw_scores = self._detector.run(None, {self._detector_input: tensor})
         detections = weighted_nms(decode_detections(raw_boxes[0], raw_scores[0, :, 0], min_detection_confidence))
-        rois = []
-        for det in detections[:max_people]:
-            # DetectionLetterboxRemoval: letterboxed-input coordinates -> image coordinates.
-            keypoints = det.keypoints.copy()
-            keypoints[:, 0] = (keypoints[:, 0] - pad_x) / (1.0 - 2 * pad_x)
-            keypoints[:, 1] = (keypoints[:, 1] - pad_y) / (1.0 - 2 * pad_y)
-            rois.append(detection_to_roi(keypoints, w, h))
-        return rois
+        return [remove_letterbox(det, pad, w, h) for det in detections]
+
+    def detect_rois(
+        self, image_rgb: np.ndarray, max_people: int, min_detection_confidence: float, tiled: bool | None = None
+    ) -> list[NormRect]:
+        """tiled: True also searches overlapping tiles (group photos) whenever the
+        whole image yields fewer than max_people; None (the default) does that
+        only when the whole image yields nobody at all; False never does."""
+        h, w = image_rgb.shape[:2]
+        detections = self._run_detector(image_rgb, min_detection_confidence)
+        want_tiles = tiled if tiled is not None else not detections
+        if want_tiles and len(detections) < max_people:
+            from_tiles = []
+            for x0, y0, x1, y1 in tile_regions(w, h):
+                tile = np.ascontiguousarray(image_rgb[y0:y1, x0:x1])
+                offset = np.array([x0, y0], dtype=np.float64)
+                for det in self._run_detector(tile, min_detection_confidence):
+                    from_tiles.append(
+                        Detection(det.score, det.box + np.tile(offset, 2), det.keypoints + offset)
+                    )
+            detections = merge_tile_detections(detections, from_tiles)
+        size = np.array([w, h], dtype=np.float64)
+        return [detection_to_roi(det.keypoints / size, w, h) for det in detections[:max_people]]
 
     def landmarks_for_roi(self, image_rgb: np.ndarray, roi: NormRect, min_presence: float) -> PoseResult | None:
         outputs = dict(zip(self._landmarks_outputs, self._landmarks.run(None, {self._landmarks_input: landmark_input(image_rgb, roi)})))
@@ -343,12 +479,36 @@ class BlazePose:
         visibility = 1.0 / (1.0 + np.exp(-raw[:, 3]))
         world = rotate_world(outputs["Identity_4"].reshape(NUM_LANDMARKS, 3), roi.rotation)
         body = slice(0, NUM_BODY_LANDMARKS)
+        aux = slice(NUM_BODY_LANDMARKS, NUM_BODY_LANDMARKS + 2)
         return PoseResult(
             image_xy=project_to_image(xy[body], roi).astype(np.float64),
             visibility=visibility[body].astype(np.float64),
             world=world[body].astype(np.float64),
             presence=presence,
+            aux_xy=project_to_image(xy[aux], roi).astype(np.float64),
         )
+
+    def track(
+        self,
+        image_rgb: np.ndarray,
+        previous: PoseResult | None,
+        min_detection_confidence: float = 0.5,
+        min_presence_confidence: float = 0.5,
+    ) -> PoseResult | None:
+        """One video frame for one person, MediaPipe VIDEO-mode style: the
+        landmark model runs on the crop the previous frame's landmarks predict,
+        and the detector runs only when there's no previous frame or the person
+        was lost there (presence below the threshold). Returns None when nobody
+        is found."""
+        image_rgb = np.ascontiguousarray(image_rgb)
+        h, w = image_rgb.shape[:2]
+        roi = previous.next_roi(w, h) if previous is not None else None
+        if roi is not None:
+            result = self.landmarks_for_roi(image_rgb, roi, min_presence_confidence)
+            if result is not None:
+                return result
+        found = self.detect(image_rgb, 1, min_detection_confidence, min_presence_confidence)
+        return found[0] if found else None
 
     def detect(
         self,
@@ -356,11 +516,23 @@ class BlazePose:
         max_people: int = 1,
         min_detection_confidence: float = 0.5,
         min_presence_confidence: float = 0.5,
+        tiled: bool | None = None,
     ) -> list[PoseResult]:
+        """tiled: see detect_rois. With None (auto), a photo whose whole-image
+        detections all fail the landmark model's presence check is also retried
+        with tiles -- the whole image can "find" a person-like blob in a group
+        shot while every real face in it is too small."""
         image_rgb = np.ascontiguousarray(image_rgb)
-        results = []
-        for roi in self.detect_rois(image_rgb, max_people, min_detection_confidence):
-            result = self.landmarks_for_roi(image_rgb, roi, min_presence_confidence)
-            if result is not None:
-                results.append(result)
+
+        def solve(tiles: bool | None) -> list[PoseResult]:
+            results = []
+            for roi in self.detect_rois(image_rgb, max_people, min_detection_confidence, tiles):
+                result = self.landmarks_for_roi(image_rgb, roi, min_presence_confidence)
+                if result is not None:
+                    results.append(result)
+            return results
+
+        results = solve(tiled)
+        if not results and tiled is None:
+            results = solve(True)
         return results

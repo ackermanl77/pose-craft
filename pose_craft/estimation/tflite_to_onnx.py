@@ -5,7 +5,9 @@ its CUDA execution provider -- MediaPipe's own Windows build is CPU-only).
 This is deliberately *not* a general TFLite converter. It supports exactly the op
 set those BlazePose graphs use (checked for the lite/full/heavy variants):
 CONV_2D, DEPTHWISE_CONV_2D, ADD, PAD, MAX_POOL_2D, RESIZE_BILINEAR,
-DEPTH_TO_SPACE, CONCATENATION, RESHAPE and LOGISTIC, plus DEQUANTIZE and DENSIFY,
+DEPTH_TO_SPACE, CONCATENATION, RESHAPE and LOGISTIC -- plus PRELU, MEAN and
+FULLY_CONNECTED, the extra ops of MediaPipe's hand landmarker (palm detector and
+21-point hand landmark model, for finger poses) -- plus DEQUANTIZE and DENSIFY,
 which only ever act on constant weights (float16 and block-sparse storage) and so
 are folded into plain float32 initializers here. Anything else raises
 `UnsupportedTFLiteOp` instead of silently producing a wrong graph -- the general
@@ -398,6 +400,64 @@ class _Converter:
 
         if name == "LOGISTIC":
             self.values[out_index] = self._node("Sigmoid", [self._value(inputs[0])], base)
+            return
+
+        if name == "PRELU":
+            slope = self._constant(inputs[1])
+            if slope is None:
+                raise UnsupportedTFLiteOp("PRELU with a non-constant slope")
+            slope = slope.astype(np.float32)
+            if len(self._shape(inputs[0])) == 4:
+                # The slope broadcasts against NHWC's trailing axes (usually
+                # [1, 1, C]); pad it to rank 4 and move it to NCHW like the input.
+                slope = slope.reshape((1,) * (4 - slope.ndim) + slope.shape).transpose(_NHWC_TO_NCHW)
+            self.values[out_index] = self._node(
+                "PRelu", [self._value(inputs[0]), self._initializer(slope, base + "_slope")], base
+            )
+            return
+
+        if name == "MEAN":
+            options = _options(op, tfl.ReducerOptions)
+            axes = self._constant(inputs[1])
+            if axes is None:
+                raise UnsupportedTFLiteOp("MEAN with non-constant axes")
+            rank = len(self._shape(inputs[0]))
+            axes = [int(a) % rank for a in np.atleast_1d(axes)]
+            keep_dims = bool(options.KeepDims())
+            if rank == 4:
+                if not keep_dims and sorted(axes) != [1, 2]:
+                    # Only the spatial mean ([N, H, W, C] -> [N, C]) keeps the same
+                    # axis order in both layouts once the reduced axes are dropped.
+                    raise UnsupportedTFLiteOp(f"MEAN over NHWC axes {axes} without keep_dims")
+                axes = [_NHWC_AXIS_IN_NCHW[a] for a in axes]
+            self.values[out_index] = self._node(
+                "ReduceMean", [self._value(inputs[0])], base, axes=sorted(axes), keepdims=int(keep_dims)
+            )
+            return
+
+        if name == "FULLY_CONNECTED":
+            options = _options(op, tfl.FullyConnectedOptions)
+            weights = self._constant(inputs[1])
+            if weights is None:
+                raise UnsupportedTFLiteOp("FULLY_CONNECTED with non-constant weights")
+            if options.WeightsFormat() != 0:
+                raise UnsupportedTFLiteOp("FULLY_CONNECTED with shuffled weights")
+            weights = weights.astype(np.float32)  # [out, in]
+            value = self._value(inputs[0])
+            if len(self._shape(inputs[0])) == 4:
+                value = self._node("Transpose", [value], base + "_to_nhwc", perm=_NCHW_TO_NHWC)
+            if len(self._shape(inputs[0])) != 2:
+                flat = self._initializer(np.array([-1, weights.shape[1]], dtype=np.int64), base + "_flat")
+                value = self._node("Reshape", [value, flat], base + "_flatten")
+            gemm_inputs = [value, self._initializer(weights, base + "_w")]
+            if len(inputs) > 2 and inputs[2] >= 0:
+                gemm_inputs.append(self._initializer(self._constant(inputs[2]).astype(np.float32), base + "_b"))
+            out = self._node("Gemm", gemm_inputs, base, transB=1)
+            out_shape = self._shape(out_index)
+            if len(out_shape) != 2:
+                shape = self._initializer(np.array(out_shape, dtype=np.int64), base + "_shape")
+                out = self._node("Reshape", [out, shape], base + "_reshape")
+            self.values[out_index] = self._activation(out, options.FusedActivationFunction(), base)
             return
 
         raise UnsupportedTFLiteOp(f"TFLite op {name} is not supported by this converter")

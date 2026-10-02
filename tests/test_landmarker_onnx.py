@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from pose_craft.estimation import landmarker
 from pose_craft.estimation.onnx_pose import PoseResult
@@ -50,8 +51,9 @@ class _FakeBlazePose:
         self.results = results
         self.calls = []
 
-    def detect(self, image_rgb, max_people, min_detection_confidence, min_presence_confidence):
+    def detect(self, image_rgb, max_people, min_detection_confidence, min_presence_confidence, tiled=None):
         self.calls.append((image_rgb.copy(), max_people))
+        self.tiled = tiled
         return self.results
 
 
@@ -77,3 +79,46 @@ def test_pose_estimator_converts_results_and_orders_people_left_to_right():
     assert max_people == 3
     assert sent_rgb[0, 0].tolist() == [0, 0, 255]  # BGR -> RGB before inference
     assert estimator.device == "GPU"
+
+
+def test_large_photos_are_downscaled_with_area_averaging_before_inference():
+    """Regression test: an 8000 px photo went straight into the 224/256 px warps,
+    which sample 4 source pixels per output pixel -- aliasing and noise that
+    doubled the landmark error and made a solve ~6x slower."""
+    estimator = landmarker.PoseEstimator.__new__(landmarker.PoseEstimator)
+    estimator._pose = _FakeBlazePose([_result(0.5)])
+    estimator.max_people = 1
+    # A 1-pixel checkerboard: area averaging turns it into flat gray, while
+    # point sampling would keep it at full contrast.
+    image_bgr = np.zeros((3000, 8000, 3), dtype=np.uint8)
+    image_bgr[::2, ::2] = 255
+    image_bgr[1::2, 1::2] = 255
+
+    people = estimator.detect(image_bgr)
+
+    sent_rgb, _ = estimator._pose.calls[0]
+    assert max(sent_rgb.shape[:2]) == landmarker.MAX_INPUT_SIDE
+    assert sent_rgb.shape[1] / sent_rgb.shape[0] == pytest.approx(8000 / 3000, rel=1e-2)
+    assert np.ptp(sent_rgb[100:200, 100:200].astype(int)) < 10  # averaged, not aliased
+    assert len(people) == 1
+
+
+def test_small_photos_are_passed_through_unscaled():
+    estimator = landmarker.PoseEstimator.__new__(landmarker.PoseEstimator)
+    estimator._pose = _FakeBlazePose([])
+    estimator.max_people = 1
+    estimator.detect(np.zeros((600, 800, 3), dtype=np.uint8))
+    assert estimator._pose.calls[0][0].shape == (600, 800, 3)
+
+
+def test_group_photo_mode_asks_for_tiled_detection():
+    estimator = landmarker.PoseEstimator.__new__(landmarker.PoseEstimator)
+    estimator._pose = _FakeBlazePose([])
+    estimator.max_people = 4
+    image = np.zeros((40, 40, 3), dtype=np.uint8)
+
+    estimator.detect(image)
+    assert estimator._pose.tiled is None  # default: tiles only when nobody is found
+    estimator.group_photo = True
+    estimator.detect(image)
+    assert estimator._pose.tiled is True
