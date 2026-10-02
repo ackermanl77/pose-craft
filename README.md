@@ -32,14 +32,23 @@ release; if `pip install` can't find a match for your interpreter, use a
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-pip install -r requirements-gpu.txt   # optional: NVIDIA GPU acceleration
+pip install -r requirements-gpu.txt   # optional: NVIDIA GPU acceleration (CUDA)
 ```
 
-`requirements-gpu.txt` adds the CUDA 13 runtime and cuDNN as pip packages, so
-an NVIDIA GPU (RTX 20-series or newer, including RTX 40/50) only needs a
-current driver -- no CUDA Toolkit install. Without it everything still works,
-on the CPU. The **Use GPU** checkbox under Solve Pose toggles it, and the
-status bar says which device each solve actually ran on.
+Two GPU options, each in its own venv (both install the same `onnxruntime`
+module, so they can't be combined):
+
+- `requirements-dml.txt` -- DirectML, any DirectX 12 GPU (NVIDIA, AMD, Intel).
+  Measured on an RTX 5080: ~4-8 ms per solve, within 0.02 px of the CPU, and
+  a much smaller build. See the file for the install steps.
+- `requirements-gpu.txt` -- CUDA 13 + cuDNN as pip packages, so an NVIDIA GPU
+  (RTX 20-series or newer) only needs a current driver. ~9-39 ms per solve.
+  TF32 math is switched off, so results match the CPU (with it on, landmarks
+  moved up to 12 px).
+
+Without either everything still works, on the CPU. The **Use GPU** checkbox
+under Solve Pose toggles it, and the status bar says which device each solve
+actually ran on ("GPU (DirectML)", "GPU (CUDA)" or "CPU").
 
 `requirements.txt` is pinned to known-working versions; if you deliberately
 want the latest of everything instead, drop the `==` pins.
@@ -50,21 +59,28 @@ want the latest of everything instead, drop the `==` pins.
 python -m pose_craft.app
 ```
 
-Load a photo (PNG/JPEG/BMP/WebP/TIFF; a resolution/framing warning pops up if it's likely to give a
-worse result -- see the tips under the Load Photo button), optionally raise
-"Max people to detect" above its default of 4 for a bigger group photo, then
-click **Solve Pose** (downloads MediaPipe's pose model to
-`~/.cache/pose_craft/models` on first run and converts it to ONNX next to it -- needs network access once, cached
-after that, with a live download percentage in the status bar). Every
+Load a photo (PNG/JPEG/BMP/WebP/TIFF -- or drag it onto the window; a banner
+warns if its resolution is likely to give a worse result -- see the tips under
+the Load Photo button), optionally raise "Max people to detect" above its
+default of 4 and tick "Group photo" for a wide group shot, then click **Solve
+Pose** (F5). A source install downloads MediaPipe's pinned pose model to
+`~/.cache/pose_craft/models` on first run (SHA-256-checked, then converted to
+ONNX next to it -- needs network access once, with a progress bar and
+Cancel); a release build ships the models. Once the model is on disk the app
+loads it in the background at startup, so the first solve is quick. Every
 detected person's skeleton is drawn directly on the photo -- the selected
-person in a bright color (their low-confidence joints, likely occluded in
-the photo, shown in a distinct warning color), everyone else dimmed. Either
-click the person you want directly in the photo or pick them from the
-dropdown. From there:
+person in a bright color (low-confidence bones, likely occluded in the photo,
+dashed in a warning color), everyone else dimmed. Click the person you want
+in the photo, pick them from the dropdown, or use Page Up/Down. A limb that
+came out reaching the wrong way in depth can be flipped from the photo's
+right-click menu, and any bone can be rotated by hand in "3. Correct" (with
+undo). **Load Video...** tracks one person through a clip and exports an
+animated BVH. From there:
 
-- **Export Pose JSON** / **Export All People...** (one JSON per detected
-  person, to a folder you choose; the mirror checkbox, if used, applies to
-  everyone in a batch export the same way it applies to a single person), or
+- **Export Pose JSON** / **Export BVH** / **Export All People...** (one JSON
+  per detected person, to a folder you choose, named after the photo; the
+  mirror checkbox, if used, applies to everyone in a batch export the same way
+  it applies to a single person; the BVH stands on the floor), or
 - **Send to Blender (Live Link)** -- needs Blender running with the add-on's
   Live Link started first (see below). The host/port fields next to the
   button default to `127.0.0.1:8642` and only need changing if that port is
@@ -83,17 +99,28 @@ shows up as "unmatched"), use the panel's **Bone Mapping** box: click
 "Initialize/Refresh" for one row per PoseCraft bone name, then either "Auto-Guess
 Unset" to fill in what it can (it knows Rigify's `upper_arm_fk.L`-style controls
 and Mixamo's `mixamorig:` names), or pick each target bone yourself from the
-searchable dropdown. Saved on the armature, so it's a one-time setup per rig.
+searchable dropdown; a row's "Extra Bones" field chains more bones (Mixamo's
+spine is chained automatically). Saved on the armature, so it's a one-time
+setup per rig. The panel also has "Keep feet on the floor", "Insert keyframes"
+with a frame step, and the Live Link target (captured when Live Link starts).
+
+The app's menus list every keyboard shortcut; the user guide has the table.
 
 ## Build the .exe
 
 ```bash
+python scripts/convert_models.py           # pre-convert the models into build/models (bundled, no first-run download)
+set POSECRAFT_FLAVOR=dml   # or cuda / cpu; unset = bundle the CUDA DLLs if installed
 pyinstaller PoseCraft.spec
 ```
 
 Produces `dist/PoseCraft/PoseCraft.exe` plus its `_internal/` dependency
-folder (~480 MB total) -- ship the whole `dist/PoseCraft/` folder, not just
-the `.exe`. See `docs/PROJECT_STATUS.md`'s "Release" section for why onedir
+folder -- about 2 GB for the CUDA build before the DLL and library trimming
+(~0.6 GB less now), far less for DirectML or CPU (not re-measured) -- ship the whole `dist/PoseCraft/` folder, not just
+the `.exe`. With `build/models` present the converter (onnx/tflite) is left
+out of the build. `.github/workflows/release.yml` does all of this for the
+DirectML and CPU flavours on a `v*` tag (or a manual run), zips them with the
+Blender add-on and writes `SHA256SUMS` -- it hasn't been run yet. See `docs/PROJECT_STATUS.md`'s "Release" section for why onedir
 was chosen over `--onefile`. Re-run `python scripts/generate_icon.py` first if
 you've changed `assets/icon.png`/`assets/icon.ico`.
 
@@ -107,15 +134,24 @@ Needs `requirements-test.txt` (numpy/scipy/opencv-python-headless/pytest plus
 CPU onnxruntime/onnx/tflite, not the Qt stack or the GPU runtime) -- covers the
 bone retargeting math, the Blender axis-conversion math, the atomic
 model-download logic, the pose pipeline's pre/post-processing and the model
-converter, unicode-safe image loading, and the Live Link wire protocol. `.github/workflows/ci.yml` runs this
-same lightweight suite on every push/PR. See `docs/PROJECT_STATUS.md`'s
+converter, unicode-safe image loading, the Live Link wire protocol, and (when golden
+photos and the cached model are present, see `scripts/generate_goldens.py`)
+a real-photo end-to-end golden test. `.github/workflows/ci.yml` runs this
+same lightweight suite on every push/PR. With PySide6 installed, run it with
+`QT_QPA_PLATFORM=offscreen` to include the GUI flow tests (real Qt event loop,
+fake estimators; no pytest-qt needed). Before a release, also run the GPU/CPU
+parity tests: `set POSECRAFT_GPU_TESTS=1` then `pytest -m gpu` (needs a GPU
+provider and the cached models). See `docs/PROJECT_STATUS.md`'s
 "Verification" section for what is and isn't covered by an automated test
 today.
 
+The 3D preview draws the exported rotations themselves (with the raw
+landmarks as faint dots), so what you see is what Blender gets. The app logs
+to `%LOCALAPPDATA%\PoseCraft\logs\posecraft.log`.
+
 See [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) for architecture, and its
-"Known Issues" section before relying on an exported pose -- twist is only
-solved for the hands (everything else stays at identity), the world-landmark axis
-convention follows MediaPipe's docs but hasn't been checked end to end against a
-real photo, the add-on assumes a T-pose rig (A-pose rigs and rigs with extra
-spine/hip bones need manual touch-up), and the Blender add-on (including the
-Live Link server) hasn't been checked against a real Blender install or rig.
+"Known Issues" section before relying on an exported pose -- a straight limb's
+roll is inferred rather than measured, the torso is one bone, the
+world-landmark axis convention hasn't been checked end to end against a real
+photo in Blender, and the Blender add-on (including the rig-aware retargeting
+and the Live Link server) hasn't been run in a real Blender install.

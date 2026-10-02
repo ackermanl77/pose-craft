@@ -8,41 +8,63 @@ Photo (loaded via imaging.imread_unicode, unicode-path-safe;
         |
         v
 PoseEstimator (pose_craft/estimation/landmarker.py)
-  -- MediaPipe's BlazePose models (downloaded .task bundle), converted once to ONNX
-     (estimation/tflite_to_onnx.py) and run on ONNX Runtime -- CUDA provider on an
-     NVIDIA GPU when available, CPU otherwise (estimation/onnx_pose.py re-implements
-     MediaPipe's detector -> ROI -> landmark calculator graph); multi-person
+  -- MediaPipe's BlazePose models: bundled pre-converted ONNX in a release build
+     (scripts/convert_models.py), else the pinned, SHA-256-verified .task bundle
+     downloaded and converted once (estimation/tflite_to_onnx.py); run on ONNX
+     Runtime -- DirectML, then CUDA (TF32 off) when available, CPU otherwise;
+     photos over 2048 px are area-downscaled first (estimation/onnx_pose.py
+     re-implements MediaPipe's detector -> ROI -> landmark calculator graph);
+     multi-person, with overlapping-tile detection for group photos
+  -- video (estimation/video.py): one person tracked frame to frame
+     (MediaPipe VIDEO-mode ROI from the previous landmarks), One Euro
+     smoothing, floor contact and foot-locked root motion
         |  landmarks converted to the engine frame (right-handed, Y-up, +X image right =
         |  subject's left, +Z toward camera = the way the subject faces);
         |  each DetectedPerson also carries 2D image-space landmarks + per-landmark visibility
         v
 retarget/skeleton.py -- 15-bone humanoid hierarchy, T-pose rest directions
-  -- per-bone shortest-arc swing quaternion, world -> parent-relative
-  -- plus solved twist for hand.L/hand.R (from the index/pinky lateral spread) --
-     every other bone's twist stays at identity, no independent reference exists
+  -- a full frame per bone (direction + roll): spine from the hip/shoulder lines,
+     head from the ear line (neck takes 40% of its twist), upper arm/thigh roll
+     from the elbow/knee bend plane (forearm/shin are pure hinges), hand from
+     index/pinky (forearm takes half its twist), foot from heel -> toe and the
+     ankle-heel-toe plane; unmeasurable roll is carried from the parent
+  -- world -> parent-relative; forward_kinematics() poses the rest skeleton
+     from those rotations (the 3D preview and the BVH use the same rest skeleton)
   -- bone_confidence() derives a per-bone score from landmark visibility
+  -- manual correction: flip_limb_depth() (per-limb depth flip) and
+     apply_bone_overrides()/bone_axes_rotation() (per-bone adjustments about
+     Blender-style bone axes); hip_height_above_floor() for ground contact
         v
-export/blender_pose.py -- axis-converts Y-up -> Blender Z-up, writes JSON
+export/blender_pose.py -- axis-converts Y-up -> Blender Z-up, writes JSON (format v2:
+     local + world rotation + rest direction per bone, optional "root"
+     hip height / leg length); export/bvh_export.py -- single-frame or
+     animated BVH, the root standing on the floor
   -- low-confidence bones flagged "low_confidence": true
         |
         +---------------------------------------------+
         v  (file)                                      v  (live)
 pose_craft_pose .json file            export/live_link.py: length-prefixed
         |                              JSON over TCP to host:port (UI-configurable,
-        |                              default 127.0.0.1:8642)
+        |                              default 127.0.0.1:8642); the add-on replies
+        |                              with what it applied (protocol 2)
         v                                              |
 export/blender_addon/import_pose.py (installed inside Blender)
   -- Load Pose JSON operator, or a Live Link server (bpy.app.timers-polled,
-     non-blocking accept) that applies a received pose automatically
+     fully non-blocking: accept and incremental reads with a 2 s per-message
+     deadline, 256 KB cap) that applies a received pose to the captured
+     target armature, as its own undo step, optionally keyframed
   -- bone name resolution: an explicit per-armature manual mapping row
      (POSECRAFT_BoneMapping, saved with the .blend file) wins if set, else
      falls back to name-guessing (exact, Rigify upper_arm_fk.L/_ik, DEF-/ORG-, Mixamo)
-  -- converts each armature-space delta into the bone's rest frame
-     (R^-1 q R) and applies it to the active armature's pose bones
+  -- "Match rig rest pose" (default): rig_pose_basis() aims each mapped bone at
+     PoseCraft's world target against the rig's own rest direction and posed
+     parent (A-pose, Mixamo Hips, clavicles, bones without Inherit Rotation),
+     spreading a bone mapped to a chain (Mixamo Spine/Spine1/Spine2) over it;
+     off / v1 files: R^-1 q R per bone; each bone keeps its rotation mode
 ```
 
 `pose_craft/gui/main_window.py` is the only orchestrator: it owns the loaded
-photo, runs `PoseEstimator.detect()` on a background `QThread` (`SolveWorker`)
+photo (or tracked video), runs `PoseEstimator.detect()` on a background `QThread` (`SolveWorker`)
 so the UI doesn't freeze while the pose-landmarker model downloads/runs, and
 re-solves `retarget.skeleton.solve_bone_rotations()` synchronously (cheap, no
 model inference) whenever the person picker, a photo click, or the mirror
@@ -81,14 +103,29 @@ dimmed -- deliberately independent of the mirror checkbox, since mirroring
 relabels which exported bone name a side's data feeds, it doesn't move
 anyone's arm in the photo (see `PhotoOverlayPerson`'s docstring).
 `gui/viewport_3d.py` is a thin wrapper around `pyqtgraph.opengl.GLViewWidget`
-that draws `retarget.skeleton.joint_positions()` as line segments + points and
+that draws `retarget.skeleton.forward_kinematics()` of the exported rotations (raw landmarks as ghost points) as line segments + points and
 auto-frames the camera to the skeleton's own bounding box on every update
 (`_compute_camera_frame`) -- it has no other state of its own beyond the
 current skeleton, `main_window.py` always calls `clear_skeleton()` before
-`show_skeleton()` on every update rather than diffing. The left control
+`show_skeleton()` on every update rather than diffing. The window is a three-pane `QSplitter` (scrollable controls, photo, 3D view); the control
 panel is split into four `QGroupBox` sections (`_build_detect_group`,
 `_build_person_group`, `_build_export_group`, `_build_live_link_group`)
-instead of one flat stack of ~15 controls.
+instead of one flat stack of ~15 controls, plus a "3. Correct" group (per-bone
+adjustment spin boxes; depth flips come from the photo's right-click menu)
+and a "Video" group (frame slider, animation export) that appears once a
+video is tracked.
+
+Added in the P2 round (2026-09-30): busy state lives in `_set_busy()` and
+`_set_result_actions_enabled()` (one place for what a running solve disables,
+the status-bar progress bar and the Cancel button); `WarmUpWorker` creates
+and warms the remembered model at startup when it's available offline
+(`MainWindow(warm_up=True)`, which `app.py` passes; a Solve clicked meanwhile
+waits for it); `VideoSolveWorker` tracks a video; manual corrections are
+`PersonEdits` per person, changed only through `QUndoStack` commands, and
+applied in `_document_inputs_for()` so every export path gets them; settings
+(last folder, recent files, host/port, model, GPU, group photo, max people,
+window and splitter geometry) persist through `QSettings` (an INI under the
+user's config folder; `tests/conftest.py` points it at a temp folder).
 
 The retargeting math (`retarget/skeleton.py`), the axis-conversion math
 (`export/blender_pose.py`), the atomic-download logic and unicode-path
@@ -104,8 +141,11 @@ differently.
 |---|---|
 | Desktop app (load photo, solve, preview, export) | `pose_craft/app.py`, run as `python -m pose_craft.app` |
 | Pose estimation entry point, world-axis conversion, cached `PoseEstimator`, model download + ONNX conversion cache | `pose_craft/estimation/landmarker.py` |
-| BlazePose pipeline on ONNX Runtime (detector, ROI, landmarks, GPU/CPU session setup) | `pose_craft/estimation/onnx_pose.py` |
-| TFLite -> ONNX converter for the pose models | `pose_craft/estimation/tflite_to_onnx.py` |
+| BlazePose pipeline on ONNX Runtime (detector, group-photo tiles, ROI, landmarks, video tracking, GPU/CPU session setup) | `pose_craft/estimation/onnx_pose.py` |
+| Video: tracking a person through a clip, One Euro smoothing, foot locking | `pose_craft/estimation/video.py` |
+| TFLite -> ONNX converter for the pose (and hand) models | `pose_craft/estimation/tflite_to_onnx.py` |
+| Pre-convert the models for a release build | `scripts/convert_models.py` |
+| Release build (DirectML + CPU zips, add-on zip, SHA256SUMS) | `.github/workflows/release.yml` |
 | Bone retargeting math + per-bone confidence | `pose_craft/retarget/skeleton.py` |
 | Pose file format (write from the app, read by the add-on) | `pose_craft/export/blender_pose.py` |
 | Standard BVH export (own additive path, alongside the JSON/Live Link one) | `pose_craft/export/bvh_export.py` |
@@ -121,10 +161,19 @@ differently.
 ```text
 dist/PoseCraft/PoseCraft.exe        -- now built with assets/icon.ico as the exe icon
 dist/PoseCraft/_internal/           -- PySide6, OpenCV, ONNX Runtime + (GPU build) the CUDA 13/cuDNN 9 DLLs
+dist/PoseCraft/_internal/models/    -- pre-converted ONNX models + manifest.json (when build/models existed)
 ```
 
 Built with `pyinstaller PoseCraft.spec` (onedir, `--windowed`, `collect_all`
-for `onnxruntime`/`onnx`/`cv2`/`pyqtgraph`, `collect_submodules("tflite")`,
+for `onnxruntime`/`cv2`, pyqtgraph's modules and data without its examples,
+and -- only when no pre-converted models are present -- `onnx`/`tflite`;
+`scripts/convert_models.py` writes the three variants' ONNX models plus one
+shared detector and a manifest to `build/models`, and the spec then bundles
+them under `models/` and leaves the converter out, so the app needs no
+download or network on first run. The spec also excludes matplotlib, PIL and
+the unused Qt modules (Quick/Qml/Network/Test/Pdf/VirtualKeyboard) and filters
+their DLLs. None of these spec changes has been through a real build yet.
+A CUDA build (`POSECRAFT_FLAVOR=cuda`) also bundles
 the NVIDIA CUDA/cuDNN DLLs from the pip `nvidia-*` packages kept in their
 site-packages layout under `_internal/nvidia/` (where `onnxruntime.preload_dlls()` looks) when installed -- that's what makes the GPU build
 so much bigger than the old ~480 MB one; a build from a venv without
@@ -141,9 +190,13 @@ separate, lighter pin set (numpy/scipy/opencv-python-headless/pytest) for CI.
 `.github/workflows/ci.yml` runs `compileall` + `pytest` on push/PR using only
 `requirements-test.txt` -- verified locally by installing that file into a
 throwaway venv and confirming the same pass/skip counts CI would see. There is
-still no automated *release*-build workflow analogous to
-`photo_professional_tool`'s `.github/workflows/release.yml` (which builds and
-uploads the `.exe` itself) -- see "Known Issues".
+also `.github/workflows/release.yml` (a `v*` tag or a manual run): it builds
+the DirectML and CPU flavours on `windows-latest` (tests, pre-converted
+models, PyInstaller, a bundled-model check), zips each, zips the Blender
+add-on, writes `SHA256SUMS` and publishes a GitHub Release for a tag. It has
+not been run yet. `requirements.txt` now uses `opencv-python-headless` (the
+app never used OpenCV's GUI or contrib modules; the headless wheel still has
+the FFmpeg video reader the video path needs).
 
 ## Verification
 
@@ -168,8 +221,18 @@ mirror/confidence consistency fix (see "Recently Fixed"), and
 `tests/test_viewport_camera.py` covers the auto-framing math
 (`_compute_camera_frame`); both guard their PySide6 import with
 `pytest.importorskip`, so they run locally and skip cleanly in CI's lighter
-venv. Confirmed locally: installing only `requirements-test.txt` into a fresh
-venv reproduces CI's exact result (33 passed, 2 skipped).
+venv. Last full local run (with PySide6 installed, 2026-09-30, after the P2
+round): **298 passed, 6 skipped** (the LiteRT parity test, the real-photo
+golden test, and the four opt-in GPU parity tests). `tests/test_gui_flows.py`
+now drives the real window on an offscreen Qt event loop with fake
+estimators: busy states, cancel, the close-waits-for-the-worker guarantee,
+the non-blocking send, warm-up, settings, drag-and-drop, picking, manual
+correction with undo, exports and video scrubbing -- the threading checks
+below that used to be one-off scripts. `tests/test_gpu_parity.py` (opt-in:
+`POSECRAFT_GPU_TESTS=1`) compares every available GPU provider with the CPU;
+it passed on CUDA (RTX 5080) and fails, as it should, with TF32 switched back
+on. CI's lighter venv also skips the Qt
+tests; re-run `pytest` rather than trusting a number written here.
 
 Everything else has been checked manually rather than by automated test,
 since it needs a real display/GPU/Blender install that isn't available in
@@ -181,21 +244,19 @@ this dev environment:
   not that solving/exporting/clicking a real photo works end to end.
 - The threading fixes (button-disabling during a solve, `closeEvent` waiting
   for in-flight workers, `SendToBlenderWorker` not blocking the UI thread)
-  were each checked with a scripted integration test using a real Qt event
-  loop, a fake slow `PoseEstimator`/`send_pose_document`, and timed
-  assertions -- not part of the `pytest` suite, since they depend on real
-  background-thread timing rather than being pure functions. These are one-off
-  scripts run during development, not something that re-runs on every change;
-  a regression here wouldn't be caught automatically.
-- The `max_people` mismatch handling (closing and discarding a cached
-  `PoseEstimator` whose `num_poses` no longer matches the spin box) was
-  checked the same scripted-integration way: a fake estimator confirms
-  `close()` is actually called and the new `SolveWorker` receives
-  `estimator=None` to force a rebuild. That particular run happened to also
-  exercise a real `PoseEstimator`/MediaPipe detection end to end (the pose
-  model was already cached from earlier manual testing in this session) with
-  the custom `max_people=6`, with no crash -- a real, if incidental, live
-  smoke test of the whole detection path, not just the mocked one.
+  are now in the suite (`tests/test_gui_flows.py`, see above). The 3D view's
+  actual OpenGL drawing (octahedral bones, labels, gizmo) still isn't: an
+  offscreen Qt has no GL context to render into, so those tests check the
+  geometry and the items created, not pixels.
+- `max_people` is applied per call (`PoseEstimator.max_people`), so changing
+  it no longer rebuilds the estimator; only the model variant and the GPU
+  checkbox do.
+- The GPU paths were checked on an RTX 5080 with the project's own
+  `BlazePose` on `two_people.jpg` (2026-09-30): CUDA with `use_tf32=0`
+  9.3/11.1/39.1 ms (lite/full/heavy) and at most 0.017 px from the CPU;
+  DirectML (onnxruntime-directml 1.24.4) 4.0/4.5/7.6 ms and at most 0.021 px;
+  CPU 22-42 ms. The CUDA run used a venv with cuFFT, nvrtc, nvJitLink and
+  cudnn_adv removed, confirming the K1 spec exclusions still work.
 - The photo overlay (`PhotoView.paintEvent`, drawing each detected person's 2D
   skeleton on the photo) was checked by constructing a real `MainWindow` with
   fake `DetectedPerson` data, calling `.grab()` to force an actual Qt paint
@@ -218,6 +279,117 @@ checked" above as weaker evidence than an automated test -- it was true at the
 time each check ran, not guaranteed to stay true as the code changes.
 
 ## Recently Fixed
+
+- **Improvement-report P2 round (2026-09-30).** Each item has tests that
+  failed before the change (298 passed, 6 skipped after it):
+  - **Group photos (B8).** The detector only sees the whole photo at 224 px,
+    so small faces vanished: on a 2x2 collage of a two-person photo (8 people)
+    the whole image found 1; with tiles, 8 (a 3x3 collage: 0, then 4). Tiles
+    are searched always with the new "Group photo" checkbox, and
+    automatically when the whole photo yields nobody. A tile detection never
+    replaces a whole-image one.
+  - **Ground contact (B6).** The world landmarks are hip-centred, so every
+    pose stood at one hip height. The 3D preview now stands the skeleton on
+    the grid, the BVH root sits at the pose's hip height above its lowest
+    joint (a crouch exports lowered), and the JSON carries a "root"
+    hip_height/leg_length. The add-on's new "Keep feet on the floor" option
+    moves the rig's root so the pose stands on the rig's own floor.
+  - **Video (B12).** Load Video tracks one person (the detector runs once,
+    then the previous frame's landmarks give the next crop: 1 detector run for
+    40 frames, ~11 ms/frame on the CPU), smooths with a One Euro filter, and
+    exports an animated BVH whose root follows planted feet. Scrub frames with
+    the slider.
+  - **Live Link (B16-B18, plus B19/B20).** The server no longer blocks
+    Blender's UI: reads are non-blocking and incremental with a 2 s deadline
+    per message and a 256 KB cap. The target armature is captured when Live
+    Link starts. Each received pose is an undo step; optional keyframing
+    (also when auto-keying is on) with a frame step. Bones keep their own
+    rotation mode, and the panel redraws after each pose. Add-on 0.5.0.
+  - **Rig-aware retargeting (B5, more).** A mapping row can name a chain
+    ("Extra Bones"); the rotation is spread over it (Mixamo's three spine
+    bones automatically), and bones with Inherit Rotation off are solved the
+    way Blender evaluates them.
+  - **GUI (F3, F4, F6, F7, F9, P3, plus F5/C1).** A legend drawn with the
+    overlay's own colours; low-confidence bones dashed (2D and 3D), joints
+    neutral. Manual correction: right-click a limb to flip its depth, or
+    rotate any bone about its own X/Y/Z, with undo/redo. A progress bar and
+    Cancel; the photo-quality warning is a dismissable banner; the model warms
+    up in the background at startup. Menus and shortcuts, drag-and-drop,
+    recent files, remembered settings, `<photo>_person<N>` export names
+    (Export All asks before overwriting). The 3D view: floor grid, XYZ gizmo,
+    front/side/top presets, bone labels, octahedral bones showing roll.
+    Clicking empty background no longer changes the selected person.
+  - **Models (R3, K3, P5 in part).** The model URLs are pinned to version 1
+    and SHA-256-verified (the old ".../latest/" "full" file differs only in
+    zip timestamps, so existing caches stay valid). A release build bundles
+    pre-converted models. The converter also handles PRELU, MEAN and
+    FULLY_CONNECTED (MediaPipe's hand models; 2e-6 / 4e-6 relative error
+    against LiteRT) -- the first step toward finger poses (B11).
+  - **Tests and release (T3, T5, K4, K5).** GUI flow tests, the opt-in GPU
+    parity test, spec trimming, headless OpenCV and a release workflow (see
+    "Release"; none of it built or run yet).
+  - **Stale docs (C2).** Fixed the pass count, the Live Link timeout
+    contradiction, the CI comment, and the user guide's missing orientation
+    fix; two historical entries below now say what superseded them.
+
+- **Improvement-report P1 round (2026-09-30).** Each item has tests that failed
+  before the fix:
+  - **Retargeting solved only each bone's direction.** A shortest-arc swing
+    left every bone's roll arbitrary: a body turned 60 degrees solved to a
+    root rotation of 0 (BVH shoulders ~18 cm off), a 45-degree head turn to 0,
+    a 90-degree elbow to a 120-degree forearm rotation with its axis 55
+    degrees off the hinge, and a flat foot to 25 degrees toe-down. Every bone
+    now gets a full frame (see Architecture), and a bone whose roll can't be
+    measured carries its parent's, so a rigid rotation of the whole body
+    changes only the root (checked for 50 random rotations). The foot's rest
+    direction now slopes 25 degrees down (`FOOT_REST_PITCH_DEG`), which also
+    changes the BVH rest skeleton's foot End Site; `solve_bone_rotations`
+    takes an optional `visibility` for the heel fallback. Tests:
+    `tests/test_retarget_frames.py`, plus BVH forward kinematics for a 60-degree
+    turned body in `test_axis_conventions.py`.
+  - **The 3D preview drew raw landmarks, not the export.** It now draws
+    `skeleton.forward_kinematics()` of the exported rotations (with the
+    subject's measured proportions), with the raw landmarks as faint ghost
+    points. The rest skeleton moved from `bvh_export.py` to `skeleton.py`
+    (re-exported under the old names).
+  - **GPU.** `onnx_pose.select_providers` tries DirectML, then CUDA, then the
+    CPU; DirectML sessions get `enable_mem_pattern=False` and sequential
+    execution; CUDA gets `use_tf32=0` (TF32 moved landmarks up to 12 px).
+    `device` now says "GPU (DirectML)"/"GPU (CUDA)". New
+    `requirements-dml.txt` and a `POSECRAFT_FLAVOR=dml|cuda|cpu` switch in
+    `PoseCraft.spec`, which also drops cuFFT, nvrtc, nvJitLink and cudnn_adv
+    (~520 MB) from CUDA builds. Not built.
+  - **Large photos were warped straight from full resolution.**
+    `landmarker.prepare_input_rgb` shrinks anything over 2048 px with
+    `INTER_AREA` first. On the sample photos upscaled 8x with noise: median
+    2D error 2.15 -> 1.42 px, 3.8/14.0 -> 1.1/7.8 px and 10.2 -> 3.9 px; world
+    error 37 -> 11 mm, 34/46 -> 10/20 mm and 28 -> 19 mm; 148-198 ms -> 27-42 ms.
+  - **The window didn't fit a 1080p screen** (minimum height 1124 px). Now a
+    three-pane splitter with a scrollable controls column and collapsible
+    photo tips; minimum size (offscreen) 1034 x 280.
+  - **Live Link was fire-and-forget.** It's request/response now (protocol 2):
+    the add-on replies with applied/unmatched/low-confidence bones, the
+    armature and any error, and the app shows "Applied 13/15 bones to
+    'Armature'" or the error. An older add-on's silence is reported as
+    "sent but not confirmed". The add-on rejects a newer protocol.
+  - **The add-on assumed a PoseCraft-shaped T-pose rig.** Pose format v2 adds
+    each bone's world rotation and rest direction; with "Match rig rest pose"
+    (default on) the add-on aims each rig bone against its own rest direction
+    and actual posed parent (`rig_pose_basis`), so A-pose arms, Mixamo's Hips
+    and clavicles work. Tested against a simulated Mixamo-like A-pose rig
+    (every mapped bone exact; the v1 path left the arm >20 degrees off) and
+    shown identical to the v1 formula on a PoseCraft-shaped rig. Add-on 0.4.0.
+  - **Errors had nowhere to go in the windowed build.** Export failures now
+    show a dialog; `pose_craft/diagnostics.py` logs to
+    `%LOCALAPPDATA%\PoseCraft\logs\posecraft.log` and turns uncaught
+    exceptions (any thread) into a dialog; solve failures log their traceback.
+  - **The model download had no timeout** and `closeEvent` waited forever.
+    Downloads stream with a 30 s socket timeout and can be cancelled;
+    closing cancels, waits up to 5 s, then hides the window and finishes
+    closing when the worker returns.
+  - **No real-photo test.** `scripts/generate_goldens.py` plus
+    `tests/test_real_photo_golden.py` (2 px / 15 mm / 5 degree tolerances),
+    which skips until licensed photos are committed to `tests/data/golden`.
 
 - **Review fixes (axis convention, mirror, BVH, head, stale UI, add-on).**
   Each now has a test that describes what should happen, not just the math
@@ -476,7 +648,9 @@ time each check ran, not guaranteed to stay true as the code changes.
   infer an *unknown* twist from a photo -- so it doesn't actually generalize
   here. What does generalize: MediaPipe's index/pinky knuckle landmarks
   straddle the wrist's own axis, an independent reference no other limb
-  segment has in the 33-point set. **Fixed**: `retarget/skeleton.py` now
+  segment has in the 33-point set. (Superseded by the P1 round's full
+  per-bone frames: the spine, head, bent limbs and feet do have a second
+  reference after all, see above.) **Fixed**: `retarget/skeleton.py` now
   solves real twist for `hand.L`/`hand.R` from that lateral spread (comparing
   it against the already-solved swing's carried-forward rest reference);
   every other bone is unaffected and stays at identity, honestly, since no
@@ -553,9 +727,8 @@ time each check ran, not guaranteed to stay true as the code changes.
   person in a group photo was silently never detected, with no UI indication
   why. **Fixed**: added a "Max people to detect" spin box (1-8, default 4);
   since MediaPipe bakes `num_poses` into the landmarker graph at creation
-  time, changing the value closes and discards the cached `PoseEstimator` so
-  the next solve rebuilds one with the new count instead of keeping the old
-  limit silently.
+  time, changing the value closed and discarded the cached `PoseEstimator`.
+  (No longer: the ONNX pipeline takes it per call, so nothing is rebuilt.)
 - **Live Link's host/port were hardcoded.** No way to work around
   `127.0.0.1:8642` being unavailable. **Fixed**: added editable host/port
   fields in the UI, defaulting to `export.live_link.DEFAULT_HOST`/`DEFAULT_PORT`;
@@ -647,12 +820,14 @@ time each check ran, not guaranteed to stay true as the code changes.
 
 ## Known Issues
 
-- **The GPU build is large.** ONNX Runtime's CUDA provider needs cuBLAS/cuBLASLt
-  and cuDNN, which alone are well over 1 GB; they're bundled so the `.exe` works
-  without a system CUDA install (only an NVIDIA driver). For models this small
-  the GPU speedup is real but modest (~2x per solve, see "Recently Fixed") --
-  a CPU-only build (from a venv without `requirements-gpu.txt`) is far smaller
-  and still perfectly usable.
+- **The CUDA build is large** (~2.2 GB before the ~520 MB trimmed in the P1
+  round and the ~100 MB of libraries trimmed in the P2 round; not re-measured,
+  since nothing was built). cuBLAS/cuBLASLt and
+  cuDNN alone are well over 1 GB. The DirectML flavour (`POSECRAFT_FLAVOR=dml`)
+  avoids them and was faster on the one GPU measured, but no DirectML build
+  has been made or tested yet, and which flavour to publish as the main
+  download is still a release decision. The DirectML wheel lags the main
+  onnxruntime release (1.24.4 vs 1.30.0) and DirectML is in maintenance mode.
 - **The ONNX pipeline is a re-implementation, not MediaPipe itself.** It follows
   MediaPipe's sources and matches its output closely (see "Recently Fixed"),
   but it isn't bit-identical, and a future MediaPipe model update that changes
@@ -661,15 +836,16 @@ time each check ran, not guaranteed to stay true as the code changes.
 
 Ranked roughly by how much they affect whether an exported pose is usable:
 
-- **Twist is only solved for the hands.** Rotation around a bone's own long
-  axis needs a second landmark spanning that axis to measure -- MediaPipe's
-  index/pinky knuckles provide that for `hand.L`/`hand.R` (see "Recently
-  Fixed"), but forearm pronation, upper-arm rotation, thigh rotation, and
-  ankle roll all stay at identity in `retarget/skeleton.py::solve_bone_rotations()`,
-  same as before. Expect to hand-correct those in Blender -- the same category
-  of fix PoseForge's own "Before you buy" section warns about for DAZ. The
-  per-bone `low_confidence` flag doesn't help here either way -- it's about
-  landmark visibility, not about whether twist could be solved at all.
+- **A straight limb's roll is inferred, not measured.** Upper-arm and thigh
+  roll come from the elbow/knee bend plane; below a 30-degree bend
+  (`FULL_BEND_DEG`) it blends into the roll carried from the torso, so a
+  straight arm's roll is whatever the shoulders imply. Forearm twist is half
+  the hand's (`FOREARM_TWIST_SHARE`), which assumes the knuckle landmarks are
+  good. Foot roll comes from the ankle-heel-toe plane, which is only a few cm
+  across, so it's noisy; a hidden heel falls back to a fixed 25-degree pitch.
+  The single spine bone splits a shoulder-vs-hip twist evenly. None of this
+  has been compared against real photos with known poses yet (see the golden
+  test, which has no photos committed).
 - **The world-landmark axis convention follows MediaPipe's documentation
   (+y down, smaller z = closer to the camera; see "Recently Fixed"), but the
   whole export hasn't been checked against a real photo.** Isolated in
@@ -683,20 +859,20 @@ Ranked roughly by how much they affect whether an exported pose is usable:
   longer requires a code fix to work around, only picking the right dropdown
   entry; it doesn't make the underlying axis-convention guess itself any more
   verified.
-- **Retargeting assumes the rig's rest pose matches PoseCraft's own T-pose
-  rest skeleton.** The add-on converts each rotation into the bone's rest
-  frame, but it doesn't correct for different rest *directions* (e.g. an
-  A-pose rig, whose arms point about 45 degrees down at rest, ends up with
-  arms about 45 degrees lower than the photo). It also doesn't correct for a
-  different hierarchy: PoseCraft parents the thighs, arms and neck to one
-  "spine" bone, while Rigify and Mixamo rigs have hips and several
-  spine/chest bones in between, and bones PoseCraft doesn't map stay at rest.
-  A torso lean therefore doesn't carry through to the thighs on those rigs.
-  The fix is full retargeting: compute each target bone's basis from the
-  world-space delta and the actual parent's pose, measured against the rig's
-  own rest directions. That's out of scope for the minimal fix.
-- **The Blender add-on -- bone-name matching, the manual Bone Mapping UI, and
-  the Live Link server -- is unverified against a real Blender install.**
+- **Rig-aware retargeting is unverified in Blender.** "Match rig rest pose"
+  handles different rest directions, extra unmapped bones, chains (Extra
+  Bones; Mixamo spines automatically) and bones with Inherit Rotation off --
+  all tested only against a simulation of Blender's pose evaluation, as are
+  floor contact, keyframing and rotation modes. Not done: Rigify's
+  constraint-driven
+  MCH chains (posing the controls works; a DEF/ORG-only rig is driven by
+  constraints the solve doesn't model). A v1 add-on rejects v2 files
+  ("update the add-on"), by design.
+- **The Blender add-on -- bone-name matching, the manual Bone Mapping UI, the
+  rig-aware solve, and the Live Link server and its reply -- is unverified
+  against a real Blender install.** The Live Link server's reads are
+  non-blocking now (B16; the framing is unit-tested on a real socket), but
+  the timer loop itself has only been reviewed, not run in Blender.
   `bone_name_candidates()` in `import_pose.py` guesses at Rigify
   (`upper_arm_fk.L`, `_ik`, then `DEF-`/`ORG-`) and Mixamo (`mixamorig:*`)
   names, and its pure helpers are unit-tested, but it was never loaded into
@@ -711,10 +887,17 @@ Ranked roughly by how much they affect whether an exported pose is usable:
   a losing game against every possible rig's own naming convention.
 - **No code signing** on the built `.exe` -- expect SmartScreen to flag it as
   unrecognized on a machine other than the one it was built on.
-- **No automated release-build workflow** -- `.github/workflows/ci.yml` only
-  runs tests, unlike `photo_professional_tool`'s `.github/workflows/release.yml`
-  which builds and uploads the `.exe` itself. Rebuild locally with
-  `pyinstaller PoseCraft.spec` for now.
+- **The release workflow has never run** (`.github/workflows/release.yml`),
+  and the spec's K3/K4 changes have never been through a build: run it once
+  (a manual `workflow_dispatch`) and launch each zip before trusting it. No
+  headless-Blender job exists yet (T4).
+- **No hands or fingers yet (B11).** The converter can now run MediaPipe's
+  hand models, but the pose-driven hand crop, the hand landmark pass and
+  finger bones (export, BVH, add-on mapping) aren't built.
+- **Video tracks one person** (the leftmost found in the first frame) and
+  re-detects only when it's lost; there's no identity tracking across
+  people, no rotation-space smoothing, and the root's horizontal motion comes
+  only from planted feet (a jump or a slide has none).
 - **No DAZ Studio export target -- deliberately not started, not just missing.**
   PoseCraft only exports to Blender; the original PoseForge this project is
   inspired by targets DAZ Studio directly. Investigated adding a `.duf` export

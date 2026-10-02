@@ -18,9 +18,12 @@ feature-by-feature version of both.
 - [The main window](#the-main-window)
 - [1. Load & Detect](#1-load--detect)
 - [2. Select Person](#2-select-person)
-- [3. Export](#3-export)
-- [4. Blender Live Link](#4-blender-live-link)
+- [3. Correct](#3-correct)
+- [Video](#video)
+- [4. Export](#4-export)
+- [5. Blender Live Link](#5-blender-live-link)
 - [The 3D preview](#the-3d-preview)
+- [Menus and keyboard shortcuts](#menus-and-keyboard-shortcuts)
 - [Setting up the Blender add-on](#setting-up-the-blender-add-on)
 - [The PoseCraft panel in Blender](#the-posecraft-panel-in-blender)
 - [Confidence and unmatched bones, explained](#confidence-and-unmatched-bones-explained)
@@ -43,83 +46,118 @@ pip install -r requirements.txt
 python -m pose_craft.app
 ```
 
-Either way, the first time you click **Solve Pose** the app downloads a pose
-estimation model (a few MB) to `~/.cache/pose_craft/models` -- this needs
-network access once, then it's cached for every run after that.
+A packaged release build already contains the pose models, so it needs no
+network at all. Run from source, the first time you click **Solve Pose** the
+app downloads a pose estimation model (a few MB) to
+`~/.cache/pose_craft/models` -- this needs network access once, then it's
+cached for every run after that. The download is checked against a pinned
+checksum; a corrupted or altered file is rejected and nothing is saved.
+
+Once a model is on disk, the app loads it in the background as soon as it
+starts ("Preparing the pose model in the background..."), so even the first
+Solve answers quickly -- on a GPU, loading can otherwise take several seconds.
 
 ## The main window
 
-The window has two halves:
+The window has three side-by-side panes; drag the dividers between them to
+resize:
 
-- **Left**: a control panel, split into four numbered sections you use in
-  order -- *1. Load & Detect*, *2. Select Person*, *3. Export*, *4. Blender
-  Live Link* -- with the loaded photo shown above them.
-- **Right**: the **3D preview**, a live 3D skeleton view of whichever person
-  is currently selected.
+- **Left**: the control panel, split into numbered sections you use in
+  order -- *1. Load & Detect*, *2. Select Person*, *3. Correct*, *4. Export*,
+  *5. Blender Live Link* (plus a *Video* section once you load a video). It
+  scrolls if the window is short, so the whole app fits on a laptop screen.
+- **Middle**: the loaded photo, with every detected person's skeleton drawn
+  on it.
+- **Right**: the **3D preview** of whichever person is currently selected.
 
-A status bar along the bottom reports what's happening -- model download
-progress, solve results, export/send confirmations, and errors.
+A status bar along the bottom reports what's happening -- solve results,
+export/send confirmations, and errors -- with a progress bar and a **Cancel**
+button while something runs in the background. The window remembers its size,
+the pane widths, the last folder you used, your recent files and your
+settings (model, GPU, host/port, ...) between runs.
+
+You can also drag a photo or video file from Explorer onto the window to open
+it, or reopen one from **File > Open Recent**.
 
 ## 1. Load & Detect
 
-**Load Photo...** opens a file picker (PNG, JPG, JPEG, BMP, WEBP, TIF, TIFF). Once a
-photo loads:
+**Load Photo...** opens a file picker (PNG, JPG, JPEG, BMP, WEBP, TIF, TIFF).
+**Load Video...** tracks a person through a clip instead -- see [Video](#video).
+Once a photo loads:
 
-- The tips list under the button (*"For best results..."*) is always visible
-  as a reminder: full body in frame, facing the camera or a slight angle,
+- The **Photo tips** toggle under the button (also the button's tooltip)
+  shows the "For best results" list: full body in frame, facing the camera or a slight angle,
   even bright lighting, limbs not hidden behind the body or other people.
   These aren't checked automatically -- there's no reliable way to detect "is
   this person facing sideways" from pixels alone -- so treat them as
   guidance, not a photo requirement.
-- If the photo's resolution is below 480px on its shorter side, a popup warns
-  you that pose estimation is likely to be less accurate. You can still
-  proceed; it's a quality hint, not a hard block.
+- If the photo's resolution is below 480px on its shorter side, a yellow
+  banner above the photo warns that pose estimation is likely to be less
+  accurate (click its ✕ to dismiss it). You can still proceed; it's a quality
+  hint, not a hard block.
 
 **Max people to detect** (1-8, default 4) caps how many people the pose model
 looks for in one photo. A person beyond this count in a group photo won't be
 detected at all -- raise it before solving a bigger group shot. Changing it
 takes effect on the next Solve Pose, with no model reload needed.
 
-**Use GPU (NVIDIA CUDA) when available** (on by default) runs the pose model on
-an NVIDIA graphics card, which makes each solve roughly twice as fast. If the
-computer has no suitable NVIDIA GPU (or the GPU libraries aren't installed),
-the app quietly uses the CPU instead -- the status bar after each solve says
-which one it used ("Solved 2 pose(s) on GPU"). Changing this checkbox or
+**Use GPU when available** (on by default) runs the pose model on the graphics
+card: through DirectML (any DirectX 12 GPU, NVIDIA, AMD or Intel) in a
+DirectML build, or CUDA (NVIDIA only) in a CUDA build. Either gives the same
+result as the CPU to within a fraction of a pixel, several times faster. If
+there's no usable GPU, the app quietly uses the CPU instead -- the status bar
+after each solve says which one it used ("Solved 2 pose(s) on GPU (DirectML)"). Changing this checkbox or
 **Model quality** reloads the model on the next solve (a brief extra delay).
 
-**Solve Pose** runs the actual detection. On the very first solve of a
-session, this also downloads the pose model, and the status bar shows a live
-download percentage (the downloaded model is also converted once to the
-format the app runs it in -- well under a second). Every solve after that reuses the already-loaded model,
+**Group photo (slower)** also searches overlapping quarters of the photo for
+people. The detector looks at the whole photo shrunk to a small square, so in
+a wide group shot each face can be only a few pixels across and get missed;
+the quarters see them bigger. Even with it off, the quarters are tried
+automatically when the whole photo finds nobody.
+
+**Solve Pose** (or **F5**) runs the actual detection. On the very first solve, a source install also
+downloads the pose model, and the progress bar shows how far along it is
+(the downloaded model is also converted once to the
+format the app runs it in -- well under a second). **Cancel** (or **Esc**)
+stops a download. Every solve after that reuses the already-loaded model,
 so later clicks are noticeably faster. While a solve is running, **Load
-Photo**, **Max people to detect**, **Model quality** and **Use GPU** are disabled -- this is intentional:
+Photo**, **Load Video**, **Max people to detect**, **Model quality**, **Use GPU** and **Group photo** are disabled -- this is intentional:
 swapping the photo or the detection settings mid-solve could let a stale
 result land on the wrong photo.
+
+Very large photos (over 2048 pixels on the long side, typical of modern
+cameras) are shrunk to 2048 pixels before detection. That's both faster and
+more accurate: the model only ever looks at a small version of the photo, and
+shrinking it smoothly first removes the noise and jagged edges that the
+model's own sampling would otherwise pick up.
 
 If nobody is detected, a popup says so and you're back to square one with the
 same photo (try the framing tips above, or a different photo).
 
 ## 2. Select Person
 
-Once a solve finds one or more people, each shows up as "Person 1", "Person
-2", etc. in the **Person** dropdown, ordered left-to-right in the photo. Pick
-one either from the dropdown, or by clicking that person directly in the
-photo -- PoseCraft matches your click to whichever detected person's center
-is closest.
+Once a solve finds one or more people, each shows up in the **Person**
+dropdown, ordered left-to-right in the photo, with how many of their bones
+were seen confidently ("Person 2: 13/15 bones confident"). Pick one from the
+dropdown, with **Page Down / Page Up**, or by clicking that person's skeleton
+in the photo -- the click goes to whichever drawn skeleton passes nearest it.
+A click on empty background (or with the right mouse button) doesn't change
+the selection.
 
 The photo itself shows every detected person's 2D skeleton, drawn directly on
-top of the image:
+top of the image; the legend under the photo shows the same line styles:
 
-- The **selected** person's skeleton is bright cyan with orange joints, drawn
+- The **selected** person's skeleton is bright cyan with white joints, drawn
   on top of everyone else.
 - Any bone on the selected person that the pose model wasn't confident about
-  (likely occluded or hard to see in the photo) is drawn in **orange-red**
-  instead of cyan, so you can see at a glance which parts of the pose are
-  shakiest before you ever open Blender.
+  (likely occluded or hard to see in the photo) is drawn **dashed** and in
+  orange-red, so you can see at a glance which parts of the pose are
+  shakiest before you ever open Blender -- the dashes make it readable
+  without relying on colour.
 - Everyone **not** currently selected is dimmed gray underneath, so it's
   obvious who you're about to export.
 
-**Mirror left/right (body orientation fix)** swaps which side of the body
+**Mirror left/right** (**M**; a body orientation fix) swaps which side of the body
 feeds which exported bone and mirrors the pose (a left arm raised becomes a
 right arm raised) -- use it if a solved pose comes out with left and
 right reversed. It's a property of the *photo/camera orientation*, not of one
@@ -129,21 +167,70 @@ skeleton drawn on the photo (checking it doesn't move anyone's arm in the
 picture -- it only relabels which side's data goes into the exported bone
 names), so don't expect the overlay to visibly change when you toggle it.
 
-## 3. Export
+**Body orientation fix** turns the whole solved pose if it comes out
+upside-down or facing 90 degrees off: *Flip Upside-Down*, *Rotate 90° Left*,
+*Rotate 90° Right* (or *Default*, no change). Like Mirror, it applies to the
+3D preview and to every export at once.
 
-Both buttons only need Load Photo + Solve Pose to have already found at least
-one person; the JSON they write includes the solved rotation for every bone,
-plus a confidence flag per bone (see
-[Confidence and unmatched bones](#confidence-and-unmatched-bones-explained)).
+## 3. Correct
 
-- **Export Pose JSON...** saves just the currently selected person as one
+A single photo can't always tell which way a limb points in depth: a forearm
+reaching toward the camera and one reaching away by the same angle look the
+same. Two fixes, both undoable with **Ctrl+Z** (redo **Ctrl+Y** or
+**Ctrl+Shift+Z**):
+
+- **Flip a limb's depth**: right-click an arm or leg bone in the photo and
+  choose **Flip depth: forearm.L** (or whichever bone you clicked). That bone
+  and everything below it is mirrored front-to-back about its joint -- its
+  position in the photo stays the same. Do it again to undo it.
+- **Adjust bone**: pick a bone and rotate it about its own axes in degrees,
+  like Blender's bone axes: **Y** runs along the bone (a twist), **X** and
+  **Z** bend it. Its children follow. **Reset bone** clears one bone's
+  adjustment, **Reset all edits** everything for this person.
+
+Corrections belong to one person and go into every export (JSON, BVH, Live
+Link, and every person of Export All). A new solve or a new photo clears them.
+
+## Video
+
+**Load Video...** (MP4, MOV, AVI, MKV, WEBM, M4V) tracks one person -- the
+leftmost one in the first frame -- through the whole clip, with a progress bar
+and **Cancel**. The detector runs on the first frame and whenever the person
+is lost; every other frame looks where the previous frame's pose says they
+are, which is fast (about 10 ms a frame on a CPU) and steady. The landmarks
+are smoothed over time (a One Euro filter: strong smoothing while the body is
+still, little lag when it moves fast).
+
+The **Video** section then shows a frame slider: scrub to any frame to see
+it, its skeleton and its 3D preview; every export, correction and Live Link
+send works on the frame you're looking at. **Export Animation BVH...** writes
+every tracked frame as one animated BVH: each frame stands on the floor, and
+while a foot is planted the root moves so that foot stays put, which is what
+moves a walk forward.
+
+## 4. Export
+
+All three buttons only need Load Photo + Solve Pose to have already found at
+least one person. The JSON includes the solved rotation for every bone, plus a
+confidence flag per bone (see
+[Confidence and unmatched bones](#confidence-and-unmatched-bones-explained))
+and how high the hips sit above the floor in this pose.
+If a file can't be written (a read-only folder, a file open elsewhere), a
+popup says which file and why. File names default to the photo's name plus
+the person, like `IMG_0042_person2.json`.
+
+- **Export Pose JSON...** (**Ctrl+S**) saves just the currently selected person as one
   `.json` file, wherever you choose.
 - **Export All People...** saves every detected person as a separate file
-  (`pose_person1.json`, `pose_person2.json`, ...) into a folder you choose --
-  useful for a group photo where you want every person's pose. Respects the
+  (`IMG_0042_person1.json`, `IMG_0042_person2.json`, ...) into a folder you
+  choose -- useful for a group photo where you want every person's pose. It
+  asks before overwriting files that are already there. Respects the
   Mirror checkbox for everyone, the same as single-person export.
+- **Export BVH...** (**Ctrl+Shift+S**) saves the selected person as a single-frame `.bvh` file
+  (Y up, facing +Z), for tools that read BVH rather than PoseCraft's JSON. The
+  skeleton stands on the floor (Y = 0), so a crouch comes out lowered.
 
-## 4. Blender Live Link
+## 5. Blender Live Link
 
 An alternative to file export: send a solved pose straight into a running
 Blender session over a local network connection, so you don't need a file
@@ -155,7 +242,7 @@ dialog for every attempt.
   own PoseCraft panel before starting Live Link there, or the send will fail.
   Changing the host field doesn't make Blender listen anywhere new; see
   [Setting up the Blender add-on](#setting-up-the-blender-add-on).
-- **Send to Blender (Live Link)** sends the currently selected person's
+- **Send to Blender (Live Link)** (**Ctrl+B**) sends the currently selected person's
   solved pose. This needs Blender open, the add-on installed, and its **Start
   Live Link** button already clicked -- otherwise you'll get a popup
   explaining that and pointing you at the Blender side.
@@ -164,15 +251,57 @@ Sending runs in the background, so the app doesn't freeze while it connects
 -- useful because the most common failure (Blender's Live Link isn't started
 yet) would otherwise mean a multi-second freeze on every attempt.
 
+Blender replies with what it did, and the status bar shows it: for example
+"Applied 13/15 bones to 'Armature' (unmatched: foot.L, foot.R)". If Blender
+received the pose but couldn't apply it (no target armature, say), a popup
+says why. With an add-on older than 0.4.0, the status bar instead says the
+pose was sent but not confirmed -- update the add-on to get the reply.
+
 ## The 3D preview
 
-The right-hand panel shows the solved skeleton in 3D, independent of the
-photo overlay. It automatically frames itself to the selected person's actual
+The right-hand panel shows the pose **as it will be exported**: the skeleton
+is built from the exported bone rotations themselves, the same way Blender or
+a BVH reader will build it, sized to the person's own proportions. The raw
+detected body points are drawn as faint gray dots behind it. Where the two
+agree, the export reproduces the photo; where the skeleton leaves the dots,
+that's what the export will get wrong, so check it before exporting. It is
+independent of the photo overlay.
+
+- The skeleton **stands on the grid**: the grid is the floor, at the pose's
+  lowest point.
+- Bones are drawn as **tapered octahedra** (like Blender's), which turn with
+  each bone's roll, with a line through each; a low-confidence bone's line is
+  **dashed**.
+- A small **XYZ gizmo** at the floor's centre: red X is the subject's left,
+  green Y is behind them, blue Z is up.
+- **View** menu: **Front** (**1**), **Side** (**3**), **Top** (**7**),
+  **Reset Camera** (**0**), **Frame Skeleton** (**F**) and **Bone Labels**
+  (**L**, each bone's name at its middle).
+
+It automatically frames itself to the selected person's actual
 size and pose on every solve or selection change, so an unusually large,
 small, or extreme pose still fits in view. You can still orbit/pan/zoom it
 manually with the mouse (standard 3D-viewport drag-to-orbit,
 scroll-to-zoom) -- doing so doesn't get reset by a later solve, only the
 camera's distance and center re-fit automatically.
+
+## Menus and keyboard shortcuts
+
+| Key | Does |
+|---|---|
+| Ctrl+O / Ctrl+Shift+O | Open a photo / a video |
+| F5 or Ctrl+Enter | Solve Pose |
+| Esc | Cancel a running solve or video |
+| Page Down / Page Up | Next / previous person |
+| M | Mirror left/right |
+| Ctrl+Z / Ctrl+Y | Undo / redo a correction |
+| Ctrl+S / Ctrl+Shift+S | Export Pose JSON / Export BVH |
+| Ctrl+B | Send to Blender |
+| 1 / 3 / 7 / 0 | Front / side / top / default 3D view |
+| F / L | Frame the skeleton / toggle bone labels |
+
+Most control labels have an underlined letter: Alt plus that letter jumps to
+it. **File > Open Recent** lists the last eight photos and videos.
 
 ## Setting up the Blender add-on
 
@@ -188,6 +317,28 @@ camera's distance and center re-fit automatically.
 **Load Pose JSON** applies a `.json` file you exported from the app to the
 currently selected armature. Use this for one-off poses.
 
+**Match rig rest pose** (on by default) aims each bone of your rig at the
+direction PoseCraft solved, measured against your rig's *own* rest pose and
+bone hierarchy. That makes A-pose rigs, sloped foot bones, and rigs with extra
+bones (a Mixamo "Hips" bone above the legs, clavicles between the spine and
+the arms) come out right. Bones PoseCraft has no counterpart for keep their
+current pose. Turn it off to apply PoseCraft's rotations exactly as exported
+(this assumes a T-pose rig shaped like PoseCraft's skeleton, and is also what
+happens with files from PoseCraft versions before this option existed).
+
+**Keep feet on the floor** (off by default): after posing, the rig's root bone
+is moved up or down so the pose's lowest point sits where the rig's rest pose
+had its feet -- a crouch or a sit comes out lowered instead of hanging at
+standing height. It moves the top bone of the rig's hierarchy (Mixamo's Hips,
+Rigify's root).
+
+**Insert keyframes** keys every applied bone at the current frame (it also
+happens whenever Blender's own auto-keying is on), and **Then advance** steps
+the current frame forward by that many frames after each keyed pose -- send a
+series of photos to block out an animation. Each applied bone keeps its own
+rotation mode (Euler, axis-angle or quaternion), so Euler rigs and their
+existing keys aren't disturbed.
+
 **Bone Mapping** bridges the gap between PoseCraft's 15 bone names (spine,
 neck, head, and left/right upper arm, forearm, hand, thigh, shin, foot) and
 whatever your rig actually calls its bones:
@@ -199,6 +350,10 @@ whatever your rig actually calls its bones:
    `DEF-`/`ORG-` bones, then Mixamo names like `mixamorig:LeftArm`).
 3. For anything still blank, or wrong, use each row's searchable dropdown to
    pick the correct bone on your armature by hand.
+   The text field next to it, **Extra Bones**, takes more bones continuing a
+   chain, comma-separated (for example `Spine1, Spine2` after `Spine`): the
+   rotation is spread evenly over the whole chain. Mixamo's three spine bones
+   are chained like this automatically.
 4. **Clear All** blanks every row's assignment if you want to start over
    (keeps the row list itself).
 
@@ -208,8 +363,13 @@ wins over the automatic guess -- even reporting that bone as "unmatched"
 rather than silently guessing something else, if the bone you picked has
 since been renamed or deleted.
 
-**Live Link**: set the **port** to match the PoseCraft app's (default 8642),
-then click **Start Live Link**. The status line underneath shows whether it's
+**Live Link**: select the armature, set the **port** to match the PoseCraft app's (default 8642),
+then click **Start Live Link**. The armature becomes the **Live Link target**
+(shown in the panel; pick another there any time), so you can select other
+objects while you work and poses still go to the rig. Each received pose is
+its own undo step (**Ctrl+Z** in Blender). Receiving never stalls Blender:
+a sender that stops halfway is dropped after two seconds. The status line
+underneath shows whether it's
 listening, and reports the result of the most recently received pose. Click
 **Stop Live Link** to close it. This always listens on `127.0.0.1`
 (localhost) only, by design -- there's no setting to expose it to the network,
@@ -224,8 +384,8 @@ information:
 - **Low confidence**: MediaPipe (the pose-detection model) scores how
   visible each part of the body was in the photo. A bone built from a
   poorly-visible body part (an arm behind the back, a foot out of frame) gets
-  flagged `low_confidence` in the exported JSON, shown as orange-red in the
-  app's photo overlay, and called out by name when applied in Blender (both
+  flagged `low_confidence` in the exported JSON, drawn dashed in orange-red in the
+  app's photo overlay and 3D preview, and called out by name when applied in Blender (both
   via **Load Pose JSON** and **Live Link**).
 - **Unmatched**: a PoseCraft bone name that couldn't be resolved to any bone
   on your armature, neither by your manual Bone Mapping nor by the automatic
@@ -239,13 +399,21 @@ so you know which parts of a pose are worth checking by hand.
 
 Worth knowing before you rely on an exported pose:
 
-- **Only hands solve real "twist"** (rotation around a limb's own length,
-  like forearm rotation or wrist twist) -- everywhere else, twist is left
-  untouched, because a single photo doesn't give enough information to
-  recover it. Expect to hand-correct forearms, upper arms, thighs, and
-  ankles for anything beyond the basic pose direction.
+- **Twist on a straight limb is a guess.** PoseCraft solves the body's turn,
+  head turns, foot angles and roll, and the roll of the upper arms and thighs
+  from how the elbow or knee bends. A nearly straight arm or leg has no bend
+  to measure its roll from, so it keeps the roll of the torso; forearm twist
+  comes from the hand (half each). Check those in Blender.
+- **One spine bone.** PoseCraft's torso is a single bone, so a twist between
+  the shoulders and the hips is split evenly between the spine and the limbs.
 - **A solved pose might come out mirrored or upside-down** for certain
-  photos -- if that happens, try the **Mirror left/right** checkbox first.
+  photos -- if that happens, try the **Mirror left/right** checkbox first,
+  then the **Body orientation fix**.
+- **A limb can come out reaching the wrong way in depth** (toward the camera
+  instead of away) -- right-click it in the photo and flip its depth.
+- **No fingers.** Hands are one bone each; finger poses aren't estimated yet.
+- **Video follows one person** (the leftmost in the first frame) and gives
+  the root horizontal motion only through planted feet.
 - **The Blender add-on** (bone-name matching, the Bone Mapping UI, and Live
   Link) hasn't been checked against every possible rig -- if something looks
   off, the Bone Mapping panel is exactly the tool for fixing bone-name
@@ -260,9 +428,13 @@ Worth knowing before you rely on an exported pose:
 | Symptom | Try this |
 |---|---|
 | "No person was detected in this photo" | Check the framing tips under Load Photo -- full body in frame, decent lighting, not too small a photo. |
-| Pose looks mirrored or flipped | Toggle **Mirror left/right** and re-export/re-send. |
-| A limb looks twisted the wrong way in Blender | Expected for most limbs (see Known Limitations) -- correct it by hand in Blender; hands are the one part PoseCraft solves twist for. |
+| Pose looks mirrored or flipped | Toggle **Mirror left/right**; if it's upside-down or turned sideways, use **Body orientation fix**. Then re-export/re-send. |
+| One arm or leg reaches the wrong way (toward vs away from the camera) | Right-click that bone in the photo > **Flip depth**. |
+| People in a wide group photo are missing | Tick **Group photo (slower)** and solve again (and raise **Max people to detect** if needed). |
+| A limb looks twisted the wrong way in Blender | Most likely a straight arm or leg (see Known Limitations) -- correct it by hand in Blender. Check the 3D preview first: it shows what the export contains. |
+| Arms come out too low (or bones point oddly) on your rig | Make sure **Match rig rest pose** is on in Blender's PoseCraft panel, and the file came from this version of PoseCraft. |
 | "Unmatched" bone reported in Blender | Open the PoseCraft panel's **Bone Mapping** box and assign that bone manually. |
 | "Could not reach Blender's Live Link" | In Blender, open the PoseCraft tab and click **Start Live Link** first; double-check the port matches on both sides. |
-| Solve Pose seems stuck on first use | It's downloading the pose model -- check the status bar for a percentage, and that you have network access. |
+| Solve Pose seems stuck on first use | It's downloading the pose model -- check the progress bar, and that you have network access; **Cancel** stops it. |
+| "doesn't match its pinned SHA-256" | The model download was corrupted (or the file on the server changed); try again on a stable connection. |
 | A 5th+ person in a group photo isn't detected | Raise **Max people to detect** before clicking Solve Pose. |
