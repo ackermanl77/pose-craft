@@ -3,9 +3,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
+from pose_craft.diagnostics import configure_logging, install_excepthooks
 from pose_craft.gui.main_window import MainWindow
 
 
@@ -20,11 +22,32 @@ def _asset_path(relative: str) -> Path:
 ICON_PATH = _asset_path("assets/icon.png")
 
 
+class _ErrorDialogRelay(QObject):
+    """Shows uncaught-exception messages on the GUI thread, whichever thread
+    raised (a queued signal hops threads safely; a QMessageBox can't)."""
+
+    message = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.message.connect(self._show, Qt.QueuedConnection)
+
+    def _show(self, text: str) -> None:
+        QMessageBox.critical(None, "PoseCraft error", text)
+
+
 def main() -> int:
+    # The windowed build has no console: log to a file and turn any uncaught
+    # exception into a dialog pointing at it (see pose_craft/diagnostics.py).
+    configure_logging()
     app = QApplication(sys.argv)
+    relay = _ErrorDialogRelay()
+    install_excepthooks(relay.message.emit)
     if ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(ICON_PATH)))
-    window = MainWindow()
+    # warm_up: load the remembered model on the GPU in the background, so the
+    # first Solve doesn't pay the cold start (only when it's already cached).
+    window = MainWindow(warm_up=True)
     window.show()
     return app.exec()
 

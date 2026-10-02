@@ -1,50 +1,101 @@
 from __future__ import annotations
 
+import dataclasses
+import logging
+import threading
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import QSettings, Qt, QThread, Signal
+from PySide6.QtGui import QAction, QImage, QKeySequence, QPixmap, QUndoCommand, QUndoStack
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSlider,
     QSpinBox,
+    QSplitter,
     QStatusBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
+from scipy.spatial.transform import Rotation
 
+from pose_craft.diagnostics import log_file_hint
 from pose_craft.estimation.landmarker import (
+    MODEL_URLS,
     DetectedPerson,
+    DownloadCancelled,
     PoseEstimator,
-    ensure_model_downloaded,
-    model_cache_path,
+    is_model_available,
 )
 from pose_craft.export import live_link
-from pose_craft.export.blender_pose import LOW_CONFIDENCE_THRESHOLD, build_pose_document, save_pose_file
-from pose_craft.export.bvh_export import save_bvh_file
+from pose_craft.export.blender_pose import (
+    LOW_CONFIDENCE_THRESHOLD,
+    build_pose_document,
+    root_measurements,
+    save_pose_file,
+)
+from pose_craft.export.bvh_export import floor_root_position, save_bvh_animation, save_bvh_file
 from pose_craft.export.live_link import send_pose_document
-from pose_craft.gui.photo_view import PhotoOverlayPerson, PhotoView
+from pose_craft.gui.photo_view import PhotoOverlayPerson, PhotoView, legend_entries, legend_swatch
 from pose_craft.gui.viewport_3d import SkeletonViewport
 from pose_craft.imaging import PHOTO_GUIDANCE, assess_photo_quality, imread_unicode
 from pose_craft.retarget.skeleton import (
+    BONE_NAMES,
+    FLIPPABLE_BONES,
     ORIENTATION_CORRECTIONS,
+    apply_bone_overrides,
     apply_orientation_correction,
+    bone_axes_rotation,
     bone_confidence,
+    bone_lateral_axes,
+    flip_limb_depth,
+    floor_height,
+    forward_kinematics,
     image_joint_positions_2d,
     joint_positions,
+    measured_proportions,
     mirror_landmarks,
     rotate_joint_positions,
     solve_bone_rotations,
 )
+
+log = logging.getLogger(__name__)
+
+# How long closeEvent waits for a background worker before hiding the window
+# and finishing the close once the worker returns (a download blocked in a
+# network read can take up to landmarker.DOWNLOAD_TIMEOUT_SECONDS to notice a
+# cancel).
+_CLOSE_WAIT_MS = 5000
+
+PHOTO_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff")
+VIDEO_SUFFIXES = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v")
+_PHOTO_FILTER = "Images (" + " ".join(f"*{s}" for s in PHOTO_SUFFIXES) + ")"
+_VIDEO_FILTER = "Videos (" + " ".join(f"*{s}" for s in VIDEO_SUFFIXES) + ")"
+MAX_RECENT_FILES = 8
+# A click farther than this (as a fraction of the photo's diagonal) from every
+# person's drawn skeleton doesn't change the selection.
+PICK_MAX_DISTANCE = 0.05
+
+
+def default_settings() -> QSettings:
+    """PoseCraft's settings file (an INI under the user's config folder)."""
+    return QSettings(QSettings.IniFormat, QSettings.UserScope, "PoseCraft", "PoseCraft")
 
 
 class SolveWorker(QThread):
@@ -57,6 +108,7 @@ class SolveWorker(QThread):
 
     finished_ok = Signal(list, object)  # list[DetectedPerson], PoseEstimator
     failed = Signal(str)
+    cancelled = Signal()
     progress = Signal(int, int)  # downloaded_bytes, total_bytes -- only during a real download
 
     def __init__(
@@ -66,6 +118,7 @@ class SolveWorker(QThread):
         max_people: int,
         model_variant: str,
         use_gpu: bool = True,
+        group_photo: bool = False,
         parent=None,
     ):
         super().__init__(parent)
@@ -74,19 +127,114 @@ class SolveWorker(QThread):
         self._max_people = max_people
         self._model_variant = model_variant
         self._use_gpu = use_gpu
+        self._group_photo = group_photo
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        """Asks a running model download to stop at its next chunk (see
+        landmarker.ensure_model_downloaded); a solve that's already loading the
+        model is dropped as soon as that finishes. An inference already in
+        progress can't be interrupted, but it takes milliseconds."""
+        self._cancel.set()
 
     def run(self) -> None:
         estimator = self._estimator
         newly_created = estimator is None
         try:
             if estimator is None:
-                model_path = ensure_model_downloaded(
-                    self._model_variant, on_progress=lambda downloaded, total: self.progress.emit(downloaded, total)
+                estimator = PoseEstimator.for_variant(
+                    self._model_variant,
+                    max_people=self._max_people,
+                    use_gpu=self._use_gpu,
+                    on_progress=lambda downloaded, total: self.progress.emit(downloaded, total),
+                    should_cancel=self._cancel.is_set,
                 )
-                estimator = PoseEstimator(model_path, max_people=self._max_people, use_gpu=self._use_gpu)
+            if self._cancel.is_set():
+                raise DownloadCancelled("solve cancelled")
+            estimator.max_people = self._max_people
+            estimator.group_photo = self._group_photo
             people = estimator.detect(self._image_bgr)
+            if self._cancel.is_set():
+                raise DownloadCancelled("solve cancelled")
             self.finished_ok.emit(people, estimator)
+        except DownloadCancelled:
+            if newly_created and estimator is not None:
+                estimator.close()
+            self.cancelled.emit()
         except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
+            log.exception("pose solve failed")
+            if newly_created and estimator is not None:
+                estimator.close()
+            self.failed.emit(str(exc))
+
+
+class WarmUpWorker(QThread):
+    """Creates the estimator for the remembered model and device at startup and
+    runs one blank inference through it (P3), so the first Solve doesn't pay
+    the GPU's cold start -- 15.7 s for a fresh CUDA process was measured.
+    Only runs when the model is already available offline (never downloads)."""
+
+    finished_ok = Signal(object)  # PoseEstimator
+    failed = Signal(str)
+
+    def __init__(self, model_variant: str, use_gpu: bool, max_people: int, parent=None):
+        super().__init__(parent)
+        self.model_variant = model_variant
+        self.use_gpu = use_gpu
+        self._max_people = max_people
+
+    def run(self) -> None:
+        try:
+            estimator = PoseEstimator.for_variant(self.model_variant, max_people=self._max_people, use_gpu=self.use_gpu)
+            estimator.warm_up()
+            self.finished_ok.emit(estimator)
+        except Exception as exc:  # noqa: BLE001 - a failed warm-up just means the first solve loads it
+            log.warning("model warm-up failed: %s", exc)
+            self.failed.emit(str(exc))
+
+
+class VideoSolveWorker(QThread):
+    """Tracks one person through a video (estimation/video.py) off the UI thread."""
+
+    finished_ok = Signal(object, object)  # VideoSolve, PoseEstimator
+    failed = Signal(str)
+    cancelled = Signal()
+    progress = Signal(int, int)  # frames done, total frames (0 if unknown)
+
+    def __init__(self, path: str, estimator: PoseEstimator | None, model_variant: str, use_gpu: bool, parent=None):
+        super().__init__(parent)
+        self._path = path
+        self._estimator = estimator
+        self._model_variant = model_variant
+        self._use_gpu = use_gpu
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def run(self) -> None:
+        from pose_craft.estimation.video import solve_video
+
+        estimator = self._estimator
+        newly_created = estimator is None
+        try:
+            if estimator is None:
+                estimator = PoseEstimator.for_variant(
+                    self._model_variant, use_gpu=self._use_gpu, should_cancel=self._cancel.is_set
+                )
+            result = solve_video(
+                self._path,
+                estimator,
+                on_progress=lambda done, total: self.progress.emit(done, total),
+                should_cancel=self._cancel.is_set,
+            )
+            self.finished_ok.emit(result, estimator)
+        except (DownloadCancelled, InterruptedError):
+            if newly_created and estimator is not None:
+                estimator.close()
+            self.cancelled.emit()
+        except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
+            log.exception("video solve failed")
             if newly_created and estimator is not None:
                 estimator.close()
             self.failed.emit(str(exc))
@@ -99,7 +247,7 @@ class SendToBlenderWorker(QThread):
     first-time scenario, not an edge case.
     """
 
-    finished_ok = Signal()
+    finished_ok = Signal(object)  # the add-on's reply dict, or None from an add-on too old to reply
     failed = Signal(str)
 
     def __init__(self, document: dict, host: str, port: int, parent=None):
@@ -110,15 +258,60 @@ class SendToBlenderWorker(QThread):
 
     def run(self) -> None:
         try:
-            send_pose_document(self._document, host=self._host, port=self._port)
-            self.finished_ok.emit()
-        except OSError as exc:
+            reply = send_pose_document(self._document, host=self._host, port=self._port)
+            self.finished_ok.emit(reply)
+        except (OSError, ValueError) as exc:  # ValueError: a malformed reply
+            log.warning("Live Link send failed: %s", exc)
             self.failed.emit(str(exc))
 
 
 def _nearest_person_index(people: list[DetectedPerson], x: float, y: float) -> int:
     distances = [((p.centroid_xy()[0] - x) ** 2 + (p.centroid_xy()[1] - y) ** 2) for p in people]
     return int(np.argmin(distances))
+
+
+def _point_segment_distance(point: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    ab = b - a
+    denominator = float(np.dot(ab, ab))
+    t = 0.0 if denominator < 1e-18 else float(np.clip(np.dot(point - a, ab) / denominator, 0.0, 1.0))
+    return float(np.linalg.norm(point - (a + t * ab)))
+
+
+def _nearest_bone(
+    joints_2d: dict[str, np.ndarray], x: float, y: float, aspect: float = 1.0, bones=BONE_NAMES
+) -> tuple[str, float]:
+    """(bone name, distance) of the drawn bone segment nearest the normalized
+    point (x, y). `aspect` is the photo's width / height, so distances are
+    measured in proportion to the photo's real shape (as a fraction of its
+    height)."""
+    scale = np.array([aspect, 1.0])
+    point = np.array([x, y]) * scale
+    best = ("", float("inf"))
+    for name in bones:
+        distance = _point_segment_distance(
+            point, joints_2d[f"{name}.head"] * scale, joints_2d[f"{name}.tail"] * scale
+        )
+        if distance < best[1]:
+            best = (name, distance)
+    return best
+
+
+def _person_at(
+    people_joints_2d: list[dict[str, np.ndarray]], x: float, y: float, aspect: float = 1.0,
+    max_distance: float = PICK_MAX_DISTANCE,
+) -> int | None:
+    """The person whose drawn skeleton passes nearest the click (F5), or None
+    when the click is farther than `max_distance` of the photo's diagonal from
+    everyone -- a click on empty background no longer changes the selection,
+    and in a crowded shot the skeleton under the cursor wins rather than the
+    one whose centroid happens to be closest."""
+    diagonal = float(np.hypot(aspect, 1.0))
+    best_index, best_distance = None, float("inf")
+    for index, joints in enumerate(people_joints_2d):
+        _bone, distance = _nearest_bone(joints, x, y, aspect)
+        if distance < best_distance:
+            best_index, best_distance = index, distance
+    return best_index if best_distance <= max_distance * diagonal else None
 
 
 def _low_confidence_bone_count(confidence: dict[str, float]) -> int:
@@ -144,98 +337,323 @@ def _low_confidence_status_suffix(confidence: dict[str, float]) -> str:
     return f" -- {low_count} of {len(confidence)} bones low-confidence"
 
 
+def _person_label(index: int, confidence: dict[str, float]) -> str:
+    """The person picker's entry: "Person 2: 13/15 bones confident"."""
+    confident = len(confidence) - _low_confidence_bone_count(confidence)
+    return f"Person {index + 1}: {confident}/{len(confidence)} bones confident"
+
+
+def _live_link_reply_message(reply: dict | None) -> tuple[str, bool]:
+    """Status text for the Blender add-on's Live Link reply, and whether the pose
+    was applied. `reply` is None when the add-on predates the reply protocol
+    (it applied or rejected the pose without saying which)."""
+    if reply is None:
+        return (
+            "Pose sent to Blender, but the add-on didn't confirm it -- update the PoseCraft add-on "
+            "to see what was applied",
+            True,
+        )
+    if not reply.get("ok"):
+        return f"Blender didn't apply the pose: {reply.get('error') or 'unknown error'}", False
+    applied = reply.get("applied") or []
+    requested = reply.get("requested", len(applied))
+    message = f"Applied {len(applied)}/{requested} bones to '{reply.get('armature', '?')}'"
+    unmatched = reply.get("unmatched") or []
+    if unmatched:
+        message += f" (unmatched: {', '.join(unmatched)})"
+    low_confidence = reply.get("low_confidence") or []
+    if low_confidence:
+        message += f"; {len(low_confidence)} low-confidence"
+    return message, True
+
+
+def _preview_positions(
+    landmarks: np.ndarray, rotations: dict, correction
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """What the 3D preview draws: (the skeleton posed by forward kinematics from
+    the exported rotations, the raw landmark joints as a ghost). The FK skeleton
+    uses the subject's own segment lengths and is rooted at the hip center, so
+    it sits on the ghost wherever the rotations reproduce the landmarks and
+    visibly departs from it where they don't. The ghost gets the same body
+    orientation fix the rotations already carry. Both are then lifted so the
+    skeleton's lowest joint stands on the grid at Y = 0 (B6) -- the world
+    landmarks are hip-centred, so without this every pose stood half through
+    the floor."""
+    raw = joint_positions(landmarks)
+    lengths, shoulder_half, hip_half = measured_proportions(landmarks)
+    solved = forward_kinematics(rotations, lengths, shoulder_half, hip_half, root_position=raw["spine.head"])
+    ghost = rotate_joint_positions(raw, correction, pivot=raw["spine.head"])
+    lift = np.array([0.0, -floor_height(solved), 0.0])
+    return {k: v + lift for k, v in solved.items()}, {k: v + lift for k, v in ghost.items()}
+
+
+def default_export_name(source: str | None, person_index: int, suffix: str) -> str:
+    """"<photo stem>_person<N><suffix>", or "pose_person<N>" with no photo."""
+    stem = Path(source).stem if source else "pose"
+    return f"{stem}_person{person_index + 1}{suffix}"
+
+
+def _update_recent_files(recent: list[str], path: str, limit: int = MAX_RECENT_FILES) -> list[str]:
+    """`path` moved to the front of the recent-files list (case-insensitively
+    unique, as Windows paths are), trimmed to `limit`."""
+    key = str(Path(path)).lower()
+    kept = [p for p in recent if str(Path(p)).lower() != key]
+    return [str(Path(path))] + kept[: limit - 1]
+
+
+@dataclasses.dataclass(frozen=True)
+class PersonEdits:
+    """Manual corrections for one person (F4): limbs whose depth is flipped
+    (raw, unmirrored bone names -- what the user clicked in the photo), and
+    per-bone rotation adjustments in degrees about the bone's own X/Y/Z axes
+    (exported bone names, as in the "Adjust bone" picker)."""
+
+    flipped: frozenset = frozenset()
+    overrides: tuple = ()  # ((bone name, (x, y, z) degrees), ...), sorted
+
+    def override_rotations(self) -> dict[str, Rotation]:
+        return {name: bone_axes_rotation(name, angles) for name, angles in self.overrides}
+
+    def with_flip_toggled(self, bone: str) -> "PersonEdits":
+        return dataclasses.replace(self, flipped=self.flipped ^ {bone})
+
+    def with_override(self, bone: str, angles: tuple[float, float, float] | None) -> "PersonEdits":
+        entries = {name: value for name, value in self.overrides if name != bone}
+        if angles is not None and any(abs(a) > 1e-9 for a in angles):
+            entries[bone] = tuple(float(a) for a in angles)
+        return dataclasses.replace(self, overrides=tuple(sorted(entries.items())))
+
+    def override_for(self, bone: str) -> tuple[float, float, float]:
+        return dict(self.overrides).get(bone, (0.0, 0.0, 0.0))
+
+    def is_empty(self) -> bool:
+        return not self.flipped and not self.overrides
+
+
+class _EditCommand(QUndoCommand):
+    """One manual correction as an undo step: swaps a person's PersonEdits."""
+
+    def __init__(self, window: "MainWindow", person_index: int, before: PersonEdits, after: PersonEdits, text: str):
+        super().__init__(text)
+        self._window, self._index, self._before, self._after = window, person_index, before, after
+
+    def redo(self) -> None:
+        self._window._set_person_edits(self._index, self._after)
+
+    def undo(self) -> None:
+        self._window._set_person_edits(self._index, self._before)
+
+
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, settings: QSettings | None = None, warm_up: bool = False):
         super().__init__()
         self.setWindowTitle("PoseCraft - Photo to Pose")
         self.resize(1200, 720)
+        self.setAcceptDrops(True)
 
+        self._settings = settings if settings is not None else default_settings()
         self._image_bgr: np.ndarray | None = None
+        self._source_path: str | None = None
         self._people: list[DetectedPerson] = []
+        self._edits: dict[int, PersonEdits] = {}
+        self._video = None  # estimation.video.VideoSolve while a video is loaded
         self._worker: SolveWorker | None = None
+        self._video_worker: VideoSolveWorker | None = None
+        self._warmup_worker: WarmUpWorker | None = None
         self._send_worker: SendToBlenderWorker | None = None
         self._estimator: PoseEstimator | None = None
+        self._pending_solve = False  # Solve clicked while the warm-up was still running
+        self._closing = False  # set by closeEvent; suppresses the dialogs of work it cancelled
+        self._syncing_adjust = False
+        self.undo_stack = QUndoStack(self)
+        self.undo_stack.indexChanged.connect(lambda _index: self._sync_adjust_controls())
 
         self._build_ui()
+        self._build_menus()
+        self._restore_settings()
+        self._set_result_actions_enabled(False)
+        if warm_up:
+            self._start_warm_up()
+
+    # -- layout ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        central = QWidget(self)
-        self.setCentralWidget(central)
-        root = QHBoxLayout(central)
+        # Three panes side by side in a splitter: the controls (scrollable, so
+        # they never set the window's minimum height), the photo, and the 3D
+        # preview. Stacking the photo on top of the controls used to make the
+        # window's minimum height 1124 px, taller than a 1080p screen.
+        controls = QWidget()
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.addWidget(self._build_detect_group())
+        controls_layout.addWidget(self._build_person_group())
+        controls_layout.addWidget(self._build_correction_group())
+        controls_layout.addWidget(self._build_video_group())
+        controls_layout.addWidget(self._build_export_group())
+        controls_layout.addWidget(self._build_live_link_group())
+        controls_layout.addStretch(1)
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidget(controls)
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        controls_scroll.setMinimumWidth(controls.minimumSizeHint().width() + 24)
+        controls_scroll.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
 
-        left = QVBoxLayout()
-        root.addLayout(left, stretch=1)
-
+        photo_pane = QWidget()
+        photo_layout = QVBoxLayout(photo_pane)
+        photo_layout.setContentsMargins(0, 0, 0, 0)
+        photo_layout.addWidget(self._build_banner())
         self.photo_view = PhotoView()
+        self.photo_view.setAccessibleName("Photo")
         self.photo_view.clicked_normalized.connect(self._on_photo_clicked)
-        left.addWidget(self.photo_view)
+        self.photo_view.context_requested.connect(self._on_photo_context)
+        photo_layout.addWidget(self.photo_view, stretch=1)
+        photo_layout.addWidget(self._build_legend())
 
-        legend_label = QLabel("\U0001F535 Normal confidence   \U0001F7E0 Low confidence — may need manual correction")
-        legend_label.setStyleSheet("color: #888; font-size: 11px;")
-        left.addWidget(legend_label)
-
-        left.addWidget(self._build_detect_group())
-        left.addWidget(self._build_person_group())
-        left.addWidget(self._build_export_group())
-        left.addWidget(self._build_live_link_group())
-        left.addStretch(1)
-
-        right = QVBoxLayout()
-        root.addLayout(right, stretch=2)
-        right.addWidget(QLabel("3D preview"))
+        preview_pane = QWidget()
+        preview_layout = QVBoxLayout(preview_pane)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_label = QLabel("3D preview (the exported rotations; faint dots are the raw landmarks)")
+        preview_label.setWordWrap(True)
+        preview_layout.addWidget(preview_label)
         self.viewport = SkeletonViewport()
-        right.addWidget(self.viewport, stretch=1)
+        self.viewport.setMinimumSize(240, 240)
+        self.viewport.setAccessibleName("3D preview")
+        preview_layout.addWidget(self.viewport, stretch=1)
+
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter.addWidget(controls_scroll)
+        self.splitter.addWidget(photo_pane)
+        self.splitter.addWidget(preview_pane)
+        self.splitter.setCollapsible(0, False)
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setStretchFactor(2, 1)
+        self.setCentralWidget(self.splitter)
 
         self.setStatusBar(QStatusBar())
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximumWidth(180)
+        self.progress_bar.setVisible(False)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.clicked.connect(self._on_cancel)
+        self.statusBar().addPermanentWidget(self.progress_bar)
+        self.statusBar().addPermanentWidget(self.cancel_btn)
         self.statusBar().showMessage("Ready")
+
+    def _build_banner(self) -> QWidget:
+        """A non-modal warning strip above the photo (F6): photo-quality notes
+        used to be a modal popup on every load."""
+        self.banner = QWidget()
+        self.banner.setStyleSheet("background:#5a4a1a; color:#fff3c4;")
+        layout = QHBoxLayout(self.banner)
+        layout.setContentsMargins(8, 4, 4, 4)
+        self.banner_label = QLabel()
+        self.banner_label.setWordWrap(True)
+        layout.addWidget(self.banner_label, stretch=1)
+        close = QToolButton()
+        close.setText("✕")
+        close.setAccessibleName("Dismiss warning")
+        close.clicked.connect(lambda: self.banner.setVisible(False))
+        layout.addWidget(close)
+        self.banner.setVisible(False)
+        return self.banner
+
+    def _build_legend(self) -> QWidget:
+        """Swatches drawn with the overlay's own colours and line styles (F3)."""
+        legend = QWidget()
+        layout = QGridLayout(legend)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setHorizontalSpacing(6)
+        layout.setVerticalSpacing(0)
+        for i, (color, style, text) in enumerate(legend_entries()):
+            swatch = QLabel()
+            swatch.setPixmap(legend_swatch(color, style))
+            row, column = divmod(i, 2)
+            layout.addWidget(swatch, row, 2 * column)
+            layout.addWidget(QLabel(text), row, 2 * column + 1)
+        layout.setColumnStretch(4, 1)
+        legend.setToolTip(
+            f"Low-confidence bones (visibility under {LOW_CONFIDENCE_THRESHOLD:.0%}) are dashed: the landmarks "
+            "behind them were likely hidden or out of frame, so check them before exporting. "
+            "Right-click a limb to flip its depth."
+        )
+        return legend
 
     def _build_detect_group(self) -> QGroupBox:
         group = QGroupBox("1. Load && Detect")
         layout = QVBoxLayout(group)
 
+        load_row = QHBoxLayout()
         self.load_btn = QPushButton("Load Photo...")
         self.load_btn.clicked.connect(self._on_load_photo)
-        layout.addWidget(self.load_btn)
+        load_row.addWidget(self.load_btn)
+        self.load_video_btn = QPushButton("Load Video...")
+        self.load_video_btn.setToolTip("Track one person through a video clip and export it as an animated BVH.")
+        self.load_video_btn.clicked.connect(self._on_load_video)
+        load_row.addWidget(self.load_video_btn)
+        layout.addLayout(load_row)
 
-        tips_label = QLabel("For best results:\n" + "\n".join(f"- {tip}" for tip in PHOTO_GUIDANCE))
+        # The tips used to be a permanent multi-line label; they're a toggle now
+        # so they don't cost the controls column its height.
+        tips_text = "For best results:\n" + "\n".join(f"- {tip}" for tip in PHOTO_GUIDANCE)
+        self.load_btn.setToolTip(tips_text)
+        self.tips_toggle = QPushButton("Photo tips")
+        self.tips_toggle.setCheckable(True)
+        self.tips_toggle.setFlat(True)
+        tips_label = QLabel(tips_text)
         tips_label.setWordWrap(True)
-        tips_label.setStyleSheet("color: #888; font-size: 11px;")
+        tips_label.setVisible(False)
+        self.tips_toggle.toggled.connect(tips_label.setVisible)
+        layout.addWidget(self.tips_toggle)
         layout.addWidget(tips_label)
 
         max_people_row = QHBoxLayout()
-        max_people_row.addWidget(QLabel("Max people to detect:"))
+        max_people_label = QLabel("Max &people to detect:")
+        max_people_row.addWidget(max_people_label)
         self.max_people_spin = QSpinBox()
         self.max_people_spin.setRange(1, 8)
         self.max_people_spin.setValue(4)
         self.max_people_spin.setToolTip(
             "A person beyond this count in a group photo won't be detected at all."
         )
+        max_people_label.setBuddy(self.max_people_spin)
         max_people_row.addWidget(self.max_people_spin)
         layout.addLayout(max_people_row)
 
         model_row = QHBoxLayout()
-        model_row.addWidget(QLabel("Model quality:"))
+        model_label = QLabel("Model &quality:")
+        model_row.addWidget(model_label)
         self.model_variant_combo = QComboBox()
-        self.model_variant_combo.addItems(["lite", "full", "heavy"])
+        self.model_variant_combo.addItems(list(MODEL_URLS))
         self.model_variant_combo.setCurrentText("full")
         self.model_variant_combo.setToolTip(
             "lite is fastest and best for low-end machines; heavy is the most accurate "
             "but slowest. Changing this after a solve rebuilds the pose model (and downloads "
             "it on first use) on the next Solve Pose."
         )
+        model_label.setBuddy(self.model_variant_combo)
         model_row.addWidget(self.model_variant_combo)
         layout.addLayout(model_row)
 
-        self.use_gpu_checkbox = QCheckBox("Use GPU (NVIDIA CUDA) when available")
+        self.use_gpu_checkbox = QCheckBox("Use &GPU when available")
         self.use_gpu_checkbox.setChecked(True)
         self.use_gpu_checkbox.setToolTip(
-            "Runs pose estimation on an NVIDIA GPU through ONNX Runtime's CUDA provider. "
-            "Falls back to the CPU automatically when no usable GPU/CUDA runtime is found -- "
-            "the status bar says which one each solve actually used."
+            "Runs pose estimation on the GPU through ONNX Runtime: DirectML (any DirectX 12 GPU) "
+            "in a DirectML build, CUDA (NVIDIA) in a CUDA build. Falls back to the CPU automatically "
+            "when no usable GPU runtime is found -- the status bar says which one each solve actually used."
         )
         layout.addWidget(self.use_gpu_checkbox)
 
+        self.group_photo_checkbox = QCheckBox("Group photo (slower)")
+        self.group_photo_checkbox.setToolTip(
+            "Also searches overlapping tiles of the photo, so people whose faces are only a few pixels "
+            "wide in a wide group shot are found. Without it, tiles are only tried when nobody is found."
+        )
+        layout.addWidget(self.group_photo_checkbox)
+
         self.solve_btn = QPushButton("Solve Pose")
+        self.solve_btn.setToolTip("Detect and solve every person in the photo (F5)")
         self.solve_btn.clicked.connect(self._on_solve_pose)
         self.solve_btn.setEnabled(False)
         layout.addWidget(self.solve_btn)
@@ -247,19 +665,27 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(group)
 
         person_row = QHBoxLayout()
-        person_row.addWidget(QLabel("Person:"))
+        person_label = QLabel("P&erson:")
+        person_row.addWidget(person_label)
         self.person_combo = QComboBox()
         self.person_combo.currentIndexChanged.connect(self._on_person_changed)
+        person_label.setBuddy(self.person_combo)
         person_row.addWidget(self.person_combo)
         layout.addLayout(person_row)
-        layout.addWidget(QLabel("(or click the person directly in the photo)"))
+        click_hint = QLabel("(or click the person in the photo; Page Up/Down cycles)")
+        click_hint.setWordWrap(True)
+        layout.addWidget(click_hint)
 
-        self.mirror_checkbox = QCheckBox("Mirror left/right (body orientation fix)")
+        self.mirror_checkbox = QCheckBox("&Mirror left/right")
+        self.mirror_checkbox.setToolTip(
+            "Body orientation fix: swaps the left and right sides if the estimate labeled them the wrong way round."
+        )
         self.mirror_checkbox.stateChanged.connect(self._on_person_changed)
         layout.addWidget(self.mirror_checkbox)
 
         orientation_row = QHBoxLayout()
-        orientation_row.addWidget(QLabel("Body orientation fix:"))
+        orientation_label = QLabel("Body &orientation fix:")
+        orientation_row.addWidget(orientation_label)
         self.orientation_combo = QComboBox()
         self.orientation_combo.addItems(list(ORIENTATION_CORRECTIONS.keys()))
         self.orientation_combo.setToolTip(
@@ -269,13 +695,86 @@ class MainWindow(QMainWindow):
             "the 3D preview and in every export."
         )
         self.orientation_combo.currentIndexChanged.connect(self._on_person_changed)
+        orientation_label.setBuddy(self.orientation_combo)
         orientation_row.addWidget(self.orientation_combo)
         layout.addLayout(orientation_row)
 
         return group
 
+    def _build_correction_group(self) -> QGroupBox:
+        """Manual correction (F4): rotate one bone about its own axes, and
+        (from the photo's right-click menu) flip a limb's depth."""
+        group = QGroupBox("3. Correct")
+        layout = QVBoxLayout(group)
+        hint = QLabel("Right-click a limb in the photo to flip its depth (toward / away from the camera).")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        bone_row = QHBoxLayout()
+        bone_label = QLabel("Adjust &bone:")
+        bone_row.addWidget(bone_label)
+        self.adjust_bone_combo = QComboBox()
+        self.adjust_bone_combo.addItems(BONE_NAMES)
+        self.adjust_bone_combo.currentIndexChanged.connect(lambda _i: self._sync_adjust_controls())
+        bone_label.setBuddy(self.adjust_bone_combo)
+        bone_row.addWidget(self.adjust_bone_combo)
+        layout.addLayout(bone_row)
+
+        angles_row = QHBoxLayout()
+        self.adjust_spins: list[QDoubleSpinBox] = []
+        for axis in "XYZ":
+            angles_row.addWidget(QLabel(axis))
+            spin = QDoubleSpinBox()
+            spin.setRange(-180.0, 180.0)
+            spin.setSingleStep(5.0)
+            spin.setDecimals(1)
+            spin.setSuffix("°")
+            spin.setKeyboardTracking(False)
+            spin.setAccessibleName(f"Rotate the bone about its own {axis} axis")
+            spin.setToolTip(
+                "Degrees about the bone's own axes, as in Blender: Y runs along the bone (twist), "
+                "X and Z bend it. Ctrl+Z undoes."
+            )
+            spin.valueChanged.connect(self._on_adjust_changed)
+            self.adjust_spins.append(spin)
+            angles_row.addWidget(spin)
+        layout.addLayout(angles_row)
+
+        reset_row = QHBoxLayout()
+        self.reset_bone_btn = QPushButton("Reset bone")
+        self.reset_bone_btn.clicked.connect(lambda: self._set_override(self.adjust_bone_combo.currentText(), None))
+        reset_row.addWidget(self.reset_bone_btn)
+        self.reset_edits_btn = QPushButton("Reset all edits")
+        self.reset_edits_btn.clicked.connect(self._on_reset_edits)
+        reset_row.addWidget(self.reset_edits_btn)
+        layout.addLayout(reset_row)
+        return group
+
+    def _build_video_group(self) -> QGroupBox:
+        group = QGroupBox("Video")
+        layout = QVBoxLayout(group)
+        frame_row = QHBoxLayout()
+        self.frame_slider = QSlider(Qt.Horizontal)
+        self.frame_slider.setRange(0, 0)
+        self.frame_slider.setAccessibleName("Video frame")
+        self.frame_slider.valueChanged.connect(self._on_frame_changed)
+        frame_row.addWidget(self.frame_slider, stretch=1)
+        self.frame_label = QLabel("no video")
+        frame_row.addWidget(self.frame_label)
+        layout.addLayout(frame_row)
+        self.export_animation_btn = QPushButton("Export Animation BVH...")
+        self.export_animation_btn.setToolTip(
+            "Every solved frame as one BVH animation, smoothed, standing on the floor, with planted feet "
+            "driving the root's motion."
+        )
+        self.export_animation_btn.clicked.connect(self._on_export_animation)
+        layout.addWidget(self.export_animation_btn)
+        self.video_group = group
+        group.setVisible(False)
+        return group
+
     def _build_export_group(self) -> QGroupBox:
-        group = QGroupBox("3. Export")
+        group = QGroupBox("4. Export")
         layout = QVBoxLayout(group)
 
         self.export_btn = QPushButton("Export Pose JSON...")
@@ -296,11 +795,12 @@ class MainWindow(QMainWindow):
         return group
 
     def _build_live_link_group(self) -> QGroupBox:
-        group = QGroupBox("4. Blender Live Link")
+        group = QGroupBox("5. Blender Live Link")
         layout = QVBoxLayout(group)
 
         live_link_row = QHBoxLayout()
-        live_link_row.addWidget(QLabel("Blender host:"))
+        host_label = QLabel("Blender &host:")
+        live_link_row.addWidget(host_label)
         self.live_link_host_edit = QLineEdit(live_link.DEFAULT_HOST)
         self.live_link_host_edit.setMaximumWidth(100)
         self.live_link_host_edit.setToolTip(
@@ -308,73 +808,287 @@ class MainWindow(QMainWindow):
             "only if PoseCraft and Blender already talk over some other configured "
             "loopback/tunnel, not to reach Blender on a different machine."
         )
+        host_label.setBuddy(self.live_link_host_edit)
         live_link_row.addWidget(self.live_link_host_edit)
-        live_link_row.addWidget(QLabel("port:"))
+        port_label = QLabel("po&rt:")
+        live_link_row.addWidget(port_label)
         self.live_link_port_spin = QSpinBox()
         self.live_link_port_spin.setRange(1, 65535)
         self.live_link_port_spin.setValue(live_link.DEFAULT_PORT)
         self.live_link_port_spin.setToolTip(
             "Must match the port set in Blender's PoseCraft panel before Live Link is started there."
         )
+        port_label.setBuddy(self.live_link_port_spin)
         live_link_row.addWidget(self.live_link_port_spin)
         layout.addLayout(live_link_row)
 
         self.send_to_blender_btn = QPushButton("Send to Blender (Live Link)")
+        self.send_to_blender_btn.setToolTip("Ctrl+B")
         self.send_to_blender_btn.clicked.connect(self._on_send_to_blender)
         self.send_to_blender_btn.setEnabled(False)
         layout.addWidget(self.send_to_blender_btn)
 
         return group
 
+    def _action(self, menu: QMenu, text: str, slot, shortcut=None, checkable: bool = False) -> QAction:
+        action = QAction(text, self)
+        if shortcut is not None:
+            shortcuts = shortcut if isinstance(shortcut, list) else [shortcut]
+            action.setShortcuts([QKeySequence(s) for s in shortcuts])
+        action.setCheckable(checkable)
+        action.triggered.connect(slot)
+        menu.addAction(action)
+        return action
+
+    def _build_menus(self) -> None:
+        """Menus with keyboard shortcuts (F7) for the load -> solve -> send loop."""
+        bar = self.menuBar()
+        file_menu = bar.addMenu("&File")
+        self.open_action = self._action(file_menu, "&Open Photo...", self._on_load_photo, QKeySequence.Open)
+        self.open_video_action = self._action(file_menu, "Open &Video...", self._on_load_video, "Ctrl+Shift+O")
+        self.recent_menu = file_menu.addMenu("Open &Recent")
+        file_menu.addSeparator()
+        self.export_action = self._action(file_menu, "&Export Pose JSON...", self._on_export_pose, "Ctrl+S")
+        self.export_bvh_action = self._action(file_menu, "Export &BVH...", self._on_export_bvh, "Ctrl+Shift+S")
+        self.export_all_action = self._action(file_menu, "Export &All People...", self._on_export_all)
+        file_menu.addSeparator()
+        self._action(file_menu, "&Quit", self.close, QKeySequence.Quit)
+
+        edit_menu = bar.addMenu("&Edit")
+        undo = self.undo_stack.createUndoAction(self, "&Undo")
+        undo.setShortcut(QKeySequence.Undo)
+        redo = self.undo_stack.createRedoAction(self, "&Redo")
+        redo.setShortcuts([QKeySequence.Redo, QKeySequence("Ctrl+Shift+Z")])
+        edit_menu.addAction(undo)
+        edit_menu.addAction(redo)
+
+        pose_menu = bar.addMenu("&Pose")
+        self.solve_action = self._action(pose_menu, "&Solve", self._on_solve_pose, ["F5", "Ctrl+Return"])
+        self.send_action = self._action(pose_menu, "Send to &Blender", self._on_send_to_blender, "Ctrl+B")
+        self.mirror_action = self._action(pose_menu, "&Mirror Left/Right", self.mirror_checkbox.toggle, "M")
+        self.next_person_action = self._action(pose_menu, "&Next Person", lambda: self._cycle_person(1), "PgDown")
+        self.previous_person_action = self._action(
+            pose_menu, "&Previous Person", lambda: self._cycle_person(-1), "PgUp"
+        )
+        self.cancel_action = self._action(pose_menu, "&Cancel", self._on_cancel, "Esc")
+
+        view_menu = bar.addMenu("&View")
+        self._action(view_menu, "&Frame Skeleton", self.viewport.frame_skeleton, "F")
+        self._action(view_menu, "Fro&nt", lambda: self.viewport.set_camera_preset("front"), "1")
+        self._action(view_menu, "&Side", lambda: self.viewport.set_camera_preset("side"), "3")
+        self._action(view_menu, "&Top", lambda: self.viewport.set_camera_preset("top"), "7")
+        self._action(view_menu, "&Reset Camera", lambda: self.viewport.set_camera_preset("default"), "0")
+        self.labels_action = self._action(view_menu, "Bone &Labels", self._on_toggle_labels, "L", checkable=True)
+
+    # -- settings (F7) --------------------------------------------------------------
+
+    def _restore_settings(self) -> None:
+        s = self._settings
+        self.live_link_host_edit.setText(str(s.value("live_link/host", live_link.DEFAULT_HOST)))
+        self.live_link_port_spin.setValue(int(s.value("live_link/port", live_link.DEFAULT_PORT)))
+        variant = str(s.value("detect/model", "full"))
+        if variant in MODEL_URLS:
+            self.model_variant_combo.setCurrentText(variant)
+        self.use_gpu_checkbox.setChecked(str(s.value("detect/use_gpu", "true")).lower() == "true")
+        self.max_people_spin.setValue(int(s.value("detect/max_people", 4)))
+        self.group_photo_checkbox.setChecked(str(s.value("detect/group_photo", "false")).lower() == "true")
+        geometry = s.value("window/geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        splitter = s.value("window/splitter")
+        if splitter is not None:
+            self.splitter.restoreState(splitter)
+        self._rebuild_recent_menu()
+
+    def _save_settings(self) -> None:
+        s = self._settings
+        s.setValue("live_link/host", self.live_link_host_edit.text().strip() or live_link.DEFAULT_HOST)
+        s.setValue("live_link/port", self.live_link_port_spin.value())
+        s.setValue("detect/model", self.model_variant_combo.currentText())
+        s.setValue("detect/use_gpu", "true" if self.use_gpu_checkbox.isChecked() else "false")
+        s.setValue("detect/max_people", self.max_people_spin.value())
+        s.setValue("detect/group_photo", "true" if self.group_photo_checkbox.isChecked() else "false")
+        s.setValue("window/geometry", self.saveGeometry())
+        s.setValue("window/splitter", self.splitter.saveState())
+        s.sync()
+
+    def _recent_files(self) -> list[str]:
+        value = self._settings.value("recent_files", [])
+        if isinstance(value, str):
+            value = [value]
+        return [str(v) for v in (value or [])]
+
+    def _remember_file(self, path: str) -> None:
+        self._settings.setValue("recent_files", _update_recent_files(self._recent_files(), path))
+        self._settings.setValue("last_dir", str(Path(path).parent))
+        self._rebuild_recent_menu()
+
+    def _rebuild_recent_menu(self) -> None:
+        self.recent_menu.clear()
+        recent = self._recent_files()
+        for path in recent:
+            action = self.recent_menu.addAction(Path(path).name)
+            action.setToolTip(path)
+            action.triggered.connect(lambda _checked=False, p=path: self.open_path(p))
+        self.recent_menu.setEnabled(bool(recent))
+
+    def _last_dir(self) -> str:
+        return str(self._settings.value("last_dir", ""))
+
+    # -- busy / enabled state (C1) --------------------------------------------------
+
+    def _set_busy(self, busy: bool, message: str = "", cancellable: bool = True) -> None:
+        """One place for "a background solve is running": what it disables (a new
+        photo mid-solve would let this solve's results land on it; the model,
+        device and people count are baked into the running worker), the
+        progress bar (indeterminate until a download reports progress), the
+        Cancel button and the busy cursor."""
+        for widget in (
+            self.load_btn, self.load_video_btn, self.solve_btn, self.max_people_spin,
+            self.model_variant_combo, self.use_gpu_checkbox, self.group_photo_checkbox,
+        ):
+            widget.setEnabled(not busy)
+        for action in (self.open_action, self.open_video_action, self.solve_action, self.recent_menu.menuAction()):
+            action.setEnabled(not busy)
+        if not busy:
+            self.solve_btn.setEnabled(self._image_bgr is not None)
+            self.solve_action.setEnabled(self._image_bgr is not None)
+            self.recent_menu.setEnabled(bool(self._recent_files()))
+        self.progress_bar.setVisible(busy)
+        self.progress_bar.setRange(0, 0)  # indeterminate until progress arrives
+        self.cancel_btn.setVisible(busy and cancellable)
+        self.cancel_action.setEnabled(busy and cancellable)
+        if busy:
+            self.setCursor(Qt.BusyCursor)
+            if message:
+                self.statusBar().showMessage(message)
+        else:
+            self.unsetCursor()
+
+    def _set_result_actions_enabled(self, has_person: bool) -> None:
+        """Everything that needs a solved, selected person (and Export All, which
+        needs any people)."""
+        for widget in (self.export_btn, self.export_bvh_btn, self.send_to_blender_btn, self.reset_bone_btn,
+                       self.reset_edits_btn, self.adjust_bone_combo, *self.adjust_spins):
+            widget.setEnabled(has_person)
+        for action in (self.export_action, self.export_bvh_action, self.send_action,
+                       self.next_person_action, self.previous_person_action):
+            action.setEnabled(has_person)
+        has_people = bool(self._people) and self._video is None
+        self.export_all_btn.setEnabled(has_people)
+        self.export_all_action.setEnabled(has_people)
+        self.export_animation_btn.setEnabled(self._video is not None and bool(self._video.solved_frames()))
+
+    def _worker_running(self) -> bool:
+        return any(w is not None and w.isRunning() for w in (self._worker, self._video_worker))
+
+    # -- closing -------------------------------------------------------------------
+
     def closeEvent(self, event) -> None:
         # Closing the shared PoseEstimator while a background thread is still
         # calling into it (or destroying a QThread object while it's still
-        # running) is unsafe -- block briefly and let any in-flight work finish
-        # first. Solves and Live Link sends are both short (seconds at most),
-        # so this is a bounded wait, not an indefinite freeze.
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.wait()
-        if self._send_worker is not None and self._send_worker.isRunning():
-            self._send_worker.wait()
+        # running) is unsafe, so in-flight work gets to finish first -- but
+        # never with an unbounded wait: a model download stalled in a network
+        # read used to make the window unclosable. Ask the solve to cancel and
+        # wait up to _CLOSE_WAIT_MS; if a worker is still running after that,
+        # hide the window now and finish closing when the worker returns (the
+        # download's socket timeout bounds how long that can take).
+        self._closing = True
+        workers = (self._worker, self._video_worker, self._warmup_worker, self._send_worker)
+        running = [w for w in workers if w is not None and w.isRunning()]
+        for worker in running:
+            if hasattr(worker, "cancel"):
+                worker.cancel()
+        still_running = [w for w in running if not w.wait(_CLOSE_WAIT_MS)]
+        if still_running:
+            self.hide()
+            for worker in still_running:
+                worker.finished.connect(self.close)
+            event.ignore()
+            return
+        try:
+            self._save_settings()
+        except Exception:  # noqa: BLE001 -- settings must never block closing
+            log.exception("could not save settings")
         if self._estimator is not None:
             self._estimator.close()
         super().closeEvent(event)
+
+    # -- loading ---------------------------------------------------------------------
+
+    def dragEnterEvent(self, event) -> None:
+        if self._dropped_path(event.mimeData()) is not None and not self._worker_running():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:
+        path = self._dropped_path(event.mimeData())
+        if path is not None:
+            event.acceptProposedAction()
+            self.open_path(path)
+
+    @staticmethod
+    def _dropped_path(mime) -> str | None:
+        """The first dropped local file that's a photo or a video, if any."""
+        if not mime.hasUrls():
+            return None
+        for url in mime.urls():
+            if url.isLocalFile() and Path(url.toLocalFile()).suffix.lower() in PHOTO_SUFFIXES + VIDEO_SUFFIXES:
+                return url.toLocalFile()
+        return None
+
+    def open_path(self, path: str) -> None:
+        """Opens a photo or a video by extension (drag-and-drop, recent files)."""
+        if Path(path).suffix.lower() in VIDEO_SUFFIXES:
+            self.load_video(path)
+        else:
+            self.load_photo(path)
 
     def _on_load_photo(self) -> None:
         # Guards against the same race closeEvent guards against: loading a new
         # photo while a solve for the OLD photo is still running would let that
         # solve's results land on the new photo once it finishes, and risks two
         # threads calling the shared PoseEstimator concurrently. load_btn is
-        # disabled for the duration of a solve (see _on_solve_pose) so this
+        # disabled for the duration of a solve (see _set_busy) so this
         # shouldn't be reachable from the UI, but checking here too costs nothing.
-        if self._worker is not None and self._worker.isRunning():
+        if self._worker_running():
             return
+        path, _ = QFileDialog.getOpenFileName(self, "Load Photo", self._last_dir(), _PHOTO_FILTER)
+        if path:
+            self.load_photo(path)
 
-        path, _ = QFileDialog.getOpenFileName(self, "Load Photo", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff)")
-        if not path:
-            return
-
+    def load_photo(self, path: str) -> bool:
+        if self._worker_running():
+            return False
         image_bgr = imread_unicode(path)
         if image_bgr is None:
             QMessageBox.warning(self, "Load Photo", f"Could not read image:\n{path}")
-            return
+            return False
 
+        self._clear_video()
         self._image_bgr = image_bgr
+        self._source_path = path
         self._set_photo_preview(image_bgr)
+        self._clear_results()
         self.solve_btn.setEnabled(True)
-        self.export_btn.setEnabled(False)
-        self.export_all_btn.setEnabled(False)
-        self.export_bvh_btn.setEnabled(False)
-        self.send_to_blender_btn.setEnabled(False)
-        self.person_combo.clear()
-        self._people = []
-        self.viewport.clear_skeleton()
-        self.photo_view.set_skeleton_overlay([])
+        self.solve_action.setEnabled(True)
+        self._remember_file(path)
         self.statusBar().showMessage(f"Loaded {Path(path).name}")
 
         quality_warnings = assess_photo_quality(image_bgr)
-        if quality_warnings:
-            QMessageBox.warning(self, "Photo Quality", "\n\n".join(quality_warnings))
+        self.banner_label.setText("\n".join(quality_warnings))
+        self.banner.setVisible(bool(quality_warnings))
+        return True
+
+    def _clear_results(self) -> None:
+        self.person_combo.blockSignals(True)
+        self.person_combo.clear()
+        self.person_combo.blockSignals(False)
+        self._people = []
+        self._edits = {}
+        self.undo_stack.clear()
+        self.viewport.clear_skeleton()
+        self.photo_view.set_skeleton_overlay([])
+        self._set_result_actions_enabled(False)
 
     def _set_photo_preview(self, image_bgr: np.ndarray) -> None:
         rgb = np.ascontiguousarray(image_bgr[:, :, ::-1])
@@ -382,78 +1096,86 @@ class MainWindow(QMainWindow):
         qimage = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
         self.photo_view.set_source_pixmap(QPixmap.fromImage(qimage))
 
-    def _on_solve_pose(self) -> None:
-        if self._image_bgr is None:
-            return
-        if self._worker is not None and self._worker.isRunning():
-            return  # defense in depth -- solve_btn being disabled should already prevent this
+    # -- solving -----------------------------------------------------------------------
 
-        max_people = self.max_people_spin.value()
-        model_variant = self.model_variant_combo.currentText()
-        use_gpu = self.use_gpu_checkbox.isChecked()
-        if self._estimator is not None and (
-            self._estimator.model_path != model_cache_path(model_variant) or self._estimator.use_gpu != use_gpu
-        ):
-            # The model weights and the execution device are both fixed when the
-            # ONNX Runtime sessions are created -- changing either means the cached
-            # estimator can't be reused as-is.
+    def _estimator_matches(self, estimator: PoseEstimator | None) -> bool:
+        return (
+            estimator is not None
+            and getattr(estimator, "variant", None) == self.model_variant_combo.currentText()
+            and estimator.use_gpu == self.use_gpu_checkbox.isChecked()
+        )
+
+    def _take_estimator(self) -> PoseEstimator | None:
+        """The cached estimator if it still matches the chosen model and device
+        (both are fixed when the ONNX Runtime sessions are created); otherwise
+        it's closed and None is returned, so the worker builds a new one."""
+        if self._estimator is not None and not self._estimator_matches(self._estimator):
             self._estimator.close()
             self._estimator = None
-        if self._estimator is not None:
-            self._estimator.max_people = max_people  # applied per call, no rebuild needed
+        return self._estimator
 
-        self.solve_btn.setEnabled(False)
-        self.load_btn.setEnabled(False)  # a new photo mid-solve would let this solve's results land on it
-        self.max_people_spin.setEnabled(False)
-        self.model_variant_combo.setEnabled(False)
-        self.use_gpu_checkbox.setEnabled(False)
-        first_run_note = "" if self._estimator is not None else " (loading the model -- the first run also downloads it)"
-        self.statusBar().showMessage(f"Solving pose...{first_run_note}")
+    def _on_solve_pose(self) -> None:
+        if self._image_bgr is None or self._worker_running():
+            return  # defense in depth -- solve_btn being disabled should already prevent this
+        if self._warmup_worker is not None and self._warmup_worker.isRunning():
+            # The model is being prepared already; solve as soon as it's ready.
+            self._pending_solve = True
+            self._set_busy(True, "Preparing the pose model...", cancellable=False)
+            return
 
-        self._worker = SolveWorker(self._image_bgr, self._estimator, max_people, model_variant, use_gpu)
+        estimator = self._take_estimator()
+        first_run_note = "" if estimator is not None else " (loading the model -- the first run also downloads it)"
+        self._set_busy(True, f"Solving pose...{first_run_note}")
+
+        self._worker = SolveWorker(
+            self._image_bgr,
+            estimator,
+            self.max_people_spin.value(),
+            self.model_variant_combo.currentText(),
+            self.use_gpu_checkbox.isChecked(),
+            self.group_photo_checkbox.isChecked(),
+        )
         self._worker.finished_ok.connect(self._on_solve_finished)
         self._worker.failed.connect(self._on_solve_failed)
+        self._worker.cancelled.connect(self._on_solve_cancelled)
         self._worker.progress.connect(self._on_solve_progress)
         self._worker.start()
 
+    def _on_cancel(self) -> None:
+        for worker in (self._worker, self._video_worker):
+            if worker is not None and worker.isRunning():
+                worker.cancel()
+                self.statusBar().showMessage("Cancelling...")
+
     def _on_solve_progress(self, downloaded: int, total: int) -> None:
         if total > 0:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(downloaded * 100 // total)
             self.statusBar().showMessage(f"Downloading pose model... {downloaded * 100 // total}%")
         else:
             self.statusBar().showMessage(f"Downloading pose model... {downloaded // 1024} KB")
 
     def _on_solve_finished(self, people: list[DetectedPerson], estimator: PoseEstimator) -> None:
-        self.solve_btn.setEnabled(True)
-        self.load_btn.setEnabled(True)
-        self.max_people_spin.setEnabled(True)
-        self.model_variant_combo.setEnabled(True)
-        self.use_gpu_checkbox.setEnabled(True)
-        self._people = people
+        if self._closing:
+            if estimator is not self._estimator:
+                estimator.close()
+            return
+        self._set_busy(False)
+        self._clear_video()
         self._estimator = estimator
+        self._clear_results()
+        self._people = people
 
         if not people:
             # Clear everything the previous solve left behind -- the person list,
             # photo overlay, 3D skeleton and export buttons all still referred to
             # people from the last solve, which no longer exist.
-            self.person_combo.blockSignals(True)
-            self.person_combo.clear()
-            self.person_combo.blockSignals(False)
-            self.viewport.clear_skeleton()
-            self.photo_view.set_skeleton_overlay([])
-            for button in (self.export_btn, self.export_all_btn, self.export_bvh_btn, self.send_to_blender_btn):
-                button.setEnabled(False)
             self.statusBar().showMessage(f"No person detected in this photo (ran on {estimator.device})")
-            QMessageBox.information(self, "Solve Pose", "No person was detected in this photo.")
+            if not self._closing:
+                QMessageBox.information(self, "Solve Pose", "No person was detected in this photo.")
             return
 
-        self.person_combo.blockSignals(True)
-        self.person_combo.clear()
-        for i in range(len(people)):
-            self.person_combo.addItem(f"Person {i + 1}")
-        self.person_combo.blockSignals(False)
-        self.person_combo.setCurrentIndex(0)
-
-        self.export_all_btn.setEnabled(True)
+        self._fill_person_combo()
         status = f"Solved {len(people)} pose(s) on {estimator.device}"
         if len(people) >= estimator.max_people:
             status += (
@@ -468,29 +1190,236 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(status)
         self._update_preview_for_selected_person()
 
+    def _fill_person_combo(self) -> None:
+        self.person_combo.blockSignals(True)
+        self.person_combo.clear()
+        for i, person in enumerate(self._people):
+            self.person_combo.addItem(_person_label(i, bone_confidence(person.visibility)))
+        self.person_combo.blockSignals(False)
+        self.person_combo.setCurrentIndex(0)
+
     def _on_solve_failed(self, message: str) -> None:
-        self.solve_btn.setEnabled(True)
-        self.load_btn.setEnabled(True)
-        self.max_people_spin.setEnabled(True)
-        self.model_variant_combo.setEnabled(True)
-        self.use_gpu_checkbox.setEnabled(True)
+        self._set_busy(False)
         self.statusBar().showMessage("Solve failed")
-        QMessageBox.critical(self, "Solve Pose", f"Pose solving failed:\n{message}")
+        if self._closing:
+            return  # cancelled by closeEvent -- not an error worth a dialog
+        QMessageBox.critical(
+            self, "Solve Pose", f"Pose solving failed:\n{message}\n\nDetails are in the log: {log_file_hint()}"
+        )
+
+    def _on_solve_cancelled(self) -> None:
+        self._set_busy(False)
+        self.statusBar().showMessage("Cancelled")
+
+    # -- warm-up (P3) ------------------------------------------------------------------
+
+    def _start_warm_up(self) -> None:
+        variant = self.model_variant_combo.currentText()
+        if not is_model_available(variant):
+            return  # never download in the background; the first Solve does it, with progress
+        self._warmup_worker = WarmUpWorker(variant, self.use_gpu_checkbox.isChecked(), self.max_people_spin.value())
+        self._warmup_worker.finished_ok.connect(self._on_warm_up_finished)
+        self._warmup_worker.failed.connect(self._on_warm_up_failed)
+        self.statusBar().showMessage("Preparing the pose model in the background...")
+        self._warmup_worker.start()
+
+    def _on_warm_up_finished(self, estimator: PoseEstimator) -> None:
+        if self._closing:
+            estimator.close()
+            return
+        if self._estimator is None and self._estimator_matches(estimator):
+            self._estimator = estimator
+            self.statusBar().showMessage(f"Ready -- pose model loaded on {estimator.device}")
+        else:
+            estimator.close()  # the model or device was changed meanwhile
+        self._resume_pending_solve()
+
+    def _on_warm_up_failed(self, message: str) -> None:
+        if not self._closing:
+            self.statusBar().showMessage("Ready")
+        self._resume_pending_solve()
+
+    def _resume_pending_solve(self) -> None:
+        if self._pending_solve and not self._closing:
+            self._pending_solve = False
+            self._set_busy(False)
+            self._on_solve_pose()
+
+    # -- video (B12) --------------------------------------------------------------------
+
+    def _on_load_video(self) -> None:
+        if self._worker_running():
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Load Video", self._last_dir(), _VIDEO_FILTER)
+        if path:
+            self.load_video(path)
+
+    def load_video(self, path: str) -> None:
+        if self._worker_running():
+            return
+        self._remember_file(path)
+        estimator = self._take_estimator()
+        self._set_busy(True, f"Tracking {Path(path).name}...")
+        self._video_worker = VideoSolveWorker(
+            path, estimator, self.model_variant_combo.currentText(), self.use_gpu_checkbox.isChecked()
+        )
+        self._video_worker.finished_ok.connect(self._on_video_finished)
+        self._video_worker.failed.connect(self._on_video_failed)
+        self._video_worker.cancelled.connect(self._on_solve_cancelled)
+        self._video_worker.progress.connect(self._on_video_progress)
+        self._video_worker.start()
+
+    def _on_video_progress(self, done: int, total: int) -> None:
+        if total > 0:
+            self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(done)
+        self.statusBar().showMessage(f"Tracking frame {done}" + (f" of {total}" if total else "") + "...")
+
+    def _on_video_finished(self, result, estimator: PoseEstimator) -> None:
+        if self._closing:
+            if estimator is not self._estimator:
+                estimator.close()
+            return
+        self._set_busy(False)
+        self._estimator = estimator
+        self._image_bgr = None
+        self._source_path = result.path
+        self._clear_results()
+        self._video = result
+        solved = len(result.solved_frames())
+        self.video_group.setVisible(True)
+        self.frame_slider.blockSignals(True)
+        self.frame_slider.setRange(0, max(0, len(result.frames) - 1))
+        self.frame_slider.setValue(0)
+        self.frame_slider.blockSignals(False)
+        self._on_frame_changed(0)
+        self.statusBar().showMessage(
+            f"Tracked {solved} of {len(result.frames)} frames at {result.fps:.0f} fps on {estimator.device}"
+        )
+
+    def _on_video_failed(self, message: str) -> None:
+        self._set_busy(False)
+        self.statusBar().showMessage("Video failed")
+        if not self._closing:
+            QMessageBox.critical(self, "Load Video", f"Could not track the video:\n{message}")
+
+    def _clear_video(self) -> None:
+        self._video = None
+        self.video_group.setVisible(False)
+        self.frame_label.setText("no video")
+
+    def _on_frame_changed(self, index: int) -> None:
+        if self._video is None or not (0 <= index < len(self._video.frames)):
+            return
+        frame = self._video.frames[index]
+        self.frame_label.setText(f"{index + 1}/{len(self._video.frames)}")
+        image = self._read_video_frame(index)
+        if image is not None:
+            self._set_photo_preview(image)
+        selected = self.person_combo.currentIndex()
+        self._people = [frame.person] if frame.person is not None else []
+        self.person_combo.blockSignals(True)
+        self.person_combo.clear()
+        for i, person in enumerate(self._people):
+            self.person_combo.addItem(_person_label(i, bone_confidence(person.visibility)))
+        self.person_combo.blockSignals(False)
+        if self._people:
+            self.person_combo.setCurrentIndex(max(0, selected))
+        self._update_preview_for_selected_person()
+
+    def _read_video_frame(self, index: int) -> np.ndarray | None:
+        import cv2
+
+        capture = cv2.VideoCapture(self._video.path)
+        try:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+            ok, image = capture.read()
+            return image if ok else None
+        finally:
+            capture.release()
+
+    def _on_export_animation(self) -> None:
+        if self._video is None:
+            return
+        people = [frame.person for frame in self._video.solved_frames()]
+        if not people:
+            return
+        from pose_craft.estimation.video import animation_root_positions
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Animation BVH", str(Path(self._last_dir()) / f"{Path(self._video.path).stem}.bvh"), "BVH (*.bvh)"
+        )
+        if not path:
+            return
+        edits = self._edits.get(0)
+        frames = [
+            self._document_inputs_for(
+                p.landmarks, p.visibility, self.mirror_checkbox.isChecked(), self._orientation_correction(), edits
+            )[0]
+            for p in people
+        ]
+        try:
+            save_bvh_animation(
+                frames, path, frame_time=1.0 / self._video.fps, root_positions=animation_root_positions(frames, self._video.fps)
+            )
+        except OSError as exc:
+            self._report_export_error("Export Animation BVH", path, exc)
+            return
+        self.statusBar().showMessage(f"Exported {len(frames)} frames to {path}")
+
+    # -- selection -----------------------------------------------------------------------
 
     def _on_person_changed(self) -> None:
         self._update_preview_for_selected_person()
 
+    def _cycle_person(self, step: int) -> None:
+        count = self.person_combo.count()
+        if count:
+            self.person_combo.setCurrentIndex((self.person_combo.currentIndex() + step) % count)
+
+    def _photo_aspect(self) -> float:
+        if self._image_bgr is not None:
+            h, w = self._image_bgr.shape[:2]
+            return w / h
+        if self._video is not None:
+            w, h = self._video.frame_size
+            return w / h if h else 1.0
+        return 1.0
+
     def _on_photo_clicked(self, x: float, y: float) -> None:
         if not self._people:
             return
-        index = _nearest_person_index(self._people, x, y)
-        self.person_combo.setCurrentIndex(index)  # triggers _on_person_changed via the signal
+        joints = [image_joint_positions_2d(person.image_landmarks_xy) for person in self._people]
+        index = _person_at(joints, x, y, self._photo_aspect())
+        if index is not None:
+            self.person_combo.setCurrentIndex(index)  # triggers _on_person_changed via the signal
+
+    def _on_photo_context(self, x: float, y: float, global_pos) -> None:
+        """Right-click a limb (F4): offer to flip that limb's depth."""
+        if not self._people:
+            return
+        joints = [image_joint_positions_2d(person.image_landmarks_xy) for person in self._people]
+        index = _person_at(joints, x, y, self._photo_aspect())
+        if index is None:
+            return
+        self.person_combo.setCurrentIndex(index)
+        bone, _distance = _nearest_bone(joints[index], x, y, self._photo_aspect(), FLIPPABLE_BONES)
+        menu = QMenu(self)
+        flipped = bone in self._person_edits(index).flipped
+        action = menu.addAction(f"{'Unflip' if flipped else 'Flip'} depth: {bone}")
+        action.triggered.connect(lambda: self.flip_bone_depth(index, bone))
+        reset = menu.addAction("Reset all edits for this person")
+        reset.setEnabled(not self._person_edits(index).is_empty())
+        reset.triggered.connect(self._on_reset_edits)
+        menu.exec(global_pos)
 
     def _selected_landmarks(self) -> np.ndarray | None:
         index = self.person_combo.currentIndex()
         if index < 0 or index >= len(self._people):
             return None
         landmarks = self._people[index].landmarks
+        for bone in sorted(self._person_edits(index).flipped):
+            landmarks = flip_limb_depth(landmarks, bone)
         if self.mirror_checkbox.isChecked():
             landmarks = mirror_landmarks(landmarks)
         return landmarks
@@ -501,31 +1430,23 @@ class MainWindow(QMainWindow):
     def _update_preview_for_selected_person(self) -> None:
         landmarks = self._selected_landmarks()
         if landmarks is None:
-            self.export_btn.setEnabled(False)
-            self.export_bvh_btn.setEnabled(False)
-            self.send_to_blender_btn.setEnabled(False)
+            self._set_result_actions_enabled(False)
             self.photo_view.set_skeleton_overlay([])
+            self.viewport.clear_skeleton()
             return
 
-        positions = joint_positions(landmarks)
-        # Same body-orientation fix applied to the exported rotations below, kept
-        # live in the 3D preview -- joint_positions() works directly off raw
-        # landmark positions (not a rotations dict), so the correction has to be
-        # applied as a position-space rotation here rather than reused as-is.
-        positions = rotate_joint_positions(positions, self._orientation_correction(), pivot=positions["spine.head"])
+        # The preview draws the exported rotations themselves (forward
+        # kinematics), with the raw landmarks as a faint ghost, so whatever the
+        # export gets wrong shows up here before the user exports it. The
+        # rotations already carry the mirror, orientation and manual fixes.
         selected_index = self.person_combo.currentIndex()
-        selected_confidence = None
-        if selected_index >= 0:
-            # Mirrored the same way the landmarks are (see _document_inputs_for),
-            # so the preview's low-confidence coloring follows the mirrored limbs.
-            visibility = self._people[selected_index].visibility
-            if self.mirror_checkbox.isChecked():
-                visibility = mirror_landmarks(visibility)
-            selected_confidence = bone_confidence(visibility)
-        self.viewport.show_skeleton(positions, confidence=selected_confidence)
-        self.export_btn.setEnabled(True)
-        self.export_bvh_btn.setEnabled(True)
-        self.send_to_blender_btn.setEnabled(True)
+        rotations, selected_confidence = self._current_person_document_inputs()
+        positions, ghost = _preview_positions(landmarks, rotations, self._orientation_correction())
+        self.viewport.show_skeleton(
+            positions, confidence=selected_confidence, ghost_points=ghost, lateral_axes=bone_lateral_axes(rotations)
+        )
+        self._set_result_actions_enabled(True)
+        self._sync_adjust_controls()
 
         self.photo_view.set_skeleton_overlay([
             PhotoOverlayPerson(
@@ -535,10 +1456,79 @@ class MainWindow(QMainWindow):
             )
             for i, person in enumerate(self._people)
         ])
+        self.photo_view.setAccessibleDescription(self._overlay_description(selected_index, selected_confidence))
+
+    def _overlay_description(self, selected_index: int, confidence: dict[str, float]) -> str:
+        low = [name for name, score in confidence.items() if score < LOW_CONFIDENCE_THRESHOLD]
+        text = f"{len(self._people)} people detected; Person {selected_index + 1} selected"
+        if low:
+            text += f"; {len(low)} low-confidence bones: {', '.join(low)}"
+        return text
+
+    def _on_toggle_labels(self, checked: bool) -> None:
+        self.viewport.show_labels = checked
+        self._update_preview_for_selected_person()
+
+    # -- manual correction (F4) ------------------------------------------------------------
+
+    def _person_edits(self, index: int) -> PersonEdits:
+        return self._edits.get(index, PersonEdits())
+
+    def _set_person_edits(self, index: int, edits: PersonEdits) -> None:
+        """Used by the undo commands: stores the edits and refreshes everything."""
+        if edits.is_empty():
+            self._edits.pop(index, None)
+        else:
+            self._edits[index] = edits
+        if index == self.person_combo.currentIndex():
+            self._update_preview_for_selected_person()
+
+    def _push_edit(self, index: int, after: PersonEdits, text: str) -> None:
+        before = self._person_edits(index)
+        if after != before:
+            self.undo_stack.push(_EditCommand(self, index, before, after, text))
+
+    def flip_bone_depth(self, index: int, bone: str) -> None:
+        """Toggles a limb's depth flip for one person, as an undo step."""
+        self._push_edit(index, self._person_edits(index).with_flip_toggled(bone), f"Flip depth of {bone}")
+
+    def _set_override(self, bone: str, angles: tuple[float, float, float] | None) -> None:
+        index = self.person_combo.currentIndex()
+        if index < 0 or index >= len(self._people):
+            return
+        text = f"Reset {bone}" if angles is None else f"Rotate {bone}"
+        self._push_edit(index, self._person_edits(index).with_override(bone, angles), text)
+
+    def _on_adjust_changed(self, _value: float) -> None:
+        if self._syncing_adjust:
+            return
+        self._set_override(self.adjust_bone_combo.currentText(), tuple(spin.value() for spin in self.adjust_spins))
+
+    def _sync_adjust_controls(self) -> None:
+        """Shows the selected bone's stored adjustment in the spin boxes."""
+        index = self.person_combo.currentIndex()
+        angles = self._person_edits(index).override_for(self.adjust_bone_combo.currentText())
+        self._syncing_adjust = True
+        try:
+            for spin, value in zip(self.adjust_spins, angles):
+                spin.setValue(value)
+        finally:
+            self._syncing_adjust = False
+
+    def _on_reset_edits(self) -> None:
+        index = self.person_combo.currentIndex()
+        if 0 <= index < len(self._people):
+            self._push_edit(index, PersonEdits(), "Reset all edits")
+
+    # -- export -------------------------------------------------------------------------
 
     @staticmethod
     def _document_inputs_for(
-        landmarks: np.ndarray, visibility: np.ndarray, mirror: bool, orientation_correction=None
+        landmarks: np.ndarray,
+        visibility: np.ndarray,
+        mirror: bool,
+        orientation_correction=None,
+        edits: PersonEdits | None = None,
     ) -> tuple[dict, dict]:
         """Shared by _current_person_document_inputs (the selected person) and
         _on_export_all (every detected person): mirror_landmarks swaps the
@@ -553,15 +1543,28 @@ class MainWindow(QMainWindow):
         skeleton.apply_orientation_correction -- composed onto the root bone's
         rotation so every export (JSON, BVH, Live Link) agrees with what's shown
         on screen.
+
+        edits: the person's manual corrections (F4) -- depth flips on the raw
+        landmarks before mirroring (they name what was clicked in the photo),
+        bone adjustments on the solved rotations.
         """
+        landmarks = MainWindow._edited_landmarks(landmarks, edits)
         if mirror:
             landmarks = mirror_landmarks(landmarks)
             visibility = mirror_landmarks(visibility)
-        rotations = solve_bone_rotations(landmarks)
+        rotations = solve_bone_rotations(landmarks, visibility=visibility)
+        if edits is not None and edits.overrides:
+            rotations = apply_bone_overrides(rotations, edits.override_rotations())
         if orientation_correction is not None:
             rotations = apply_orientation_correction(rotations, orientation_correction)
         confidence = bone_confidence(visibility)
         return rotations, confidence
+
+    @staticmethod
+    def _edited_landmarks(landmarks: np.ndarray, edits: PersonEdits | None) -> np.ndarray:
+        for bone in sorted(edits.flipped) if edits is not None else ():
+            landmarks = flip_limb_depth(landmarks, bone)
+        return landmarks
 
     def _current_person_document_inputs(self):
         index = self.person_combo.currentIndex()
@@ -569,27 +1572,56 @@ class MainWindow(QMainWindow):
             return None
         person = self._people[index]
         return self._document_inputs_for(
-            person.landmarks, person.visibility, self.mirror_checkbox.isChecked(), self._orientation_correction()
+            person.landmarks,
+            person.visibility,
+            self.mirror_checkbox.isChecked(),
+            self._orientation_correction(),
+            self._person_edits(index),
         )
+
+    def _root_for(self, index: int, rotations: dict) -> tuple[float, float]:
+        """(hip_height, leg_length) in meters for person `index`'s export (B6)."""
+        person = self._people[index]
+        landmarks = self._edited_landmarks(person.landmarks, self._person_edits(index))
+        if self.mirror_checkbox.isChecked():
+            landmarks = mirror_landmarks(landmarks)
+        return root_measurements(rotations, landmarks)
+
+    def _export_path(self, title: str, name: str, file_filter: str) -> str:
+        path, _ = QFileDialog.getSaveFileName(self, title, str(Path(self._last_dir()) / name), file_filter)
+        if path:
+            self._settings.setValue("last_dir", str(Path(path).parent))
+        return path
 
     def _on_export_pose(self) -> None:
         inputs = self._current_person_document_inputs()
         if inputs is None:
             return
         rotations, confidence = inputs
+        index = self.person_combo.currentIndex()
 
-        path, _ = QFileDialog.getSaveFileName(self, "Export Pose JSON", "pose.json", "Pose JSON (*.json)")
+        path = self._export_path(
+            "Export Pose JSON", default_export_name(self._source_path, index, ".json"), "Pose JSON (*.json)"
+        )
         if not path:
             return
 
-        save_pose_file(rotations, path, source_note="Exported from PoseCraft", bone_confidence=confidence)
+        hip_height, leg_length = self._root_for(index, rotations)
+        try:
+            save_pose_file(
+                rotations, path, source_note="Exported from PoseCraft", bone_confidence=confidence,
+                hip_height=hip_height, leg_length=leg_length,
+            )
+        except OSError as exc:
+            self._report_export_error("Export Pose JSON", path, exc)
+            return
         self.statusBar().showMessage(f"Exported pose to {path}")
 
     def _on_export_all(self) -> None:
         if not self._people:
             return
 
-        directory = QFileDialog.getExistingDirectory(self, "Export All Poses To Folder")
+        directory = QFileDialog.getExistingDirectory(self, "Export All Poses To Folder", self._last_dir())
         if not directory:
             return
 
@@ -599,13 +1631,26 @@ class MainWindow(QMainWindow):
         # _current_person_document_inputs().
         mirror = self.mirror_checkbox.isChecked()
         orientation_correction = self._orientation_correction()
+        paths = [Path(directory) / default_export_name(self._source_path, i, ".json") for i in range(len(self._people))]
+        existing = [p for p in paths if p.exists()]
+        if existing and QMessageBox.question(
+            self, "Export All People", f"Overwrite {len(existing)} existing file(s) in\n{directory}?"
+        ) != QMessageBox.Yes:
+            return
 
-        for index, person in enumerate(self._people):
+        for index, (person, path) in enumerate(zip(self._people, paths)):
             rotations, confidence = self._document_inputs_for(
-                person.landmarks, person.visibility, mirror, orientation_correction
+                person.landmarks, person.visibility, mirror, orientation_correction, self._person_edits(index)
             )
-            path = Path(directory) / f"pose_person{index + 1}.json"
-            save_pose_file(rotations, path, source_note="Exported from PoseCraft (batch)", bone_confidence=confidence)
+            hip_height, leg_length = self._root_for(index, rotations)
+            try:
+                save_pose_file(
+                    rotations, path, source_note="Exported from PoseCraft (batch)", bone_confidence=confidence,
+                    hip_height=hip_height, leg_length=leg_length,
+                )
+            except OSError as exc:
+                self._report_export_error("Export All People", str(path), exc)
+                return
 
         self.statusBar().showMessage(f"Exported {len(self._people)} pose(s) to {directory}")
 
@@ -615,12 +1660,27 @@ class MainWindow(QMainWindow):
             return
         rotations, _confidence = inputs
 
-        path, _ = QFileDialog.getSaveFileName(self, "Export BVH", "pose.bvh", "BVH (*.bvh)")
+        path = self._export_path(
+            "Export BVH", default_export_name(self._source_path, self.person_combo.currentIndex(), ".bvh"), "BVH (*.bvh)"
+        )
         if not path:
             return
 
-        save_bvh_file(rotations, path)
+        try:
+            # Standing on the floor (B6): a crouch is exported lowered.
+            save_bvh_file(rotations, path, root_position=floor_root_position(rotations))
+        except OSError as exc:
+            self._report_export_error("Export BVH", path, exc)
+            return
         self.statusBar().showMessage(f"Exported BVH to {path}")
+
+    def _report_export_error(self, title: str, path: str, exc: OSError) -> None:
+        """A failed write (read-only folder, locked file, OneDrive placeholder)
+        used to raise inside the Qt slot, which the windowed build has no
+        console to show -- the export silently did nothing."""
+        log.warning("%s failed for %s: %s", title, path, exc)
+        self.statusBar().showMessage(f"{title} failed")
+        QMessageBox.warning(self, title, f"Could not write:\n{path}\n\n{exc}")
 
     def _on_send_to_blender(self) -> None:
         if self._send_worker is not None and self._send_worker.isRunning():
@@ -630,7 +1690,11 @@ class MainWindow(QMainWindow):
         if inputs is None:
             return
         rotations, confidence = inputs
-        document = build_pose_document(rotations, source_note="Sent live from PoseCraft", bone_confidence=confidence)
+        hip_height, leg_length = self._root_for(self.person_combo.currentIndex(), rotations)
+        document = build_pose_document(
+            rotations, source_note="Sent live from PoseCraft", bone_confidence=confidence,
+            hip_height=hip_height, leg_length=leg_length,
+        )
 
         host = self.live_link_host_edit.text().strip() or live_link.DEFAULT_HOST
         port = self.live_link_port_spin.value()
@@ -643,13 +1707,18 @@ class MainWindow(QMainWindow):
         self._send_worker.failed.connect(self._on_send_to_blender_failed)
         self._send_worker.start()
 
-    def _on_send_to_blender_finished(self) -> None:
-        self.send_to_blender_btn.setEnabled(True)
-        self.statusBar().showMessage("Pose sent to Blender")
+    def _on_send_to_blender_finished(self, reply: dict | None) -> None:
+        self.send_to_blender_btn.setEnabled(bool(self._people))
+        message, ok = _live_link_reply_message(reply)
+        self.statusBar().showMessage(message)
+        if not ok and not self._closing:
+            QMessageBox.warning(self, "Send to Blender", message)
 
     def _on_send_to_blender_failed(self, message: str) -> None:
-        self.send_to_blender_btn.setEnabled(True)
+        self.send_to_blender_btn.setEnabled(bool(self._people))
         self.statusBar().showMessage("Send to Blender failed")
+        if self._closing:
+            return
         QMessageBox.warning(
             self,
             "Send to Blender",
