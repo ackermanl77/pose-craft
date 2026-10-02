@@ -1,4 +1,6 @@
 import math
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -216,17 +218,152 @@ def test_cuda_provider_options_disable_tf32():
 
 def test_directml_is_preferred_and_falls_back_to_the_cpu():
     available = [onnx_pose.DML_PROVIDER, onnx_pose.CUDA_PROVIDER, onnx_pose.CPU_PROVIDER]
-    providers, dml = onnx_pose.select_providers(available, use_gpu=True)
+    providers, dml = onnx_pose.select_providers(available, use_gpu=True, dml_device_id=1)
     assert dml
     assert [p if isinstance(p, str) else p[0] for p in providers] == [
         onnx_pose.DML_PROVIDER, onnx_pose.CUDA_PROVIDER, onnx_pose.CPU_PROVIDER
     ]
+    assert providers[0][1] == {"device_id": 1}, "DirectML must run on the chosen hardware adapter"
+
+
+def test_directml_is_skipped_without_a_hardware_gpu():
+    available = [onnx_pose.DML_PROVIDER, onnx_pose.CPU_PROVIDER]
+    assert onnx_pose.select_providers(available, use_gpu=True, dml_device_id=None) == ([onnx_pose.CPU_PROVIDER], False)
 
 
 def test_gpu_preference_can_force_cuda_or_directml():
     available = [onnx_pose.DML_PROVIDER, onnx_pose.CUDA_PROVIDER, onnx_pose.CPU_PROVIDER]
-    providers, dml = onnx_pose.select_providers(available, use_gpu=True, preference=("cuda",))
+    providers, dml = onnx_pose.select_providers(available, use_gpu=True, preference=("cuda",), dml_device_id=0)
     assert not dml and providers[0][0] == onnx_pose.CUDA_PROVIDER and len(providers) == 2
+
+
+def test_best_directml_adapter_prefers_the_gpu_with_the_most_memory(monkeypatch):
+    adapters = [
+        onnx_pose.GpuAdapter(0, "Integrated", 0x8086, 128),
+        onnx_pose.GpuAdapter(1, "Discrete", 0x10DE, 16000),
+    ]
+    monkeypatch.setattr(onnx_pose, "directml_adapters", lambda: adapters)
+    onnx_pose.best_directml_adapter.cache_clear()
+    try:
+        assert onnx_pose.best_directml_adapter().name == "Discrete"
+        monkeypatch.setattr(onnx_pose, "directml_adapters", lambda: [])
+        onnx_pose.best_directml_adapter.cache_clear()
+        assert onnx_pose.best_directml_adapter() is None
+    finally:
+        onnx_pose.best_directml_adapter.cache_clear()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="DXGI is Windows-only")
+def test_directml_adapters_lists_only_hardware_gpus():
+    """The real DXGI enumeration: never a software renderer (Basic Render
+    Driver is always present on Windows, so it has to be filtered out)."""
+    adapters = onnx_pose.directml_adapters()
+    assert all(a.vendor_id != 0x1414 for a in adapters)
+    assert all("Basic Render" not in a.name for a in adapters)
+    assert len({a.index for a in adapters}) == len(adapters)
+
+
+def test_directml_adapters_is_empty_off_windows(monkeypatch):
+    monkeypatch.setattr(onnx_pose.sys, "platform", "linux")
+    assert onnx_pose.directml_adapters() == []
+
+
+def _image_model(tmp_path):
+    """A tiny NHWC float model (Relu) to stand in for a pose model."""
+    pytest.importorskip("onnxruntime")
+    onnx = pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+
+    graph = helper.make_graph(
+        [helper.make_node("Relu", ["x"], ["y"])],
+        "g",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 8, 8, 3])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8, 8, 3])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    path = tmp_path / "image.onnx"
+    onnx.save_model(model, str(path))
+    return path
+
+
+class _FakeGpuSession:
+    """A CPU session that claims to be on DirectML, with its outputs distorted."""
+
+    def __init__(self, path, distort):
+        self._real = onnx_pose.create_session(path, use_gpu=False)
+        self._distort = distort
+
+    def get_providers(self):
+        return [onnx_pose.DML_PROVIDER, onnx_pose.CPU_PROVIDER]
+
+    def get_inputs(self):
+        return self._real.get_inputs()
+
+    def run(self, names, feeds):
+        return [self._distort(out) for out in self._real.run(names, feeds)]
+
+
+@pytest.mark.parametrize(
+    ("distort", "problem"),
+    [
+        (lambda out: out + 1e-5, None),  # rounding-level differences pass
+        (lambda out: out * 0.0, "differ from the CPU"),
+        (lambda out: out * np.nan, "invalid results"),
+    ],
+)
+def test_gpu_session_must_match_the_cpu(tmp_path, monkeypatch, distort, problem):
+    monkeypatch.setattr(onnx_pose, "_gpu_check_cache", {})
+    path = _image_model(tmp_path)
+    reason = onnx_pose.gpu_session_problem(_FakeGpuSession(path, distort), path)
+    if problem is None:
+        assert reason is None
+    else:
+        assert problem in reason and "DirectML" in reason
+
+
+def test_a_gpu_that_fails_to_run_is_rejected_and_cpu_sessions_need_no_check(tmp_path, monkeypatch):
+    monkeypatch.setattr(onnx_pose, "_gpu_check_cache", {})
+    path = _image_model(tmp_path)
+
+    def broken(out):
+        raise RuntimeError("device removed")
+
+    assert "failed to run" in onnx_pose.gpu_session_problem(_FakeGpuSession(path, broken), path)
+    assert onnx_pose.gpu_session_problem(onnx_pose.create_session(path, use_gpu=False), path) is None
+
+
+def test_blazepose_falls_back_to_the_cpu_when_the_gpu_check_fails(monkeypatch):
+    class _Session:
+        def __init__(self, provider):
+            self.provider = provider
+
+        def get_providers(self):
+            return [self.provider]
+
+        def get_inputs(self):
+            return [type("I", (), {"name": "x"})()]
+
+        def get_outputs(self):
+            return [type("O", (), {"name": "y"})()]
+
+    monkeypatch.setattr(
+        onnx_pose, "create_session",
+        lambda path, use_gpu=True, preference=onnx_pose.GPU_PREFERENCE: _Session(
+            onnx_pose.DML_PROVIDER if use_gpu else onnx_pose.CPU_PROVIDER
+        ),
+    )
+    monkeypatch.setattr(onnx_pose, "gpu_session_problem", lambda session, path: "DirectML gave invalid results")
+    pose = BlazePose(Path("det.onnx"), Path("lm.onnx"), use_gpu=True)
+    assert pose.device == "CPU"
+    assert pose.gpu_fallback_reason == "DirectML gave invalid results"
+
+    monkeypatch.setattr(onnx_pose, "gpu_session_problem", lambda session, path: None)
+    pose = BlazePose(Path("det.onnx"), Path("lm.onnx"), use_gpu=True)
+    assert pose.device == "GPU (DirectML)" and pose.gpu_fallback_reason is None
+
+    pose = BlazePose(Path("det.onnx"), Path("lm.onnx"), use_gpu=False)
+    assert pose.device == "CPU" and pose.gpu_fallback_reason is None
 
 
 def test_cpu_only_when_gpu_not_requested_or_unavailable():

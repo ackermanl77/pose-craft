@@ -367,6 +367,13 @@ class PoseEstimator:
     def device(self) -> str:
         return self._pose.device
 
+    @property
+    def gpu_fallback_reason(self) -> str | None:
+        """Why the GPU requested with `use_gpu` isn't used: no hardware DirectX
+        12 GPU, no GPU runtime in this build, or a GPU whose results didn't
+        match the CPU's (onnx_pose.gpu_session_problem). None when it is used."""
+        return self._pose.gpu_fallback_reason
+
     def close(self) -> None:
         # ONNX Runtime sessions release their (GPU) memory when garbage-collected;
         # dropping the reference is all "closing" needs to do.

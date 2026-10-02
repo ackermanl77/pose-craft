@@ -640,8 +640,10 @@ class MainWindow(QMainWindow):
         self.use_gpu_checkbox.setChecked(True)
         self.use_gpu_checkbox.setToolTip(
             "Runs pose estimation on the GPU through ONNX Runtime: DirectML (any DirectX 12 GPU) "
-            "in a DirectML build, CUDA (NVIDIA) in a CUDA build. Falls back to the CPU automatically "
-            "when no usable GPU runtime is found -- the status bar says which one each solve actually used."
+            "in a DirectML build, CUDA (NVIDIA) in a CUDA build. The GPU is used only when a hardware "
+            "GPU is found (DirectML ignores software renderers) and a check run at load time gives the "
+            "same results as the CPU; "
+            "otherwise it falls back to the CPU -- the status bar says which one is used, and why."
         )
         layout.addWidget(self.use_gpu_checkbox)
 
@@ -1229,7 +1231,9 @@ class MainWindow(QMainWindow):
             return
         if self._estimator is None and self._estimator_matches(estimator):
             self._estimator = estimator
-            self.statusBar().showMessage(f"Ready -- pose model loaded on {estimator.device}")
+            reason = getattr(estimator, "gpu_fallback_reason", None)
+            note = f" (GPU not used: {reason})" if reason else ""
+            self.statusBar().showMessage(f"Ready -- pose model loaded on {estimator.device}{note}")
         else:
             estimator.close()  # the model or device was changed meanwhile
         self._resume_pending_solve()

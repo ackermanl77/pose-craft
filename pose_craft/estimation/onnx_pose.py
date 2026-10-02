@@ -27,8 +27,10 @@ model still runs on the full image.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import math
+import sys
 from pathlib import Path
 
 import cv2
@@ -368,21 +370,135 @@ def _preload_cuda_dlls() -> None:
         log.info("could not preload CUDA DLLs; ONNX Runtime will fall back to the CPU", exc_info=True)
 
 
+@dataclasses.dataclass(frozen=True)
+class GpuAdapter:
+    """A DXGI adapter DirectML can run on. `index` is its IDXGIFactory1::EnumAdapters1
+    position, which is what the DirectML provider's `device_id` option selects."""
+
+    index: int
+    name: str
+    vendor_id: int
+    dedicated_memory_mb: int
+
+
+_DXGI_ADAPTER_FLAG_SOFTWARE = 2
+_MICROSOFT_VENDOR_ID = 0x1414  # Microsoft Basic Render Driver (WARP) and other software adapters
+_D3D_FEATURE_LEVEL_11_0 = 0xB000  # the minimum DirectML needs
+_IID_IDXGI_FACTORY1 = "770aae78-f26f-4dba-a829-253c83d1b387"
+_IID_ID3D12_DEVICE = "189819f1-1db6-4b57-be54-1821339b85f7"
+
+
+def directml_adapters() -> list[GpuAdapter]:
+    """The hardware GPUs DirectML can use: DXGI adapters that aren't software
+    renderers and can create a Direct3D 12 device (feature level 11_0), in DXGI
+    order. Microsoft Basic Render Driver -- what a PC without a working GPU
+    driver has -- is left out: DirectML on it runs on the CPU in software,
+    slower than the CPU provider (and with onnxruntime-directml 1.24.4 it fails
+    to initialize at all). Empty off Windows or if DXGI/D3D12 can't be loaded."""
+    if sys.platform != "win32":
+        return []
+    try:
+        return _enumerate_dxgi_adapters()
+    except Exception:  # noqa: BLE001 -- no usable GPU means "run on the CPU"
+        log.info("could not enumerate DXGI adapters; DirectML won't be used", exc_info=True)
+        return []
+
+
+def _enumerate_dxgi_adapters() -> list[GpuAdapter]:
+    import ctypes
+    import uuid
+    from ctypes import wintypes
+
+    class _GUID(ctypes.Structure):
+        _fields_ = [("d1", wintypes.DWORD), ("d2", wintypes.WORD), ("d3", wintypes.WORD), ("d4", ctypes.c_ubyte * 8)]
+
+    def guid(text: str) -> _GUID:
+        u = uuid.UUID(text)
+        g = _GUID(u.fields[0], u.fields[1], u.fields[2])
+        g.d4[:] = u.bytes[8:]
+        return g
+
+    class _LUID(ctypes.Structure):
+        _fields_ = [("low", wintypes.DWORD), ("high", wintypes.LONG)]
+
+    class _DESC1(ctypes.Structure):  # DXGI_ADAPTER_DESC1
+        _fields_ = [
+            ("description", ctypes.c_wchar * 128), ("vendor_id", ctypes.c_uint), ("device_id", ctypes.c_uint),
+            ("subsys_id", ctypes.c_uint), ("revision", ctypes.c_uint), ("dedicated_video_memory", ctypes.c_size_t),
+            ("dedicated_system_memory", ctypes.c_size_t), ("shared_system_memory", ctypes.c_size_t),
+            ("luid", _LUID), ("flags", ctypes.c_uint),
+        ]
+
+    def method(obj, index, *argtypes):
+        """COM vtable slot `index` of `obj` (IUnknown: 0-2, IDXGIObject: 3-6,
+        IDXGIFactory/IDXGIAdapter: 7-..., EnumAdapters1 = 12, GetDesc1 = 10)."""
+        vtable = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        return ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)(vtable[index])
+
+    dxgi = ctypes.WinDLL("dxgi")
+    d3d12 = ctypes.WinDLL("d3d12")
+    factory = ctypes.c_void_p()
+    if dxgi.CreateDXGIFactory1(ctypes.byref(guid(_IID_IDXGI_FACTORY1)), ctypes.byref(factory)) != 0:
+        return []
+    adapters = []
+    try:
+        index = 0
+        while True:
+            adapter = ctypes.c_void_p()
+            if method(factory, 12, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p))(factory, index, ctypes.byref(adapter)) != 0:
+                break  # DXGI_ERROR_NOT_FOUND: no more adapters
+            try:
+                desc = _DESC1()
+                method(adapter, 10, ctypes.POINTER(_DESC1))(adapter, ctypes.byref(desc))
+                software = desc.flags & _DXGI_ADAPTER_FLAG_SOFTWARE or desc.vendor_id == _MICROSOFT_VENDOR_ID
+                # ppDevice=NULL only tests support: S_FALSE (1) when a device could be created.
+                d3d12_ok = d3d12.D3D12CreateDevice(adapter, _D3D_FEATURE_LEVEL_11_0, ctypes.byref(guid(_IID_ID3D12_DEVICE)), None) in (0, 1)
+                if not software and d3d12_ok:
+                    adapters.append(GpuAdapter(index, desc.description, desc.vendor_id, desc.dedicated_video_memory >> 20))
+            finally:
+                method(adapter, 2)(adapter)  # Release
+            index += 1
+    finally:
+        method(factory, 2)(factory)
+    return adapters
+
+
+@functools.lru_cache(maxsize=1)
+def best_directml_adapter() -> GpuAdapter | None:
+    """The hardware GPU with the most dedicated memory (the discrete card on a
+    laptop with integrated graphics too), or None when there is none."""
+    adapters = directml_adapters()
+    if not adapters:
+        return None
+    return max(adapters, key=lambda a: (a.dedicated_memory_mb, -a.index))
+
+
 def select_providers(
-    available: list[str], use_gpu: bool, preference: tuple[str, ...] = GPU_PREFERENCE
+    available: list[str],
+    use_gpu: bool,
+    preference: tuple[str, ...] = GPU_PREFERENCE,
+    dml_device_id: int | None = None,
 ) -> tuple[list, bool]:
     """The provider list for an InferenceSession: the available GPU providers in
     `preference` order (each with its options), then the CPU as the fallback
-    ONNX Runtime uses if a GPU provider fails to initialize. Returns (providers,
-    whether DirectML is among them -- it needs its own session options)."""
+    ONNX Runtime uses if a GPU provider fails to initialize. DirectML is only
+    included with a `dml_device_id` -- the hardware GPU to run on (see
+    best_directml_adapter); without one there's no GPU for it. Returns
+    (providers, whether DirectML is among them -- it needs its own session options)."""
     providers: list = []
+    uses_dml = False
     if use_gpu:
         for key in preference:
             name = _GPU_PROVIDERS[key]
             if name not in available:
                 continue
-            providers.append((name, dict(CUDA_PROVIDER_OPTIONS)) if name == CUDA_PROVIDER else name)
-    uses_dml = DML_PROVIDER in providers
+            if name == DML_PROVIDER:
+                if dml_device_id is None:
+                    continue
+                providers.append((name, {"device_id": dml_device_id}))
+                uses_dml = True
+            else:
+                providers.append((name, dict(CUDA_PROVIDER_OPTIONS)))
     return providers + [CPU_PROVIDER], uses_dml
 
 
@@ -394,15 +510,88 @@ def create_session(model_path: Path, use_gpu: bool = True, preference: tuple[str
 
     options = ort.SessionOptions()
     options.log_severity_level = 3  # errors only -- keeps provider fallbacks from spamming stderr
+    available = ort.get_available_providers()
+    dml_device_id = None
     if use_gpu:
         _preload_cuda_dlls()
-    providers, uses_dml = select_providers(ort.get_available_providers(), use_gpu, preference)
+        if DML_PROVIDER in available and "directml" in preference:
+            adapter = best_directml_adapter()
+            dml_device_id = adapter.index if adapter else None
+    providers, uses_dml = select_providers(available, use_gpu, preference, dml_device_id)
     if uses_dml:
         # Required by the DirectML provider (ONNX Runtime's DirectML docs):
         # no memory-pattern optimization and no parallel execution.
         options.enable_mem_pattern = False
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     return ort.InferenceSession(str(model_path), sess_options=options, providers=providers)
+
+
+# A GPU session must reproduce the CPU's outputs on a probe input to within this
+# fraction of each output's range. Measured on an RTX 5080 and an AMD Radeon iGPU
+# (DirectML): at most ~7e-4 (the heatmap), and landmarks within 0.004 px -- a
+# broken driver/GPU gives garbage, NaNs or zeros, far outside it.
+GPU_CHECK_RELATIVE_TOLERANCE = 1e-2
+
+_gpu_check_cache: dict[tuple[str, str], str | None] = {}
+
+
+def _probe_input(session) -> dict:
+    """A smooth, deterministic image (gradients and a bright ellipse) for the
+    model's NHWC float input -- well-conditioned, unlike noise."""
+    shape = session.get_inputs()[0].shape
+    height, width = (int(d) if isinstance(d, int) and d > 0 else LANDMARK_INPUT_SIZE for d in shape[1:3])
+    y, x = np.mgrid[0:height, 0:width].astype(np.float32)
+    y /= height
+    x /= width
+    image = np.stack([x, y, 0.5 * (x + y)], axis=-1)
+    image[((x - 0.5) / 0.2) ** 2 + ((y - 0.45) / 0.35) ** 2 < 1] = (0.9, 0.7, 0.6)
+    return {session.get_inputs()[0].name: image[None]}
+
+
+def gpu_session_problem(session, model_path: Path) -> str | None:
+    """Why `session` (on a GPU provider) can't be trusted, or None when it
+    reproduces the CPU provider's outputs on a probe input. A CPU session needs
+    no check. Cached per (provider, model) for the process."""
+    provider = session.get_providers()[0]
+    if provider == CPU_PROVIDER:
+        return None
+    key = (provider, str(model_path))
+    if key not in _gpu_check_cache:
+        _gpu_check_cache[key] = _compare_with_cpu(session, model_path, provider)
+    return _gpu_check_cache[key]
+
+
+def _compare_with_cpu(session, model_path: Path, provider: str) -> str | None:
+    label = {DML_PROVIDER: "DirectML", CUDA_PROVIDER: "CUDA"}.get(provider, provider)
+    model = Path(model_path).stem
+    try:
+        inputs = _probe_input(session)
+        gpu_outputs = session.run(None, inputs)
+        cpu_outputs = create_session(model_path, use_gpu=False).run(None, inputs)
+    except Exception as exc:  # noqa: BLE001 -- any failure means "don't use this GPU"
+        return f"{label} failed to run {model}: {exc}"
+    for gpu, cpu in zip(gpu_outputs, cpu_outputs):
+        gpu = np.asarray(gpu, dtype=np.float64)
+        cpu = np.asarray(cpu, dtype=np.float64)
+        if gpu.shape != cpu.shape or not np.all(np.isfinite(gpu)):
+            return f"{label} gave invalid results for {model}"
+        scale = max(float(np.max(np.abs(cpu))), 1e-6) if cpu.size else 1.0
+        error = float(np.max(np.abs(gpu - cpu))) / scale if cpu.size else 0.0
+        if error > GPU_CHECK_RELATIVE_TOLERANCE:
+            return f"{label} results for {model} differ from the CPU's ({error:.1%} of the output range)"
+    return None
+
+
+def no_gpu_reason() -> str:
+    """Why a requested GPU isn't available, when ONNX Runtime ended up on the CPU."""
+    import onnxruntime as ort
+
+    available = ort.get_available_providers()
+    if DML_PROVIDER in available and best_directml_adapter() is None:
+        return "no DirectX 12 GPU found (only a software renderer)"
+    if DML_PROVIDER not in available and CUDA_PROVIDER not in available:
+        return "this build has no GPU runtime"
+    return "the GPU runtime could not start"
 
 
 class BlazePose:
@@ -413,6 +602,19 @@ class BlazePose:
     def __init__(self, detector_path: Path, landmarks_path: Path, use_gpu: bool = True):
         self._detector = create_session(detector_path, use_gpu)
         self._landmarks = create_session(landmarks_path, use_gpu)
+        #: Why a requested GPU isn't used (None when it is, or wasn't requested).
+        self.gpu_fallback_reason: str | None = None
+        if use_gpu:
+            reason = gpu_session_problem(self._detector, detector_path) or gpu_session_problem(
+                self._landmarks, landmarks_path
+            )
+            if reason:
+                log.warning("not using the GPU: %s", reason)
+                self.gpu_fallback_reason = reason
+                self._detector = create_session(detector_path, use_gpu=False)
+                self._landmarks = create_session(landmarks_path, use_gpu=False)
+            elif self._detector.get_providers()[0] == CPU_PROVIDER:
+                self.gpu_fallback_reason = no_gpu_reason()
         self._detector_input = self._detector.get_inputs()[0].name
         self._landmarks_input = self._landmarks.get_inputs()[0].name
         self._landmarks_outputs = [o.name for o in self._landmarks.get_outputs()]
