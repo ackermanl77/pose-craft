@@ -118,13 +118,25 @@ a wide group shot each face can be only a few pixels across and get missed;
 the quarters see them bigger. Even with it off, the quarters are tried
 automatically when the whole photo finds nobody.
 
+**Hands and fingers** (off by default, remembered) also estimates each
+person's fingers: for every hand whose wrist and knuckles are visible, the app
+crops the hand from the body pose and runs MediaPipe's hand model on it (a few
+milliseconds per hand). Each hand found gets 15 finger bones -- three each for
+the thumb and four fingers, named as in Rigify (`thumb.01.L`, `f_index.01.L`
+... `f_pinky.03.R`) -- drawn thinner in the photo and the 3D preview and
+included in every export (JSON, BVH, Live Link). The hand bone itself is then
+measured from the palm, which is more accurate. The status bar says how many
+hands were found. The first solve with it on downloads the hand model (about
+7.5 MB) in a source install; a release build ships it. With it off, exports
+are the same 15-bone body pose as before. Photos only: video stays body-only.
+
 **Solve Pose** (or **F5**) runs the actual detection. On the very first solve, a source install also
 downloads the pose model, and the progress bar shows how far along it is
 (the downloaded model is also converted once to the
 format the app runs it in -- well under a second). **Cancel** (or **Esc**)
 stops a download. Every solve after that reuses the already-loaded model,
 so later clicks are noticeably faster. While a solve is running, **Load
-Photo**, **Load Video**, **Max people to detect**, **Model quality**, **Use GPU** and **Group photo** are disabled -- this is intentional:
+Photo**, **Load Video**, **Max people to detect**, **Model quality**, **Use GPU**, **Group photo** and **Hands and fingers** are disabled -- this is intentional:
 swapping the photo or the detection settings mid-solve could let a stale
 result land on the wrong photo.
 
@@ -179,9 +191,17 @@ upside-down or facing 90 degrees off: *Flip Upside-Down*, *Rotate 90° Left*,
 
 A single photo can't always tell which way a limb points in depth: a forearm
 reaching toward the camera and one reaching away by the same angle look the
-same. Two fixes, both undoable with **Ctrl+Z** (redo **Ctrl+Y** or
-**Ctrl+Shift+Z**):
+same, and a joint can simply be detected in the wrong place. Three fixes, all
+undoable with **Ctrl+Z** (redo **Ctrl+Y** or **Ctrl+Shift+Z**):
 
+- **Drag a joint**: the selected person's shoulders, elbows, wrists, hips,
+  knees and ankles are drawn with yellow rings on the photo. Drag one to where
+  the joint really is; when you let go, its limb is re-solved and the 3D
+  preview updates. The bone keeps its length and stays on the same side in
+  depth (toward or away from the camera) -- only its direction changes; if you
+  drag farther than the bone reaches, it lies flat in the photo's plane,
+  pointing at where you dropped it. A wrist carries its hand along, an ankle
+  its foot. Each drag is one undo step ("Move right elbow"). Photos only.
 - **Flip a limb's depth**: right-click an arm or leg bone in the photo and
   choose **Flip depth: forearm.L** (or whichever bone you clicked). That bone
   and everything below it is mirrored front-to-back about its joint -- its
@@ -192,24 +212,36 @@ same. Two fixes, both undoable with **Ctrl+Z** (redo **Ctrl+Y** or
   adjustment, **Reset all edits** everything for this person.
 
 Corrections belong to one person and go into every export (JSON, BVH, Live
-Link, and every person of Export All). A new solve or a new photo clears them.
+Link, and every person of Export All). In a video they belong to the tracked
+person and apply to every frame. A new solve or a new photo clears them.
 
 ## Video
 
-**Load Video...** (MP4, MOV, AVI, MKV, WEBM, M4V) tracks one person -- the
-leftmost one in the first frame -- through the whole clip, with a progress bar
-and **Cancel**. The detector runs on the first frame and whenever the person
-is lost; every other frame looks where the previous frame's pose says they
-are, which is fast (about 10 ms a frame on a CPU) and steady. The landmarks
-are smoothed over time (a One Euro filter: strong smoothing while the body is
-still, little lag when it moves fast).
+**Load Video...** (MP4, MOV, AVI, MKV, WEBM, M4V) tracks up to **Max people
+to detect** people through the whole clip, with a progress bar and
+**Cancel**. Each person keeps the same number for the whole video ("Person
+2" stays Person 2), numbered left to right among the people in the first
+frame. Every tracked person is followed from where their pose was in the
+previous frame (fast: one model run per person per frame, about 10 ms on a
+CPU); the detector runs on the first frame, whenever someone is lost, and
+every 10 frames while fewer than the maximum are tracked, to pick up
+newcomers. Someone who disappears for up to 30 frames (walking behind
+something) gets their number back when they reappear near where they left;
+after longer they get a new number. With Max people set to 1 only the
+clearest person is tracked, as before. Each person's landmarks are smoothed
+over time on their own (a One Euro filter: strong smoothing while the body
+is still, little lag when it moves fast).
 
 The **Video** section then shows a frame slider: scrub to any frame to see
-it, its skeleton and its 3D preview; every export, correction and Live Link
-send works on the frame you're looking at. **Export Animation BVH...** writes
-every tracked frame as one animated BVH: each frame stands on the floor, and
-while a foot is planted the root moves so that foot stays put, which is what
-moves a walk forward.
+it, its skeletons and the selected person's 3D preview; the selected person
+stays selected while you scrub (as long as they're in the frame). Every
+export, correction and Live Link send works on the frame you're looking at.
+**Export Animation BVH...** writes the selected person's tracked frames as one
+animated BVH (frames where they weren't found are skipped): each frame stands
+on the floor, and while a foot is planted the root moves so that foot stays
+put, which is what moves a walk forward. **Export All People (BVH)...** writes
+one such file per tracked person (`clip_person1.bvh`, `clip_person2.bvh`, ...)
+into a folder, asking before it overwrites anything.
 
 ## 4. Export
 
@@ -232,6 +264,11 @@ the person, like `IMG_0042_person2.json`.
 - **Export BVH...** (**Ctrl+Shift+S**) saves the selected person as a single-frame `.bvh` file
   (Y up, facing +Z), for tools that read BVH rather than PoseCraft's JSON. The
   skeleton stands on the floor (Y = 0), so a crouch comes out lowered.
+
+With **Hands and fingers** on, a person whose hands were found also has 15
+finger bones per hand in the JSON (same format, same keys per bone) and the
+BVH (finger joints under each hand joint). Without them, both files are
+exactly the 15-bone body pose.
 
 ## 5. Blender Live Link
 
@@ -280,6 +317,15 @@ independent of the photo overlay.
 - **View** menu: **Front** (**1**), **Side** (**3**), **Top** (**7**),
   **Reset Camera** (**0**), **Frame Skeleton** (**F**) and **Bone Labels**
   (**L**, each bone's name at its middle).
+- **Hover a bone** (with no mouse button held) for a small label with its
+  name, its rotation relative to its parent as X/Y/Z degrees about its own
+  axes (Y along the bone -- the same axes as **Adjust bone** and Blender's
+  bone axes), and its confidence. **View > Hover Info** (**H**) turns it off.
+- **View > Photo Backdrop** (**Shift+B**, remembered) shows the photo (or the
+  current video frame) as a plane behind the skeleton, scaled and placed so
+  the person in it lines up with the faint raw-landmark dots -- a quick way to
+  compare the 3D result with the picture from the front view. It follows the
+  mirror checkbox and the body orientation fix.
 
 It automatically frames itself to the selected person's actual
 size and pose on every solve or selection change, so an unusually large,
@@ -302,6 +348,7 @@ camera's distance and center re-fit automatically.
 | Ctrl+B | Send to Blender |
 | 1 / 3 / 7 / 0 | Front / side / top / default 3D view |
 | F / L | Frame the skeleton / toggle bone labels |
+| H / Shift+B | Toggle the 3D hover info / the photo backdrop |
 
 Most control labels have an underlined letter: Alt plus that letter jumps to
 it. **File > Open Recent** lists the last eight photos and videos.
@@ -329,6 +376,20 @@ current pose. Turn it off to apply PoseCraft's rotations exactly as exported
 (this assumes a T-pose rig shaped like PoseCraft's skeleton, and is also what
 happens with files from PoseCraft versions before this option existed).
 
+**Pose rig controls** (on by default) is for rigs driven by constraints,
+like a generated Rigify rig. Such a rig deforms with `DEF-` bones that copy
+`ORG-` bones, which copy the FK or IK controls -- posing a `DEF-`/`ORG-` bone
+directly does nothing. With this on, a mapped bone whose rotation comes from
+a constraint is replaced by the bone that actually drives it (Rigify's FK
+control, e.g. `upper_arm_fk.L` for `DEF-upper_arm.L`), the arms and legs being
+posed are switched to FK (Rigify's **IK-FK** slider set to 1 on
+`upper_arm_parent.L` / `thigh_parent.L`), and each bone is aimed against its
+parent's pose as Blender actually evaluated it, constraints included -- so the
+helper (`MCH-`) bones Rigify puts between the torso and the limbs don't throw
+the limbs off. Rigify's FK spine (`spine_fk` and `.001`-`.003`) is chained
+automatically. Switch your limbs back to IK yourself afterwards if you want
+to keep animating with IK.
+
 **Keep feet on the floor** (off by default): after posing, the rig's root bone
 is moved up or down so the pose's lowest point sits where the rig's rest pose
 had its feet -- a crouch or a sit comes out lowered instead of hanging at
@@ -343,20 +404,22 @@ rotation mode (Euler, axis-angle or quaternion), so Euler rigs and their
 existing keys aren't disturbed.
 
 **Bone Mapping** bridges the gap between PoseCraft's 15 bone names (spine,
-neck, head, and left/right upper arm, forearm, hand, thigh, shin, foot) and
-whatever your rig actually calls its bones:
+neck, head, and left/right upper arm, forearm, hand, thigh, shin, foot), plus
+its 30 finger bone names, and whatever your rig actually calls its bones:
 
 1. Click **Initialize/Refresh** once per armature -- this creates one row per
    PoseCraft bone name.
 2. Click **Auto-Guess Unset** to try filling blank rows automatically (it
    tries the exact name, then Rigify controls like `upper_arm_fk.L`, then
-   `DEF-`/`ORG-` bones, then Mixamo names like `mixamorig:LeftArm`).
+   `DEF-`/`ORG-` bones, then Mixamo names like `mixamorig:LeftArm`;
+   finger bones match a Rigify rig's finger controls by name, and Mixamo's
+   `LeftHandIndex1`-style bones).
 3. For anything still blank, or wrong, use each row's searchable dropdown to
    pick the correct bone on your armature by hand.
    The text field next to it, **Extra Bones**, takes more bones continuing a
    chain, comma-separated (for example `Spine1, Spine2` after `Spine`): the
    rotation is spread evenly over the whole chain. Mixamo's three spine bones
-   are chained like this automatically.
+   and Rigify's four FK spine controls are chained like this automatically.
 4. **Clear All** blanks every row's assignment if you want to start over
    (keeps the row list itself).
 
@@ -414,13 +477,18 @@ Worth knowing before you rely on an exported pose:
   then the **Body orientation fix**.
 - **A limb can come out reaching the wrong way in depth** (toward the camera
   instead of away) -- right-click it in the photo and flip its depth.
-- **No fingers.** Hands are one bone each; finger poses aren't estimated yet.
-- **Video follows one person** (the leftmost in the first frame) and gives
-  the root horizontal motion only through planted feet.
-- **The Blender add-on** (bone-name matching, the Bone Mapping UI, and Live
-  Link) hasn't been checked against every possible rig -- if something looks
-  off, the Bone Mapping panel is exactly the tool for fixing bone-name
-  mismatches by hand.
+- **Fingers are optional and photo-only.** With **Hands and fingers** off,
+  hands are one bone each. With it on, a hand that's mostly hidden or out of
+  frame isn't searched, a finger's twist isn't estimated (fingers bend and
+  spread; the thumb's roll follows the palm), and video stays body-only. Real
+  photos haven't been checked against known finger poses yet.
+- **Video identities can swap** when two people cross closely or one is
+  hidden for more than about a second; the root moves horizontally only
+  through planted feet.
+- **The Blender add-on** (bone-name matching, the Bone Mapping UI, Rigify
+  support and Live Link) hasn't been run in a real Blender yet, let alone
+  against every possible rig -- if something looks off, the Bone Mapping
+  panel is exactly the tool for fixing bone-name mismatches by hand.
 - **DAZ Studio isn't a supported export target** -- PoseCraft only exports to
   Blender.
 - The packaged `.exe` isn't code-signed, so expect a Windows SmartScreen

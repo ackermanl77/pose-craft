@@ -17,14 +17,26 @@ PoseEstimator (pose_craft/estimation/landmarker.py)
      photos over 2048 px are area-downscaled first (estimation/onnx_pose.py
      re-implements MediaPipe's detector -> ROI -> landmark calculator graph);
      multi-person, with overlapping-tile detection for group photos
-  -- video (estimation/video.py): one person tracked frame to frame
-     (MediaPipe VIDEO-mode ROI from the previous landmarks), One Euro
-     smoothing, floor contact and foot-locked root motion
+  -- optional hands (B11, "Hands and fingers"): MediaPipe's 21-point hand
+     landmark model (pinned + SHA-256-checked like the pose models, palm
+     detector never converted) on crops derived from each person's pose
+     wrist/index/pinky landmarks (Holistic's HandDetectionsFromPoseToRects),
+     refined once from the hand's own landmarks (onnx_pose.HandLandmarker)
+  -- video (estimation/video.py): up to max_people people with stable track
+     IDs (MultiPersonTracker: each followed from its own previous landmarks,
+     detector on frame 0, on a loss and every 10 frames while under the
+     limit; lost tracks re-identified by keypoint distance for 30 frames;
+     converged tracks merged), per-person One Euro smoothing, floor contact
+     and foot-locked root motion
         |  landmarks converted to the engine frame (right-handed, Y-up, +X image right =
         |  subject's left, +Z toward camera = the way the subject faces);
         |  each DetectedPerson also carries 2D image-space landmarks + per-landmark visibility
         v
-retarget/skeleton.py -- 15-bone humanoid hierarchy, T-pose rest directions
+retarget/skeleton.py -- 15-bone humanoid hierarchy, T-pose rest directions,
+     plus 15 finger bones per hand (Rigify names) when hand landmarks are
+     given -- the hand then framed from the palm, finger knuckle segments by
+     the palm's lateral axis (the thumb by the back-of-hand normal), the
+     other segments as hinges
   -- a full frame per bone (direction + roll): spine from the hip/shoulder lines,
      head from the ear line (neck takes 40% of its twist), upper arm/thigh roll
      from the elbow/knee bend plane (forearm/shin are pure hinges), hand from
@@ -33,9 +45,13 @@ retarget/skeleton.py -- 15-bone humanoid hierarchy, T-pose rest directions
   -- world -> parent-relative; forward_kinematics() poses the rest skeleton
      from those rotations (the 3D preview and the BVH use the same rest skeleton)
   -- bone_confidence() derives a per-bone score from landmark visibility
-  -- manual correction: flip_limb_depth() (per-limb depth flip) and
-     apply_bone_overrides()/bone_axes_rotation() (per-bone adjustments about
-     Blender-style bone axes); hip_height_above_floor() for ground contact
+  -- manual correction: flip_limb_depth()/flip_hand_depth() (per-limb depth
+     flip), move_joint() (a 2D joint drag lifted to 3D through a fitted
+     weak-perspective camera, image_to_world_scale(), keeping the bone's
+     length and depth side) and apply_bone_overrides()/bone_axes_rotation()
+     (per-bone adjustments about Blender-style bone axes; bone_local_euler_deg()
+     is the inverse, for the 3D hover label); hip_height_above_floor() for
+     ground contact
         v
 export/blender_pose.py -- axis-converts Y-up -> Blender Z-up, writes JSON (format v2:
      local + world rotation + rest direction per bone, optional "root"
@@ -58,11 +74,19 @@ export/blender_addon/import_pose.py (installed inside Blender)
   -- bone name resolution: an explicit per-armature manual mapping row
      (POSECRAFT_BoneMapping, saved with the .blend file) wins if set, else
      falls back to name-guessing (exact, Rigify upper_arm_fk.L/_ik, DEF-/ORG-, Mixamo)
-  -- "Match rig rest pose" (default): rig_pose_basis() aims each mapped bone at
-     PoseCraft's world target against the rig's own rest direction and posed
-     parent (A-pose, Mixamo Hips, clavicles, bones without Inherit Rotation),
-     spreading a bone mapped to a chain (Mixamo Spine/Spine1/Spine2) over it;
-     off / v1 files: R^-1 q R per bone; each bone keeps its rotation mode
+  -- "Pose rig controls" (default): a mapped bone whose rotation a constraint
+     overrides (Rigify DEF-/ORG-) is redirected to the bone driving it
+     (control_bone_for / constraint_driver, FK preferred), and the Rigify
+     limbs posed are switched to FK (rigify_fk_switches: IK_FK = 1 on
+     upper_arm_parent.L / thigh_parent.L)
+  -- "Match rig rest pose" (default): rig_pose_basis_evaluated() aims each
+     mapped bone at PoseCraft's world target against the rig's own rest
+     direction and its parent's pose as Blender evaluated it (constraints and
+     drivers included; level by level, two passes), which covers A-pose,
+     Mixamo Hips, clavicles, bones without Inherit Rotation and Rigify's MCH
+     parents; a bone mapped to a chain (Mixamo Spine/Spine1/Spine2, Rigify
+     spine_fk/.001-.003) is spread over it; off / v1 files: R^-1 q R per bone;
+     each bone keeps its rotation mode
 ```
 
 `pose_craft/gui/main_window.py` is the only orchestrator: it owns the loaded
@@ -144,7 +168,7 @@ differently.
 | Desktop app (load photo, solve, preview, export) | `pose_craft/app.py`, run as `python -m pose_craft.app` |
 | Pose estimation entry point, world-axis conversion, cached `PoseEstimator`, model download + ONNX conversion cache | `pose_craft/estimation/landmarker.py` |
 | BlazePose pipeline on ONNX Runtime (detector, group-photo tiles, ROI, landmarks, video tracking, GPU/CPU session setup) | `pose_craft/estimation/onnx_pose.py` |
-| Video: tracking a person through a clip, One Euro smoothing, foot locking | `pose_craft/estimation/video.py` |
+| Video: tracking people through a clip with stable IDs, per-person One Euro smoothing, foot locking | `pose_craft/estimation/video.py` |
 | TFLite -> ONNX converter for the pose (and hand) models | `pose_craft/estimation/tflite_to_onnx.py` |
 | Pre-convert the models for a release build | `scripts/convert_models.py` |
 | Release build (DirectML + CPU zips, add-on zip, SHA256SUMS) | `.github/workflows/release.yml` |
@@ -225,7 +249,10 @@ mirror/confidence consistency fix (see "Recently Fixed"), and
 `pytest.importorskip`, so they run locally and skip cleanly in CI's lighter
 venv. Last full local run (with PySide6 installed, 2026-09-30, after the P2
 round): **298 passed, 6 skipped** (the LiteRT parity test, the real-photo
-golden test, and the four opt-in GPU parity tests). `tests/test_gui_flows.py`
+golden test, and the four opt-in GPU parity tests). After the "important
+items" round (2026-10-02): **357 passed, 6 skipped** (same skips; the new
+real-hand-model test runs because the hand model is cached locally and skips
+without it). `tests/test_gui_flows.py`
 now drives the real window on an offscreen Qt event loop with fake
 estimators: busy states, cancel, the close-waits-for-the-worker guarantee,
 the non-blocking send, warm-up, settings, drag-and-drop, picking, manual
@@ -281,6 +308,54 @@ checked" above as weaker evidence than an automated test -- it was true at the
 time each check ran, not guaranteed to stay true as the code changes.
 
 ## Recently Fixed
+
+- **"Important items" round (2026-10-02): B5 Rigify, B11, B12, F4, F9.** 307
+  passed / 6 skipped before, 357 / 6 after (new: `tests/test_hands.py`,
+  `test_rigify.py`, `test_video_tracking.py`, `test_gui_important.py`):
+  - **Hands and fingers (B11).** A "Hands and fingers" checkbox (off by
+    default, remembered). The hand crop comes from the pose's wrist, index and
+    pinky landmarks as in MediaPipe Holistic (scale 2.7, shift -0.1), then one
+    re-crop from the hand's own landmarks (scale 2.0); the palm detector is
+    never converted. The hand model is pinned
+    (`.../hand_landmarker/float16/1/`, SHA-256 `fbc2a300...`, identical to
+    `/latest/`) and bundled by `scripts/convert_models.py` (manifest key
+    "hand", 11 MB as float32 ONNX). Measured on an RTX 5080: 1.2 ms per hand
+    pass on the CPU, 0.47 ms on DirectML, 1.3 ms on CUDA; both GPU providers
+    within 3.4e-6 of the CPU (landmarks 0.0001 px). 15 finger bones per hand
+    (Rigify names) in the JSON (still format 2: a body-only file is
+    unchanged), the BVH (finger joints only when solved) and the add-on
+    (Rigify finger controls match by name, Mixamo `LeftHandIndex1`... via a
+    table, Bone Mapping rows for all 45 bones). A rest hand solves to straight
+    fingers, a curl to a pure hinge about the knuckle line, finger rotations
+    are invariant to turning the whole body, and FK with measured hand
+    proportions lands on the hand landmarks. Not checked on a real photo of
+    hands; photos only (video stays body-only).
+  - **Multi-person video (B12).** Load Video tracks up to "Max people" people
+    with stable IDs (`video.MultiPersonTracker`), smooths each separately and
+    exports one animated BVH per person ("Export All People (BVH)...", or the
+    selected person with "Export Animation BVH..."). Manual corrections in a
+    video belong to the track and apply to all its frames; the selected
+    person stays selected while scrubbing. Tested on scripted scenes
+    (moving people, a short loss re-identified, a newcomer, a long loss
+    getting a new ID, converging tracks merged); not on real footage.
+  - **Rigify (B5).** "Pose rig controls" (on by default): constraint-driven
+    DEF-/ORG- bones redirected to their FK controls, posed limbs switched to
+    FK, and every bone solved against its evaluated parent. Tested against a
+    simulated Rigify-like rig (Copy Transforms chains, an IK/FK-driven
+    influence, an MCH parent following the torso): each of the three fixes
+    is needed for the deform bones to reach the targets, and with none of
+    the constraints the evaluated solve equals the old one. Add-on 0.6.0.
+    Unverified in a real Blender and on a real generated Rigify rig.
+  - **2D joint drag (F4).** The selected person's shoulders, elbows, wrists,
+    hips, knees and ankles are draggable on the photo; a drag is lifted to 3D
+    through a weak-perspective camera fitted to the person (keeping the bone
+    length and depth side), re-solves the limb, and is one undo step.
+  - **3D view (F9).** A hover label (bone name, local X/Y/Z Euler degrees
+    about the bone's own axes, confidence) and an optional photo backdrop
+    placed with the same camera fit, so the photo's body lines up with the
+    raw landmarks. Neither is checked as rendered pixels (offscreen Qt has no
+    GL context): the tests check the projection, the label text, the plane's
+    corners and transform.
 
 - **Improvement-report P2 round (2026-09-30).** Each item has tests that
   failed before the change (298 passed, 6 skipped after it):
@@ -883,11 +958,13 @@ Ranked roughly by how much they affect whether an exported pose is usable:
   handles different rest directions, extra unmapped bones, chains (Extra
   Bones; Mixamo spines automatically) and bones with Inherit Rotation off --
   all tested only against a simulation of Blender's pose evaluation, as are
-  floor contact, keyframing and rotation modes. Not done: Rigify's
-  constraint-driven
-  MCH chains (posing the controls works; a DEF/ORG-only rig is driven by
-  constraints the solve doesn't model). A v1 add-on rejects v2 files
-  ("update the add-on"), by design.
+  floor contact, keyframing and rotation modes. Rigify's
+  constraint-driven chains are handled since the 2026-10-02 round ("Pose rig
+  controls": redirect to the driving control, FK switch, evaluated parents),
+  but only against a simulation -- the property names (IK_FK on
+  upper_arm_parent.L / thigh_parent.L) and the spine_fk chain follow Rigify's
+  source as remembered, not a generated rig inspected in Blender. A v1 add-on
+  rejects v2 files ("update the add-on"), by design.
 - **The Blender add-on -- bone-name matching, the manual Bone Mapping UI, the
   rig-aware solve, and the Live Link server and its reply -- is unverified
   against a real Blender install.** The Live Link server's reads are
@@ -911,13 +988,16 @@ Ranked roughly by how much they affect whether an exported pose is usable:
   and the spec's K3/K4 changes have never been through a build: run it once
   (a manual `workflow_dispatch`) and launch each zip before trusting it. No
   headless-Blender job exists yet (T4).
-- **No hands or fingers yet (B11).** The converter can now run MediaPipe's
-  hand models, but the pose-driven hand crop, the hand landmark pass and
-  finger bones (export, BVH, add-on mapping) aren't built.
-- **Video tracks one person** (the leftmost found in the first frame) and
-  re-detects only when it's lost; there's no identity tracking across
-  people, no rotation-space smoothing, and the root's horizontal motion comes
-  only from planted feet (a jump or a slide has none).
+- **Fingers are unverified on real photos (B11).** The hand pass follows
+  MediaPipe Holistic's crop rule without its re-crop model, finger twist
+  isn't measured (the knuckle segment is framed by the palm, the rest are
+  hinges, the thumb's roll follows the palm), hands whose pose landmarks are
+  under 0.5 visibility aren't searched, and video is body-only.
+- **Video identities are heuristic (B12).** Tracks are matched by crop
+  overlap and keypoint distance, not appearance, so two people crossing
+  closely can swap IDs, and someone gone for over 30 frames comes back as a
+  new person. There's no rotation-space smoothing, and the root's horizontal
+  motion comes only from planted feet (a jump or a slide has none).
 - **No DAZ Studio export target -- deliberately not started, not just missing.**
   PoseCraft only exports to Blender; the original PoseForge this project is
   inspired by targets DAZ Studio directly. Investigated adding a `.duf` export

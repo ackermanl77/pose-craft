@@ -79,11 +79,17 @@ loads it in the background at startup, so the first solve is quick. Every
 detected person's skeleton is drawn directly on the photo -- the selected
 person in a bright color (low-confidence bones, likely occluded in the photo,
 dashed in a warning color), everyone else dimmed. Click the person you want
-in the photo, pick them from the dropdown, or use Page Up/Down. A limb that
-came out reaching the wrong way in depth can be flipped from the photo's
-right-click menu, and any bone can be rotated by hand in "3. Correct" (with
-undo). **Load Video...** tracks one person through a clip and exports an
-animated BVH. From there:
+in the photo, pick them from the dropdown, or use Page Up/Down. A misplaced
+joint can be dragged on the photo (its limb is re-solved), a limb that came
+out reaching the wrong way in depth can be flipped from the photo's
+right-click menu, and any bone can be rotated by hand in "3. Correct" (all
+with undo). Tick **Hands and fingers** before solving to also estimate the
+fingers (15 bones per hand, Rigify names; off by default -- the first use
+downloads MediaPipe's pinned hand model). **Load Video...** tracks up to "Max
+people" people through a clip, each with a stable number, and exports an
+animated BVH per person. In the 3D preview, hover a bone for its name, local
+rotation and confidence; **View > Photo Backdrop** puts the photo behind the
+skeleton. From there:
 
 - **Export Pose JSON** / **Export BVH** / **Export All People...** (one JSON
   per detected person, to a folder you choose, named after the photo; the
@@ -108,8 +114,11 @@ shows up as "unmatched"), use the panel's **Bone Mapping** box: click
 Unset" to fill in what it can (it knows Rigify's `upper_arm_fk.L`-style controls
 and Mixamo's `mixamorig:` names), or pick each target bone yourself from the
 searchable dropdown; a row's "Extra Bones" field chains more bones (Mixamo's
-spine is chained automatically). Saved on the armature, so it's a one-time
-setup per rig. The panel also has "Keep feet on the floor", "Insert keyframes"
+and Rigify's spines are chained automatically). Saved on the armature, so it's a one-time
+setup per rig. For Rigify (and other constraint-driven rigs), "Pose rig
+controls" poses the controls that drive the DEF-/ORG- bones, switches the
+posed limbs to FK, and solves each bone against its parent as Blender
+evaluated it. The panel also has "Keep feet on the floor", "Insert keyframes"
 with a frame step, and the Live Link target (captured when Live Link starts).
 
 The app's menus list every keyboard shortcut; the user guide has the table.
@@ -161,5 +170,7 @@ See [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) for architecture, and its
 "Known Issues" section before relying on an exported pose -- a straight limb's
 roll is inferred rather than measured, the torso is one bone, the
 world-landmark axis convention hasn't been checked end to end against a real
-photo in Blender, and the Blender add-on (including the rig-aware retargeting
-and the Live Link server) hasn't been run in a real Blender install.
+photo in Blender, finger poses and multi-person video tracking haven't been
+checked on real footage, and the Blender add-on (including the rig-aware
+retargeting, Rigify support and the Live Link server) hasn't been run in a
+real Blender install.
