@@ -8,7 +8,10 @@ scipy==1.18.1
 onnxruntime-gpu==1.30.0
 onnx==1.23.0
 tflite==2.18.0
-opencv-contrib-python==5.0.0.93
+# headless: the app only decodes, resizes and warps images (and reads video
+# frames); the GUI is Qt, so OpenCV's own GUI and the contrib modules (~22 MB
+# in a build) aren't needed. Same package CI tests with.
+opencv-python-headless==5.0.0.93
 PySide6==6.11.2
 pyqtgraph==0.14.0
 PyOpenGL==3.1.10

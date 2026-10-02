@@ -3,17 +3,43 @@ import glob
 import importlib.util
 import os
 
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 
 datas = [('assets/icon.png', 'assets'), ('assets/icon.ico', 'assets')]
 binaries = []
 hiddenimports = []
+excludes = [
+    # mediapipe was the previous inference backend; it may still be installed in an
+    # older dev venv, but nothing imports it anymore.
+    'mediapipe',
+    # Pulled in by pyqtgraph's optional extras; nothing here uses them (~28 MB).
+    'matplotlib', 'PIL',
+    # Qt modules nothing imports (pyqtgraph imports QtSvg/QtTest optionally and
+    # falls back cleanly without them).
+    'PySide6.QtQuick', 'PySide6.QtQml', 'PySide6.QtNetwork', 'PySide6.QtTest', 'PySide6.QtPdf',
+    'PySide6.QtVirtualKeyboard',
+]
 # onnxruntime: pose inference (its capi/ folder holds the CPU + CUDA provider DLLs).
-# onnx + tflite: the one-time .task -> ONNX model conversion (estimation/tflite_to_onnx.py).
-for package in ('onnxruntime', 'onnx', 'cv2', 'pyqtgraph'):
+for package in ('onnxruntime', 'cv2'):
     tmp_ret = collect_all(package)
     datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-hiddenimports += collect_submodules('tflite')
+# pyqtgraph: its modules and data files, but not its bundled examples.
+hiddenimports += collect_submodules('pyqtgraph', filter=lambda name: '.examples' not in name)
+datas += collect_data_files('pyqtgraph', excludes=['**/examples/**'])
+
+# Pre-converted models (K3): scripts/convert_models.py writes them, with a
+# manifest, to build/models (or $POSECRAFT_MODELS_DIR). When they're there they're
+# bundled under models/ (estimation/landmarker.bundled_onnx_paths finds them) and
+# the onnx/tflite converter is left out: the app needs no download or network on
+# first run. Without them, the build keeps the converter and converts on first use.
+_models_dir = os.environ.get('POSECRAFT_MODELS_DIR', os.path.join('build', 'models'))
+if os.path.isfile(os.path.join(_models_dir, 'manifest.json')):
+    datas.append((_models_dir, 'models'))
+    excludes += ['onnx', 'tflite']
+else:
+    tmp_ret = collect_all('onnx')
+    datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+    hiddenimports += collect_submodules('tflite')
 
 # NVIDIA CUDA 13 runtime + cuDNN 9 from the pip packages requirements-gpu.txt installs
 # (onnxruntime-gpu[cuda,cudnn]). ONNX Runtime's CUDA provider needs them but doesn't
@@ -26,12 +52,33 @@ hiddenimports += collect_submodules('tflite')
 # nothing here uses; curand64_10 (~60 MB) isn't imported (statically or delay-loaded)
 # by onnxruntime's providers, cuDNN or cuBLAS -- checked with pefile -- and
 # onnxruntime.preload_dlls() only preloads curand on Linux.
-_nvidia_spec = importlib.util.find_spec('nvidia')
+#
+# Also left out (~520 MB): cufft64 (222 MB), nvrtc/nvrtc-builtins (102 MB+), nvJitLink
+# (93 MB) and cudnn_adv (101 MB). pefile shows no bundled DLL imports or delay-imports
+# them (they're only named as strings for dynamic loading), and with all five removed
+# from a dev venv, onnxruntime.preload_dlls(), session creation and inference still ran
+# on the CUDA provider for lite/full/heavy with identical results, TF32 on and off,
+# HEURISTIC and EXHAUSTIVE algorithm search. Re-check (a CUDA solve per variant) whenever
+# onnxruntime, cuDNN or the models change.
+_NVIDIA_EXCLUDED_PREFIXES = ('cufftw', 'nvblas', 'curand', 'cufft64', 'nvrtc', 'nvJitLink', 'cudnn_adv')
+
+# Build flavour, from the POSECRAFT_FLAVOR environment variable:
+#   dml  -- DirectML: build from a venv with requirements-dml.txt (onnxruntime-directml);
+#           never bundles the NVIDIA DLLs, ~0.5 GB instead of ~2 GB.
+#   cuda -- CUDA: bundles the NVIDIA DLLs from requirements-gpu.txt.
+#   cpu  -- never bundles the NVIDIA DLLs.
+#   unset (default) -- the previous behaviour: bundle the NVIDIA DLLs if they're installed.
+_flavor = os.environ.get('POSECRAFT_FLAVOR', '').strip().lower()
+if _flavor not in ('', 'dml', 'cuda', 'cpu'):
+    raise SystemExit(f"POSECRAFT_FLAVOR must be dml, cuda or cpu, not {_flavor!r}")
+_nvidia_spec = importlib.util.find_spec('nvidia') if _flavor in ('', 'cuda') else None
+if _flavor == 'cuda' and (_nvidia_spec is None or not _nvidia_spec.submodule_search_locations):
+    raise SystemExit("POSECRAFT_FLAVOR=cuda but the nvidia-* packages aren't installed (requirements-gpu.txt)")
 if _nvidia_spec is not None and _nvidia_spec.submodule_search_locations:
     _nvidia_root = list(_nvidia_spec.submodule_search_locations)[0]
     _site_packages = os.path.dirname(_nvidia_root)
     for _dll in glob.glob(os.path.join(_nvidia_root, '**', 'bin', '**', '*.dll'), recursive=True):
-        if not os.path.basename(_dll).startswith(('cufftw', 'nvblas', 'curand')):
+        if not os.path.basename(_dll).startswith(_NVIDIA_EXCLUDED_PREFIXES):
             binaries.append((_dll, os.path.relpath(os.path.dirname(_dll), _site_packages)))
 
 
@@ -44,12 +91,14 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # mediapipe was the previous inference backend; it may still be installed in an
-    # older dev venv, but nothing imports it anymore -- keep it out of the bundle.
-    excludes=['mediapipe'],
+    excludes=excludes,
     noarchive=False,
     optimize=0,
 )
+# The Qt libraries (and plugins needing them) of the excluded Qt modules can still
+# arrive as binaries; drop them by name.
+_UNUSED_QT = ('Qt6Quick', 'Qt6Qml', 'Qt6Pdf', 'Qt6VirtualKeyboard', 'Qt6Network', 'Qt6Test', 'qtvirtualkeyboard')
+a.binaries = [b for b in a.binaries if not os.path.basename(b[0]).startswith(_UNUSED_QT)]
 pyz = PYZ(a.pure)
 
 exe = EXE(

@@ -1,0 +1,17 @@
+# DirectML GPU acceleration (any DirectX 12 GPU: NVIDIA, AMD, Intel) -- an
+# alternative to requirements-gpu.txt, in its OWN venv. onnxruntime-directml and
+# onnxruntime-gpu both install the same `onnxruntime` module, so they can't share
+# an environment:
+#
+#   python -m venv .venv-dml
+#   .venv-dml\Scripts\pip install -r requirements.txt
+#   .venv-dml\Scripts\pip uninstall -y onnxruntime-gpu
+#   .venv-dml\Scripts\pip install -r requirements-dml.txt
+#
+# Build with `set POSECRAFT_FLAVOR=dml` before `pyinstaller PoseCraft.spec` (see the
+# spec). Measured on an RTX 5080: ~4-8 ms per solve against CUDA's ~9-39 ms, and
+# landmarks within 0.02 px of the CPU. The DirectML wheel lags the main
+# onnxruntime release (1.24.4 here vs 1.30.0), and Microsoft has put DirectML in
+# maintenance mode in favour of Windows ML, so keep this pinned and keep the CPU
+# fallback (onnx_pose.select_providers always appends it).
+onnxruntime-directml==1.24.4

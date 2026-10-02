@@ -1,0 +1,142 @@
+name: Release
+
+# Builds the Windows app per runtime flavour (DirectML and CPU on hosted runners;
+# CUDA needs the NVIDIA wheels' 1.5 GB and is better built locally -- see
+# PoseCraft.spec), zips each build and the Blender add-on, writes SHA256SUMS
+# and, for a v* tag, publishes a GitHub Release. Every build has its models
+# pre-converted and bundled (scripts/convert_models.py), so it needs no
+# download or network on first run.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [dml, cpu]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dml.txt
+
+      - name: Check the tag matches the app version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $version = python -c "import pose_craft; print(pose_craft.__version__)"
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} doesn't match pose_craft.__version__ $version"
+          }
+
+      - name: Install dependencies (${{ matrix.flavor }})
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements.txt
+          # onnxruntime-gpu, onnxruntime-directml and onnxruntime all install the same
+          # `onnxruntime` module, so swap the runtime for this flavour.
+          python -m pip uninstall -y onnxruntime-gpu
+          if ("${{ matrix.flavor }}" -eq "dml") {
+            python -m pip install -r requirements-dml.txt
+          } else {
+            python -m pip install onnxruntime==1.30.0
+          }
+
+      - name: Test
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+
+      - name: Cache the downloaded models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pose_craft/models
+          key: pose-models-${{ hashFiles('pose_craft/estimation/landmarker.py', 'pose_craft/estimation/tflite_to_onnx.py') }}
+
+      - name: Pre-convert the models
+        run: python scripts/convert_models.py --out build/models
+
+      - name: Build
+        shell: pwsh
+        env:
+          POSECRAFT_FLAVOR: ${{ matrix.flavor }}
+        run: python -m PyInstaller --noconfirm PoseCraft.spec
+
+      - name: Smoke-test the bundled models
+        shell: pwsh
+        env:
+          POSECRAFT_MODEL_DIR: dist/PoseCraft/_internal/models
+        run: |
+          python -c "from pose_craft.estimation.landmarker import bundled_onnx_paths as b; import sys; missing = [v for v in ('lite', 'full', 'heavy') if b(v) is None]; sys.exit(f'missing bundled models: {missing}' if missing else 0)"
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          $version = python -c "import pose_craft; print(pose_craft.__version__)"
+          Compress-Archive -Path dist/PoseCraft -DestinationPath "PoseCraft-$version-${{ matrix.flavor }}-win64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PoseCraft-${{ matrix.flavor }}
+          path: PoseCraft-*-win64.zip
+          if-no-files-found: error
+
+  addon:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Zip the Blender add-on
+        run: |
+          version=$(python3 -c "import ast; src = open('pose_craft/export/blender_addon/import_pose.py').read(); info = next(n.value for n in ast.parse(src).body if isinstance(n, ast.Assign) and getattr(n.targets[0], 'id', '') == 'bl_info'); print('.'.join(map(str, ast.literal_eval(info)['version'])))")
+          mkdir -p staging/posecraft_import_pose
+          cp pose_craft/export/blender_addon/import_pose.py staging/posecraft_import_pose/__init__.py
+          (cd staging && zip -r "../posecraft-blender-addon-$version.zip" posecraft_import_pose)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PoseCraft-addon
+          path: posecraft-blender-addon-*.zip
+          if-no-files-found: error
+
+  release:
+    needs: [build, addon]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: artifacts
+        run: sha256sum *.zip > SHA256SUMS && cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PoseCraft-release
+          path: artifacts/*
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" *.zip SHA256SUMS \
+            --repo "${{ github.repository }}" \
+            --title "PoseCraft ${{ github.ref_name }}" \
+            --generate-notes
