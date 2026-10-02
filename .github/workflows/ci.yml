@@ -18,12 +18,27 @@ jobs:
           cache: "pip"
           cache-dependency-path: requirements-test.txt
 
-      # requirements-test.txt only -- the full requirements.txt pulls PySide6/mediapipe,
-      # and PySide6 in particular needs system Qt platform libraries (libEGL,
-      # libxkbcommon-x11, ...) a plain Linux runner doesn't have. See that file's
-      # own header comment for why each dependency is or isn't included here.
+      # requirements-test.txt only -- the full requirements.txt pulls PySide6 (plus the
+      # GPU build of ONNX Runtime), and PySide6 needs system Qt platform libraries
+      # (libEGL, libxkbcommon-x11, ...) a plain Linux runner doesn't have; the Qt tests
+      # skip here. See that file's own header comment for why each dependency is or
+      # isn't included.
       - name: Install test dependencies
         run: pip install -r requirements-test.txt
+
+      # The real-photo golden test (tests/test_real_photo_golden.py) needs the
+      # pinned "full" model; cache it, keyed on the pinned URLs/hashes and the
+      # converter, and fetch it only once golden photos are committed.
+      - name: Cache the pose models
+        if: hashFiles('tests/data/golden/*.golden.json') != ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pose_craft/models
+          key: pose-models-${{ hashFiles('pose_craft/estimation/landmarker.py', 'pose_craft/estimation/tflite_to_onnx.py') }}
+
+      - name: Fetch the pose model
+        if: hashFiles('tests/data/golden/*.golden.json') != ''
+        run: python -c "from pose_craft.estimation.landmarker import resolve_onnx_models; resolve_onnx_models('full')"
 
       - name: Compile check
         run: python -m compileall -q pose_craft
