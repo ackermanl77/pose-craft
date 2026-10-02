@@ -11,7 +11,9 @@ PoseEstimator (pose_craft/estimation/landmarker.py)
   -- MediaPipe's BlazePose models: bundled pre-converted ONNX in a release build
      (scripts/convert_models.py), else the pinned, SHA-256-verified .task bundle
      downloaded and converted once (estimation/tflite_to_onnx.py); run on ONNX
-     Runtime -- DirectML, then CUDA (TF32 off) when available, CPU otherwise;
+     Runtime -- DirectML on the best hardware DX12 adapter, then CUDA (TF32 off)
+     when available, each kept only if it matches the CPU on a probe input at
+     load time, CPU otherwise;
      photos over 2048 px are area-downscaled first (estimation/onnx_pose.py
      re-implements MediaPipe's detector -> ROI -> landmark calculator graph);
      multi-person, with overlapping-tile detection for group photos
@@ -834,9 +836,18 @@ time each check ran, not guaranteed to stay true as the code changes.
   Timings are the median of one detector run plus one landmark-model run on
   random input, not a full solve on a real photo. In the CUDA build the
   `nvidia` folder is 1.02 GB (cuBLASLt alone 493 MB). The DirectML parity test
-  passes for all three variants. Which flavour to publish as the main download
-  is still a release decision. The DirectML wheel lags the main onnxruntime
-  release (1.24.4 vs 1.30.0) and DirectML is in maintenance mode.
+  passes for all three variants. **DirectML is the default flavour and the
+  main download** (decided 2026-10-02): fastest on the GPU measured, nearly the
+  CPU build's size, and it runs on AMD/Intel GPUs too. It is used only on a
+  hardware DirectX 12 adapter (`onnx_pose.best_directml_adapter()` via DXGI:
+  software adapters such as Microsoft Basic Render Driver are excluded, the
+  adapter with the most dedicated memory is passed as `device_id`) and only if
+  each model's outputs on a probe image match the CPU's to 1% of the output
+  range (`gpu_session_problem()`; measured worst case 7e-4, landmarks within
+  0.004 px, on an RTX 5080 and an AMD Radeon iGPU). Otherwise the app runs on
+  the CPU and reports why (`gpu_fallback_reason`, shown in the status bar).
+  The DirectML wheel lags the main onnxruntime release (1.24.4 vs 1.30.0) and
+  DirectML is in maintenance mode.
 - **The ONNX pipeline is a re-implementation, not MediaPipe itself.** It follows
   MediaPipe's sources and matches its output closely (see "Recently Fixed"),
   but it isn't bit-identical, and a future MediaPipe model update that changes

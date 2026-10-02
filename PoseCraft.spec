@@ -63,15 +63,24 @@ else:
 _NVIDIA_EXCLUDED_PREFIXES = ('cufftw', 'nvblas', 'curand', 'cufft64', 'nvrtc', 'nvJitLink', 'cudnn_adv')
 
 # Build flavour, from the POSECRAFT_FLAVOR environment variable:
-#   dml  -- DirectML: build from a venv with requirements-dml.txt (onnxruntime-directml);
-#           never bundles the NVIDIA DLLs, ~0.5 GB instead of ~2 GB.
+#   dml (default) -- DirectML: build from a venv with requirements-dml.txt (onnxruntime-directml);
+#           never bundles the NVIDIA DLLs (508 MB instead of 1.73 GB). The app uses the GPU only
+#           when it finds a hardware DirectX 12 GPU whose results match the CPU's at load time
+#           (onnx_pose.best_directml_adapter / gpu_session_problem), otherwise the CPU.
 #   cuda -- CUDA: bundles the NVIDIA DLLs from requirements-gpu.txt.
 #   cpu  -- never bundles the NVIDIA DLLs.
-#   unset (default) -- the previous behaviour: bundle the NVIDIA DLLs if they're installed.
-_flavor = os.environ.get('POSECRAFT_FLAVOR', '').strip().lower()
-if _flavor not in ('', 'dml', 'cuda', 'cpu'):
+_flavor = os.environ.get('POSECRAFT_FLAVOR', '').strip().lower() or 'dml'
+if _flavor not in ('dml', 'cuda', 'cpu'):
     raise SystemExit(f"POSECRAFT_FLAVOR must be dml, cuda or cpu, not {_flavor!r}")
-_nvidia_spec = importlib.util.find_spec('nvidia') if _flavor in ('', 'cuda') else None
+if _flavor == 'dml':
+    import onnxruntime as _ort
+
+    if 'DmlExecutionProvider' not in _ort.get_available_providers():
+        raise SystemExit(
+            "The default DirectML build needs onnxruntime-directml (requirements-dml.txt) in the build "
+            "venv. Install it, or set POSECRAFT_FLAVOR=cuda / cpu for another flavour."
+        )
+_nvidia_spec = importlib.util.find_spec('nvidia') if _flavor == 'cuda' else None
 if _flavor == 'cuda' and (_nvidia_spec is None or not _nvidia_spec.submodule_search_locations):
     raise SystemExit("POSECRAFT_FLAVOR=cuda but the nvidia-* packages aren't installed (requirements-gpu.txt)")
 if _nvidia_spec is not None and _nvidia_spec.submodule_search_locations:

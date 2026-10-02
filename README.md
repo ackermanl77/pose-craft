@@ -50,6 +50,14 @@ Without either everything still works, on the CPU. The **Use GPU** checkbox
 under Solve Pose toggles it, and the status bar says which device each solve
 actually ran on ("GPU (DirectML)", "GPU (CUDA)" or "CPU").
 
+The GPU is only used when it is a real, working GPU. DirectML runs on the
+hardware DirectX 12 GPU with the most dedicated memory (the discrete card on a
+laptop with integrated graphics too) and never on a software renderer such as
+Microsoft Basic Render Driver. When the model loads, each GPU model is also run
+once on a probe image and compared with the CPU; if a GPU fails, returns
+invalid values or differs by more than 1% of an output's range, PoseCraft uses
+the CPU instead and the status bar says why ("GPU not used: ...").
+
 `requirements.txt` is pinned to known-working versions; if you deliberately
 want the latest of everything instead, drop the `==` pins.
 
@@ -110,7 +118,7 @@ The app's menus list every keyboard shortcut; the user guide has the table.
 
 ```bash
 python scripts/convert_models.py           # pre-convert the models into build/models (bundled, no first-run download)
-set POSECRAFT_FLAVOR=dml   # or cuda / cpu; unset = bundle the CUDA DLLs if installed
+set POSECRAFT_FLAVOR=dml   # the default when unset (needs requirements-dml.txt); or cuda / cpu
 pyinstaller PoseCraft.spec
 ```
 

@@ -104,9 +104,12 @@ takes effect on the next Solve Pose, with no model reload needed.
 **Use GPU when available** (on by default) runs the pose model on the graphics
 card: through DirectML (any DirectX 12 GPU, NVIDIA, AMD or Intel) in a
 DirectML build, or CUDA (NVIDIA only) in a CUDA build. Either gives the same
-result as the CPU to within a fraction of a pixel, several times faster. If
-there's no usable GPU, the app quietly uses the CPU instead -- the status bar
-after each solve says which one it used ("Solved 2 pose(s) on GPU (DirectML)"). Changing this checkbox or
+result as the CPU to within a fraction of a pixel, several times faster. The
+GPU is used only if the app finds a real graphics card (not Windows' software
+renderer) and a quick check when the model loads gives the same results as the
+CPU. Otherwise it uses the CPU, and the status bar says why ("Ready -- pose
+model loaded on CPU (GPU not used: ...)"). After each solve the status bar says
+which one it used ("Solved 2 pose(s) on GPU (DirectML)"). Changing this checkbox or
 **Model quality** reloads the model on the next solve (a brief extra delay).
 
 **Group photo (slower)** also searches overlapping quarters of the photo for
