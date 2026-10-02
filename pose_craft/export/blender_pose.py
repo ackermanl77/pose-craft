@@ -1,6 +1,26 @@
 """Serializes solved bone rotations (engine frame: Y-up) into a JSON pose file
 using Blender's axis convention (Z-up), plus the companion add-on in
 blender_addon/import_pose.py that applies that JSON onto an armature's pose bones.
+
+Per bone, format version 2 writes:
+- "quaternion_wxyz": the parent-relative (local) rotation, as in version 1.
+- "world_quaternion_wxyz": the bone's armature-space rotation relative to
+  PoseCraft's T-pose rest skeleton (its parents' rotations composed in).
+- "rest_direction": the bone's rest (head -> tail) direction in that skeleton.
+The last two let the add-on pose a rig whose rest pose or hierarchy differs
+from PoseCraft's (an A-pose, a hips bone above the thighs, clavicles): it aims
+each rig bone at world_rotation * rest_direction, measured against the rig's
+own rest direction and the actual posed parent -- see the add-on's
+rig_pose_basis(). Version 1 readers only need "quaternion_wxyz", but reject
+the version number, which is the intended "update the add-on" signal.
+
+Optionally (still version 2; readers ignore unknown keys) a top-level "root":
+{"hip_height": m, "leg_length": m} -- how high the hip center sits above the
+floor in this pose, and the subject's thigh + shin length, both in the
+subject's own meters. hip_height / leg_length is the rig-independent ratio a
+reader scales by its own leg length to place the hips (a crouch is well under
+1). The add-on's "Keep feet on the floor" option instead measures the floor
+on the rig itself.
 """
 from __future__ import annotations
 
@@ -10,8 +30,15 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from pose_craft.retarget.skeleton import (
+    BONES,
+    hip_height_above_floor,
+    measured_proportions,
+    world_rotations_from_local,
+)
+
 FORMAT_NAME = "pose_craft_pose"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 # Below this MediaPipe visibility score, a bone is flagged "low_confidence" in the
 # exported file -- a hint (surfaced by the Blender add-on) that this joint was
@@ -35,37 +62,66 @@ def _rotation_to_blender(rotation: Rotation) -> Rotation:
     return _ENGINE_TO_BLENDER_AXES * rotation * _ENGINE_TO_BLENDER_AXES.inv()
 
 
+def _wxyz(rotation: Rotation) -> list[float]:
+    x, y, z, w = rotation.as_quat()  # scipy returns (x, y, z, w)
+    return [float(w), float(x), float(y), float(z)]
+
+
 def build_pose_document(
     bone_rotations: dict[str, Rotation],
     *,
     source_note: str = "",
     bone_confidence: dict[str, float] | None = None,
+    hip_height: float | None = None,
+    leg_length: float | None = None,
 ) -> dict:
     """bone_rotations: bone name -> local (parent-relative) Rotation, engine frame.
+
+    hip_height / leg_length: optional, written as the "root" entry (see the
+    module docstring); see root_measurements() for computing them.
 
     bone_confidence: optional bone name -> MediaPipe visibility score (see
     retarget.skeleton.bone_confidence), used to add "confidence"/"low_confidence"
     per bone. Bones missing from this dict (or when it's omitted entirely) simply
     don't get those keys -- callers that don't have visibility data are unaffected.
     """
+    world_rotations = world_rotations_from_local(bone_rotations)
+    rest_directions = {bone.name: bone.rest_direction for bone in BONES}
     bones = {}
     for name, rotation in bone_rotations.items():
-        blender_rotation = _rotation_to_blender(rotation)
-        x, y, z, w = blender_rotation.as_quat()  # scipy returns (x, y, z, w)
-        entry = {"quaternion_wxyz": [w, x, y, z]}
+        entry = {"quaternion_wxyz": _wxyz(_rotation_to_blender(rotation))}
+        if name in world_rotations:
+            entry["world_quaternion_wxyz"] = _wxyz(_rotation_to_blender(world_rotations[name]))
+            entry["rest_direction"] = [float(v) for v in _ENGINE_TO_BLENDER_AXES.apply(rest_directions[name])]
         if bone_confidence is not None and name in bone_confidence:
             confidence = bone_confidence[name]
             entry["confidence"] = confidence
             entry["low_confidence"] = confidence < LOW_CONFIDENCE_THRESHOLD
         bones[name] = entry
 
-    return {
+    document = {
         "format": FORMAT_NAME,
         "version": FORMAT_VERSION,
         "up_axis": "Z",
         "source_note": source_note,
         "bones": bones,
     }
+    if hip_height is not None:
+        document["root"] = {"hip_height": float(hip_height)}
+        if leg_length is not None:
+            document["root"]["leg_length"] = float(leg_length)
+    return document
+
+
+def root_measurements(bone_rotations: dict[str, Rotation], landmarks: np.ndarray) -> tuple[float, float]:
+    """(hip_height, leg_length) for build_pose_document, in the landmarks' own
+    units (meters for BlazePose's world landmarks): the posed skeleton built
+    with the subject's measured proportions, its hip center's height above its
+    lowest joint, and the mean thigh + shin length."""
+    lengths, shoulder_half, hip_half = measured_proportions(landmarks)
+    hip_height = hip_height_above_floor(bone_rotations, lengths, shoulder_half, hip_half)
+    leg_length = (lengths["thigh.L"] + lengths["shin.L"] + lengths["thigh.R"] + lengths["shin.R"]) / 2.0
+    return hip_height, leg_length
 
 
 def save_pose_file(
@@ -74,8 +130,16 @@ def save_pose_file(
     *,
     source_note: str = "",
     bone_confidence: dict[str, float] | None = None,
+    hip_height: float | None = None,
+    leg_length: float | None = None,
 ) -> None:
-    document = build_pose_document(bone_rotations, source_note=source_note, bone_confidence=bone_confidence)
+    document = build_pose_document(
+        bone_rotations,
+        source_note=source_note,
+        bone_confidence=bone_confidence,
+        hip_height=hip_height,
+        leg_length=leg_length,
+    )
     Path(path).write_text(json.dumps(document, indent=2), encoding="utf-8")
 
 

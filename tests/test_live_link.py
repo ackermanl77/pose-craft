@@ -49,7 +49,9 @@ def test_send_pose_document_wire_format():
 
     thread.join(timeout=2.0)
     server.close()
-    assert received["document"] == document
+    sent = dict(received["document"])
+    assert sent.pop("live_link_protocol") == live_link.PROTOCOL_VERSION
+    assert sent == document
 
 
 def test_send_pose_document_raises_when_nothing_listening():
@@ -60,3 +62,53 @@ def test_send_pose_document_raises_when_nothing_listening():
 
     with pytest.raises(OSError):
         live_link.send_pose_document({"format": "pose_craft_pose"}, host="127.0.0.1", port=port, timeout=1.0)
+
+
+def _serve_once(reply: dict | None, received: dict, raw_reply: bytes | None = None):
+    """A stand-in add-on: read one request, optionally write a length-prefixed reply."""
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+
+    def _serve():
+        conn, _addr = server.accept()
+        with conn:
+            length = int.from_bytes(_recv_exact(conn, 4), "big")
+            received["document"] = json.loads(_recv_exact(conn, length).decode("utf-8"))
+            if raw_reply is not None:
+                conn.sendall(raw_reply)
+            elif reply is not None:
+                payload = json.dumps(reply).encode("utf-8")
+                conn.sendall(len(payload).to_bytes(4, "big") + payload)
+        server.close()
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    return server.getsockname()[1], thread
+
+
+def test_send_returns_what_blender_applied():
+    """Regression test: the client used to close right after sending, so the app
+    said "Pose sent to Blender" even when the add-on applied nothing."""
+    received = {}
+    reply = {"ok": True, "applied": ["spine"], "requested": 1, "unmatched": [], "armature": "Armature"}
+    port, thread = _serve_once(reply, received)
+
+    result = live_link.send_pose_document({"format": "pose_craft_pose", "bones": {}}, port=port, timeout=2.0)
+
+    thread.join(timeout=2.0)
+    assert result == reply
+    assert received["document"]["live_link_protocol"] == live_link.PROTOCOL_VERSION
+
+
+def test_send_to_an_addon_without_replies_returns_none():
+    port, thread = _serve_once(None, {})
+    assert live_link.send_pose_document({"format": "pose_craft_pose"}, port=port, timeout=2.0) is None
+    thread.join(timeout=2.0)
+
+
+def test_malformed_reply_raises_value_error():
+    port, thread = _serve_once(None, {}, raw_reply=(5).to_bytes(4, "big") + b"nope!")
+    with pytest.raises(ValueError):
+        live_link.send_pose_document({"format": "pose_craft_pose"}, port=port, timeout=2.0)
+    thread.join(timeout=2.0)

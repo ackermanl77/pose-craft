@@ -31,7 +31,7 @@ _BLENDER_REST = {
     "shin.L": -BLENDER_UP,
     "upper_arm.L": BLENDER_LEFT,
     "upper_arm.R": -BLENDER_LEFT,
-    "foot.L": BLENDER_FRONT,
+    "foot.L": BLENDER_FRONT,  # the sole's forward axis (the bone itself slopes down, see FOOT_REST_PITCH_DEG)
 }
 
 
@@ -54,8 +54,10 @@ def _mediapipe_standing_person() -> np.ndarray:
         hip = lm[getattr(sk, f"{side}_HIP")]
         lm[getattr(sk, f"{side}_KNEE")] = hip + [0.0, 0.45, 0.0]
         lm[getattr(sk, f"{side}_ANKLE")] = hip + [0.0, 0.85, 0.0]
-        # Toes point toward the camera: smaller z.
-        lm[getattr(sk, f"{side}_FOOT_INDEX")] = hip + [0.0, 0.85, -0.2]
+        # Feet flat on the floor 8 cm below the ankles (+y is down): toes toward
+        # the camera (smaller z), heels just behind the ankles.
+        lm[getattr(sk, f"{side}_FOOT_INDEX")] = hip + [0.0, 0.93, -0.17]
+        lm[getattr(sk, f"{side}_HEEL")] = hip + [0.0, 0.93, 0.04]
     return lm
 
 
@@ -312,3 +314,67 @@ def test_bvh_end_site_is_the_leaf_bones_own_vector():
     for leaf in ("hand.L", "foot.R", "head"):
         spec = next(b for b in sk.BONES if b.name == leaf)
         np.testing.assert_allclose(by_name[leaf][1], spec.rest_direction * bvh.BONE_LENGTHS_CM[leaf], atol=1e-9)
+
+
+def _with_heels_at_the_rest_pitch(lm: np.ndarray) -> np.ndarray:
+    """Adds heels whose sole makes exactly FOOT_REST_PITCH_DEG with the ankle ->
+    toe line, so the sole-frame foot solve and the BVH's sloped rest foot agree
+    and forward kinematics can land the toe exactly."""
+    lm = lm.copy()
+    pitch = np.radians(sk.FOOT_REST_PITCH_DEG)
+    for side in ("LEFT", "RIGHT"):
+        ankle, toe = lm[getattr(sk, f"{side}_ANKLE")], lm[getattr(sk, f"{side}_FOOT_INDEX")]
+        foot_length = np.linalg.norm(toe - ankle)
+        d = (toe - ankle) / foot_length
+        lateral = np.array([1.0, 0.0, 0.0]) - d * d[0]
+        lateral /= np.linalg.norm(lateral)
+        sole = np.cos(pitch) * d + np.sin(pitch) * np.cross(d, lateral)
+        lm[getattr(sk, f"{side}_HEEL")] = toe - sole * (foot_length * np.cos(pitch) + 5.0)
+    return lm
+
+
+def _assert_bvh_fk_reproduces(landmarks: np.ndarray) -> None:
+    rotations = sk.solve_bone_rotations(landmarks)
+    fk = _bvh_forward_kinematics(bvh.build_bvh_document(rotations))
+    expected = sk.joint_positions(landmarks)
+    for bone in sk.BONES:
+        np.testing.assert_allclose(fk[bone.name], expected[f"{bone.name}.head"], atol=1e-4, err_msg=bone.name)
+    for leaf in ("hand.L", "hand.R", "foot.L", "foot.R"):
+        np.testing.assert_allclose(fk[f"{leaf}.end"], expected[f"{leaf}.tail"], atol=1e-4, err_msg=leaf)
+
+
+def test_bvh_forward_kinematics_holds_with_the_sole_frame_feet():
+    _assert_bvh_fk_reproduces(_with_heels_at_the_rest_pitch(_posed_landmarks_matching_bvh_proportions()))
+
+
+def test_bvh_forward_kinematics_reproduces_a_body_turned_60_degrees():
+    """Regression test: a yawed body used to solve to a root rotation of 0, and
+    BVH forward kinematics then put every shoulder about 18 cm off."""
+    turn = Rotation.from_euler("y", 60, degrees=True)
+    landmarks = turn.apply(_with_heels_at_the_rest_pitch(_posed_landmarks_matching_bvh_proportions()))
+    _assert_bvh_fk_reproduces(landmarks)
+
+
+def test_skeleton_forward_kinematics_matches_the_bvh_evaluation():
+    landmarks = _with_heels_at_the_rest_pitch(_posed_landmarks_matching_bvh_proportions())
+    rotations = sk.solve_bone_rotations(landmarks)
+    fk_bvh = _bvh_forward_kinematics(bvh.build_bvh_document(rotations))
+    fk = sk.forward_kinematics(rotations)
+    for bone in sk.BONES:
+        np.testing.assert_allclose(fk[f"{bone.name}.head"], fk_bvh[bone.name], atol=1e-4, err_msg=bone.name)
+
+
+def test_forward_kinematics_with_measured_proportions_lands_on_the_landmarks():
+    """The 3D preview draws this: with the subject's own segment lengths, the
+    posed skeleton sits on the landmarks wherever the rotations reproduce them."""
+    turn = Rotation.from_euler("xyz", [10, 70, -5], degrees=True)
+    landmarks = turn.apply(_with_heels_at_the_rest_pitch(_posed_landmarks_matching_bvh_proportions())) + [5, 2, 1]
+    lengths, shoulder_half, hip_half = sk.measured_proportions(landmarks)
+    expected = sk.joint_positions(landmarks)
+    fk = sk.forward_kinematics(
+        sk.solve_bone_rotations(landmarks), lengths, shoulder_half, hip_half, root_position=expected["spine.head"]
+    )
+    for key in expected:
+        if key == "head.tail":
+            continue
+        np.testing.assert_allclose(fk[key], expected[key], atol=1e-6, err_msg=key)

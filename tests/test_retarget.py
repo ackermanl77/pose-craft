@@ -42,13 +42,17 @@ def _t_pose_landmarks() -> np.ndarray:
     lm[sk.RIGHT_INDEX] = lm[sk.RIGHT_WRIST] + [-0.1, 0.0, 0.02]
     lm[sk.RIGHT_PINKY] = lm[sk.RIGHT_WRIST] + [-0.1, 0.0, -0.02]
 
+    # Feet flat on the floor: heel and toe 8 cm below the ankle, the toe ahead
+    # (+Z) and the heel just behind it, so the sole is level.
     lm[sk.LEFT_KNEE] = lm[sk.LEFT_HIP] + [0.0, -0.5, 0.0]
     lm[sk.LEFT_ANKLE] = lm[sk.LEFT_KNEE] + [0.0, -0.5, 0.0]
-    lm[sk.LEFT_FOOT_INDEX] = lm[sk.LEFT_ANKLE] + [0.0, 0.0, 0.2]
+    lm[sk.LEFT_FOOT_INDEX] = lm[sk.LEFT_ANKLE] + [0.0, -0.08, 0.17]
+    lm[sk.LEFT_HEEL] = lm[sk.LEFT_ANKLE] + [0.0, -0.08, -0.04]
 
     lm[sk.RIGHT_KNEE] = lm[sk.RIGHT_HIP] + [0.0, -0.5, 0.0]
     lm[sk.RIGHT_ANKLE] = lm[sk.RIGHT_KNEE] + [0.0, -0.5, 0.0]
-    lm[sk.RIGHT_FOOT_INDEX] = lm[sk.RIGHT_ANKLE] + [0.0, 0.0, 0.2]
+    lm[sk.RIGHT_FOOT_INDEX] = lm[sk.RIGHT_ANKLE] + [0.0, -0.08, 0.17]
+    lm[sk.RIGHT_HEEL] = lm[sk.RIGHT_ANKLE] + [0.0, -0.08, -0.04]
 
     return lm
 
@@ -65,8 +69,13 @@ def test_t_pose_yields_near_identity_rotations():
 
 def test_raised_arm_matches_expected_swing():
     landmarks = _t_pose_landmarks()
-    # Raise the left arm from pointing sideways (+X) to pointing up (+Y).
-    landmarks[sk.LEFT_ELBOW] = landmarks[sk.LEFT_SHOULDER] + [0.0, 0.25, 0.0]
+    # Raise the whole (straight) left arm from pointing sideways (+X) to
+    # pointing up (+Y). Moving only the elbow would bend the arm, and a bent
+    # arm's upper arm also rolls to its elbow plane (see test_retarget_frames.py).
+    raise_arm = Rotation.from_rotvec([0.0, 0.0, np.pi / 2])
+    shoulder = landmarks[sk.LEFT_SHOULDER]
+    for index in (sk.LEFT_ELBOW, sk.LEFT_WRIST, sk.LEFT_INDEX, sk.LEFT_PINKY):
+        landmarks[index] = shoulder + raise_arm.apply(landmarks[index] - shoulder)
 
     rotations = sk.solve_bone_rotations(landmarks)
     expected = Rotation.from_rotvec([0.0, 0.0, np.pi / 2])
@@ -158,9 +167,12 @@ def test_hand_twist_is_solved_from_index_pinky_spread():
     rotations = sk.solve_bone_rotations(landmarks)
     expected = Rotation.from_rotvec([np.pi / 2, 0.0, 0.0])
 
-    # forearm.L (hand.L's parent) is untouched, so local == world here.
-    relative = rotations["hand.L"] * expected.inv()
+    # The twist is shared between the forearm (where pronation happens) and the
+    # hand; together they give the full 90 degrees about the arm's own axis.
+    relative = rotations["forearm.L"] * rotations["hand.L"] * expected.inv()
     assert np.linalg.norm(relative.as_rotvec()) < 1e-6
+    forearm_share = Rotation.from_rotvec([np.pi / 2 * sk.FOREARM_TWIST_SHARE, 0.0, 0.0])
+    assert np.linalg.norm((rotations["forearm.L"] * forearm_share.inv()).as_rotvec()) < 1e-6
 
 
 def test_hand_twist_is_identity_when_index_and_pinky_coincide():
@@ -173,12 +185,6 @@ def test_hand_twist_is_identity_when_index_and_pinky_coincide():
 
     rotations = sk.solve_bone_rotations(landmarks)
     assert np.linalg.norm(rotations["hand.L"].as_rotvec()) < 1e-9
-
-
-def test_other_bones_have_no_twist_solving():
-    assert "forearm.L" not in sk._TWIST_CURRENT_LATERAL_FN
-    assert "upper_arm.L" not in sk._TWIST_CURRENT_LATERAL_FN
-    assert "thigh.L" not in sk._TWIST_CURRENT_LATERAL_FN
 
 
 def test_rejects_wrong_shape():

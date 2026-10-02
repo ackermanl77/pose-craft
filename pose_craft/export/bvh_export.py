@@ -20,7 +20,7 @@ side). Because of that choice _ENGINE_TO_BVH_AXES is the identity rotation,
 but it is still expressed as an explicit, named conversion (mirroring
 blender_pose.py's _rotation_to_blender pattern) rather than just skipped, so
 a future change to a different target convention only has to edit this one
-constant plus the rest-skeleton offsets (_rest_heads) if that also needs
+constant plus the rest-skeleton offsets (skeleton.rest_head_positions) if that also needs
 handedness flipped.
 
 Rest skeleton: a JOINT's OFFSET is where its head sits relative to its
@@ -50,7 +50,15 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from pose_craft.retarget.skeleton import BONES, LEFT_X, RIGHT_X, BoneSpec
+from pose_craft.retarget.skeleton import (  # noqa: F401 -- the size constants are re-exported
+    BONE_LENGTHS_CM,
+    BONES,
+    HIP_HALF_WIDTH_CM,
+    SHOULDER_HALF_WIDTH_CM,
+    BoneSpec,
+    hip_height_above_floor,
+    rest_head_positions,
+)
 
 BVH_ROTATION_ORDER = "ZXY"  # intrinsic Z, X, Y -- see module docstring
 
@@ -65,40 +73,10 @@ def _rotation_to_bvh(rotation: Rotation) -> Rotation:
     return _ENGINE_TO_BVH_AXES * rotation * _ENGINE_TO_BVH_AXES.inv()
 
 
-# Typical adult body-segment lengths (an arbitrary but consistent unit,
-# nominally centimeters), used only to give the BVH rest skeleton (each
-# JOINT's static OFFSET and each End Site) plausible non-zero bone lengths
-# along their rest_direction. retarget/skeleton.py
-# itself has no notion of bone length -- it only ever compares *directions*,
-# since it solves rotations from whatever real landmark positions a specific
-# photo produced -- so BVH's required OFFSET has to come from somewhere else.
-# This is a "reasonable" generic proportion table, not a calibrated
-# anthropometric one tied to any specific subject.
-BONE_LENGTHS_CM: dict[str, float] = {
-    "spine": 45.0,
-    "neck": 10.0,
-    "head": 20.0,
-    "upper_arm.L": 30.0,
-    "upper_arm.R": 30.0,
-    "forearm.L": 25.0,
-    "forearm.R": 25.0,
-    "hand.L": 18.0,
-    "hand.R": 18.0,
-    "thigh.L": 45.0,
-    "thigh.R": 45.0,
-    "shin.L": 40.0,
-    "shin.R": 40.0,
-    "foot.L": 20.0,
-    "foot.R": 20.0,
-}
-
-# Half the shoulder/hip width: how far upper_arm.L/R's heads sit to either
-# side of the spine's tail (shoulder center), and thigh.L/R's to either side of
-# its head (hip center), in the rest skeleton. Same "generic proportions" caveat
-# as BONE_LENGTHS_CM.
-SHOULDER_HALF_WIDTH_CM = 18.0
-HIP_HALF_WIDTH_CM = 10.0
-
+# The rest skeleton's proportions (BONE_LENGTHS_CM, SHOULDER_HALF_WIDTH_CM,
+# HIP_HALF_WIDTH_CM) and where the arms and legs attach live in
+# retarget/skeleton.py, shared with its forward_kinematics() preview, and are
+# re-exported here under the names this module has always used.
 _BONES_BY_NAME: dict[str, BoneSpec] = {b.name: b for b in BONES}
 
 _CHILDREN: dict[str, list[str]] = {b.name: [] for b in BONES}
@@ -109,17 +87,6 @@ for _bone in BONES:
 _ROOT_BONE = next(b.name for b in BONES if b.parent is None)
 
 
-# Bones whose head doesn't sit at their parent's tail: (which end of the
-# parent it's measured from, lateral offset from that end). Every other bone
-# continues its parent's chain from the parent's tail.
-_ATTACHMENTS: dict[str, tuple[str, np.ndarray]] = {
-    "upper_arm.L": ("tail", LEFT_X * SHOULDER_HALF_WIDTH_CM),
-    "upper_arm.R": ("tail", RIGHT_X * SHOULDER_HALF_WIDTH_CM),
-    "thigh.L": ("head", LEFT_X * HIP_HALF_WIDTH_CM),
-    "thigh.R": ("head", RIGHT_X * HIP_HALF_WIDTH_CM),
-}
-
-
 def _bone_vector(bone_name: str) -> np.ndarray:
     """The bone's own rest vector (head -> tail): rest_direction scaled to its length."""
     bone = _BONES_BY_NAME[bone_name]
@@ -127,22 +94,7 @@ def _bone_vector(bone_name: str) -> np.ndarray:
     return direction * BONE_LENGTHS_CM[bone_name]
 
 
-def _rest_heads() -> dict[str, np.ndarray]:
-    """Every bone's head position in the rest (T-pose) skeleton, root at the origin.
-    BONES lists every parent before its children, so one pass suffices."""
-    heads: dict[str, np.ndarray] = {}
-    for bone in BONES:
-        if bone.parent is None:
-            heads[bone.name] = np.zeros(3)
-            continue
-        end, lateral = _ATTACHMENTS.get(bone.name, ("tail", np.zeros(3)))
-        parent_head = heads[bone.parent]
-        anchor = parent_head + _bone_vector(bone.parent) if end == "tail" else parent_head
-        heads[bone.name] = anchor + lateral
-    return heads
-
-
-_REST_HEADS = _rest_heads()
+_REST_HEADS = rest_head_positions()
 
 
 def _offset(bone_name: str) -> np.ndarray:
@@ -202,6 +154,58 @@ def _channel_order() -> list[str]:
     return order
 
 
+def floor_root_position(bone_rotations: dict[str, Rotation]) -> tuple[float, float, float]:
+    """A ROOT position that stands the pose on the floor (Y = 0) with this
+    file's rest skeleton: the hip center lifted by its height above the
+    lowest joint (skeleton.hip_height_above_floor), so a crouch is exported
+    lowered rather than with its hips at the origin."""
+    return (0.0, hip_height_above_floor(bone_rotations), 0.0)
+
+
+def _motion_line(bone_rotations: dict[str, Rotation], root_position, order: list[str]) -> str:
+    values: list[str] = [_fmt(v) for v in root_position]
+    for name in order:
+        rotation = bone_rotations.get(name, Rotation.identity())
+        bvh_rotation = _rotation_to_bvh(rotation)
+        with warnings.catch_warnings():
+            # At exactly +/-90 degrees about X (e.g. a thigh raised straight
+            # forward) ZXY Euler angles hit gimbal lock; scipy warns and zeroes
+            # the third angle, but the returned angles still compose back to the
+            # exact same rotation, so the warning is just noise here.
+            warnings.simplefilter("ignore", UserWarning)
+            z, x, y = bvh_rotation.as_euler(BVH_ROTATION_ORDER, degrees=True)
+        values.extend([_fmt(z), _fmt(x), _fmt(y)])
+    return " ".join(values)
+
+
+def build_bvh_animation(
+    frames: list[dict[str, Rotation]],
+    *,
+    frame_time: float = 1.0 / 30.0,
+    root_positions: list[tuple[float, float, float]] | None = None,
+) -> str:
+    """A multi-frame BVH: the same HIERARCHY as build_bvh_document, and one
+    MOTION line per entry of `frames` (each a bone name -> local Rotation dict,
+    missing bones identity). root_positions: one per frame (default: all at
+    the origin)."""
+    if not frames:
+        raise ValueError("a BVH needs at least one frame")
+    if root_positions is not None and len(root_positions) != len(frames):
+        raise ValueError(f"{len(root_positions)} root positions for {len(frames)} frames")
+    hierarchy_lines: list[str] = ["HIERARCHY"]
+    _write_joint(hierarchy_lines, _ROOT_BONE, indent=0, is_root=True)
+
+    order = _channel_order()
+    positions = root_positions if root_positions is not None else [(0.0, 0.0, 0.0)] * len(frames)
+    lines = hierarchy_lines + [
+        "MOTION",
+        f"Frames: {len(frames)}",
+        f"Frame Time: {frame_time:.6f}",
+    ]
+    lines += [_motion_line(rotations, position, order) for rotations, position in zip(frames, positions)]
+    return "\n".join(lines) + "\n"
+
+
 def build_bvh_document(
     bone_rotations: dict[str, Rotation],
     *,
@@ -217,32 +221,10 @@ def build_bvh_document(
     Produces a single-frame (static pose) BVH: a HIERARCHY block for all 15
     bones plus their End Sites, and a MOTION block with exactly one frame --
     one set of Euler angles per joint, in the same traversal/channel order the
-    HIERARCHY block declares.
+    HIERARCHY block declares. Pass root_position=floor_root_position(...) to
+    stand the pose on the floor (the app does).
     """
-    hierarchy_lines: list[str] = ["HIERARCHY"]
-    _write_joint(hierarchy_lines, _ROOT_BONE, indent=0, is_root=True)
-
-    order = _channel_order()
-    motion_values: list[str] = [_fmt(v) for v in root_position]
-    for name in order:
-        rotation = bone_rotations.get(name, Rotation.identity())
-        bvh_rotation = _rotation_to_bvh(rotation)
-        with warnings.catch_warnings():
-            # At exactly +/-90 degrees about X (e.g. a thigh raised straight
-            # forward) ZXY Euler angles hit gimbal lock; scipy warns and zeroes
-            # the third angle, but the returned angles still compose back to the
-            # exact same rotation, so the warning is just noise here.
-            warnings.simplefilter("ignore", UserWarning)
-            z, x, y = bvh_rotation.as_euler(BVH_ROTATION_ORDER, degrees=True)
-        motion_values.extend([_fmt(z), _fmt(x), _fmt(y)])
-
-    lines = hierarchy_lines + [
-        "MOTION",
-        "Frames: 1",
-        f"Frame Time: {frame_time:.6f}",
-        " ".join(motion_values),
-    ]
-    return "\n".join(lines) + "\n"
+    return build_bvh_animation([bone_rotations], frame_time=frame_time, root_positions=[root_position])
 
 
 def save_bvh_file(
@@ -255,4 +237,16 @@ def save_bvh_file(
     Path(path).write_text(
         build_bvh_document(bone_rotations, frame_time=frame_time, root_position=root_position),
         encoding="utf-8",
+    )
+
+
+def save_bvh_animation(
+    frames: list[dict[str, Rotation]],
+    path: str | Path,
+    *,
+    frame_time: float = 1.0 / 30.0,
+    root_positions: list[tuple[float, float, float]] | None = None,
+) -> None:
+    Path(path).write_text(
+        build_bvh_animation(frames, frame_time=frame_time, root_positions=root_positions), encoding="utf-8"
     )
