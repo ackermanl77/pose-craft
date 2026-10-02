@@ -7,15 +7,29 @@ Blender's own bone shape, which shows each bone's roll -- with line segments
 on top; a low-confidence bone's segment is dashed, so it reads without
 relying on colour. A small XYZ gizmo, front/side/top camera presets and
 optional bone-name labels help judge depth.
+
+F9: hovering a bone shows its name, local Euler angles (about its own bone
+axes, as in Blender) and confidence in a small label; and the photo can be
+shown as a backdrop plane behind the skeleton, placed with the person's own
+weak-perspective fit (skeleton.image_to_world_scale) so the photo's body
+lines up with the raw landmarks. Finger bones (B11) are drawn when present.
 """
 from __future__ import annotations
 
 import numpy as np
 import pyqtgraph.opengl as gl
-from pyqtgraph import Vector
+from pyqtgraph import Transform3D, Vector
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import QVector4D
+from PySide6.QtWidgets import QLabel
 
 from pose_craft.export.blender_pose import LOW_CONFIDENCE_THRESHOLD
-from pose_craft.retarget.skeleton import BONES
+from pose_craft.retarget.skeleton import ALL_BONE_NAMES, BONES, bone_local_euler_deg, image_to_world_scale
+
+# A hover within this many pixels of a bone's drawn segment labels it.
+HOVER_MAX_DISTANCE_PX = 12.0
+# The backdrop texture's longest side (a photo needn't be uploaded at full size).
+BACKDROP_MAX_SIDE = 768
 
 BONE_COLOR = (0.3, 0.8, 1.0, 1.0)
 JOINT_COLOR = (1.0, 1.0, 1.0, 1.0)  # neutral: the joints say nothing about confidence
@@ -75,6 +89,11 @@ def _engine_to_display(points: np.ndarray) -> np.ndarray:
     return np.asarray(points, dtype=np.float64) @ _ENGINE_TO_DISPLAY.T
 
 
+def _drawn_bones(joint_positions: dict[str, np.ndarray]) -> list[str]:
+    """Every bone (body first, then fingers) whose head and tail are given."""
+    return [n for n in ALL_BONE_NAMES if f"{n}.head" in joint_positions and f"{n}.tail" in joint_positions]
+
+
 def _is_low_confidence(confidence: dict[str, float] | None, bone_name: str) -> bool:
     return confidence is not None and confidence.get(bone_name, 1.0) < LOW_CONFIDENCE_THRESHOLD
 
@@ -108,10 +127,10 @@ def _bone_segments(
     bones, which become DASHES_PER_BONE dashes -- the same solid/dashed
     distinction the photo overlay draws, so confidence doesn't rely on hue."""
     vertices, colors = [], []
-    for bone in BONES:
-        head = np.asarray(joint_positions[f"{bone.name}.head"], dtype=float)
-        tail = np.asarray(joint_positions[f"{bone.name}.tail"], dtype=float)
-        if _is_low_confidence(confidence, bone.name):
+    for name in _drawn_bones(joint_positions):
+        head = np.asarray(joint_positions[f"{name}.head"], dtype=float)
+        tail = np.asarray(joint_positions[f"{name}.tail"], dtype=float)
+        if _is_low_confidence(confidence, name):
             steps = np.linspace(0.0, 1.0, 2 * DASHES_PER_BONE)
             for start, end in zip(steps[0::2], steps[1::2]):
                 vertices += [head + (tail - head) * start, head + (tail - head) * end]
@@ -146,6 +165,68 @@ def octahedron_mesh(head: np.ndarray, tail: np.ndarray, lateral: np.ndarray) -> 
     return vertices, faces
 
 
+def photo_backdrop_corners(
+    landmarks: np.ndarray,
+    image_xy: np.ndarray,
+    aspect: float,
+    visibility: np.ndarray | None = None,
+    depth_margin: float = 0.25,
+) -> np.ndarray | None:
+    """The photo's four corners (top-left, top-right, bottom-right,
+    bottom-left), engine frame, in the same space as the raw landmarks: the
+    weak-perspective fit maps every image point onto the X/Y of the world
+    point it shows, and the plane sits `depth_margin` (of the person's
+    height) behind the person's deepest landmark. None when no fit exists."""
+    scale, world_center, image_center = image_to_world_scale(landmarks, image_xy, aspect, visibility)
+    if scale <= 1e-9:
+        return None
+    landmarks = np.asarray(landmarks, dtype=float)
+    height = float(np.ptp(landmarks[:, 1])) or 1.0
+    z = float(landmarks[:, 2].min()) - depth_margin * height
+    corners = []
+    for x, y in ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)):
+        u, v = x * aspect, y
+        corners.append([
+            (u - image_center[0]) / scale + world_center[0],
+            -(v - image_center[1]) / scale + world_center[1],
+            z,
+        ])
+    return np.array(corners)
+
+
+def backdrop_transform(corners_engine: np.ndarray, width: int, height: int) -> Transform3D:
+    """The GLImageItem transform drawing a width x height image (its data
+    indexed [x, y], y = image row) between the given engine-frame corners."""
+    tl, tr, _br, bl = _engine_to_display(corners_engine)
+    ex, ey = (tr - tl) / width, (bl - tl) / height
+    normal = np.cross(ex, ey)
+    normal = normal / (np.linalg.norm(normal) or 1.0)
+    return Transform3D(
+        ex[0], ey[0], normal[0], tl[0],
+        ex[1], ey[1], normal[1], tl[1],
+        ex[2], ey[2], normal[2], tl[2],
+        0.0, 0.0, 0.0, 1.0,
+    )
+
+
+def _segment_distance_2d(point: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    ab = b - a
+    denominator = float(np.dot(ab, ab))
+    t = 0.0 if denominator < 1e-18 else float(np.clip(np.dot(point - a, ab) / denominator, 0.0, 1.0))
+    return float(np.linalg.norm(point - (a + t * ab)))
+
+
+def hover_text(name: str, rotation, confidence: float | None) -> str:
+    """The hover label: bone name, local Euler angles about its own axes, confidence."""
+    text = name
+    if rotation is not None:
+        x, y, z = bone_local_euler_deg(name, rotation)
+        text += f"\nX {x:+.1f}°  Y {y:+.1f}°  Z {z:+.1f}°"
+    if confidence is not None:
+        text += f"\nconfidence {confidence:.0%}"
+    return text
+
+
 def _compute_camera_frame(points: np.ndarray) -> tuple[np.ndarray, float]:
     """Pure math behind auto-framing: given every drawn point, returns (center,
     distance) so the whole skeleton fits in view regardless of a person's size,
@@ -177,6 +258,16 @@ class SkeletonViewport(gl.GLViewWidget):
         self.addItem(self._axes)
 
         self.show_labels = False
+        self.hover_enabled = True
+        self._backdrop: gl.GLImageItem | None = None
+        self._joint_positions: dict[str, np.ndarray] = {}
+        self._rotations: dict | None = None
+        self._confidence: dict[str, float] | None = None
+        self._hover_label = QLabel(self)
+        self._hover_label.setStyleSheet("background:rgba(20,20,20,210); color:#eee; padding:3px; border-radius:3px;")
+        self._hover_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._hover_label.hide()
+        self.setMouseTracking(True)
         self._bone_lines: gl.GLLinePlotItem | None = None
         self._bone_bodies: gl.GLMeshItem | None = None
         self._joints: gl.GLScatterPlotItem | None = None
@@ -193,6 +284,98 @@ class SkeletonViewport(gl.GLViewWidget):
         for label in self._labels:
             self.removeItem(label)
         self._labels = []
+        self._joint_positions = {}
+        self._hover_label.hide()
+
+    # -- photo backdrop (F9) -----------------------------------------------------
+
+    def set_backdrop(self, image_rgb: np.ndarray | None, corners_engine: np.ndarray | None = None) -> None:
+        """Shows `image_rgb` (H, W, 3 uint8) between the engine-frame corners
+        (see photo_backdrop_corners), or removes the backdrop with None."""
+        if self._backdrop is not None:
+            self.removeItem(self._backdrop)
+            self._backdrop = None
+        if image_rgb is None or corners_engine is None:
+            return
+        import cv2
+
+        h, w = image_rgb.shape[:2]
+        if max(h, w) > BACKDROP_MAX_SIDE:
+            factor = BACKDROP_MAX_SIDE / max(h, w)
+            image_rgb = cv2.resize(image_rgb, (max(1, round(w * factor)), max(1, round(h * factor))), interpolation=cv2.INTER_AREA)
+            h, w = image_rgb.shape[:2]
+        rgba = np.empty((w, h, 4), dtype=np.ubyte)
+        rgba[..., :3] = np.transpose(image_rgb, (1, 0, 2))
+        rgba[..., 3] = 200
+        self._backdrop = gl.GLImageItem(rgba, glOptions="translucent")
+        self._backdrop.setTransform(backdrop_transform(corners_engine, w, h))
+        self.addItem(self._backdrop)
+
+    # -- hover label (F9) --------------------------------------------------------
+
+    def project_to_screen(self, points_engine: np.ndarray) -> np.ndarray:
+        """(N, 3) engine-frame points -> (N, 2) widget pixel positions with the
+        current camera (NaN for points behind it)."""
+        viewport = (0, 0, max(1, self.width()), max(1, self.height()))
+        matrix = self.projectionMatrix(viewport, viewport) * self.viewMatrix()
+        out = []
+        for point in _engine_to_display(np.atleast_2d(points_engine)):
+            clip = matrix.map(QVector4D(float(point[0]), float(point[1]), float(point[2]), 1.0))
+            if clip.w() <= 1e-9:
+                out.append([np.nan, np.nan])
+                continue
+            ndc_x, ndc_y = clip.x() / clip.w(), clip.y() / clip.w()
+            out.append([(ndc_x + 1.0) / 2.0 * viewport[2], (1.0 - ndc_y) / 2.0 * viewport[3]])
+        return np.array(out)
+
+    def bone_at(self, x: float, y: float) -> str | None:
+        """The drawn bone nearest the widget pixel (x, y), within HOVER_MAX_DISTANCE_PX."""
+        names = _drawn_bones(self._joint_positions)
+        if not names:
+            return None
+        heads = self.project_to_screen(np.array([self._joint_positions[f"{n}.head"] for n in names]))
+        tails = self.project_to_screen(np.array([self._joint_positions[f"{n}.tail"] for n in names]))
+        point = np.array([x, y])
+        best, best_distance = None, HOVER_MAX_DISTANCE_PX
+        for name, head, tail in zip(names, heads, tails):
+            if np.isnan(head).any() or np.isnan(tail).any():
+                continue
+            distance = _segment_distance_2d(point, head, tail)
+            if distance <= best_distance:
+                best, best_distance = name, distance
+        return best
+
+    def hover_at(self, x: float, y: float) -> str | None:
+        """Shows (or hides) the hover label for the bone under (x, y); returns its name."""
+        name = self.bone_at(x, y) if self.hover_enabled else None
+        if name is None:
+            self._hover_label.hide()
+            return None
+        rotation = (self._rotations or {}).get(name)
+        confidence = None if self._confidence is None else self._confidence.get(name)
+        self._hover_label.setText(hover_text(name, rotation, confidence))
+        self._hover_label.adjustSize()
+        left = min(int(x) + 14, max(0, self.width() - self._hover_label.width()))
+        top = min(int(y) + 14, max(0, self.height() - self._hover_label.height()))
+        self._hover_label.move(left, top)
+        self._hover_label.show()
+        self._hover_label.raise_()
+        return name
+
+    def hover_label_text(self) -> str:
+        return "" if self._hover_label.isHidden() else self._hover_label.text()
+
+    def mouseMoveEvent(self, ev) -> None:
+        if ev.buttons() == Qt.NoButton:
+            pos = ev.position() if hasattr(ev, "position") else QPointF(ev.pos())
+            self.hover_at(pos.x(), pos.y())
+            return
+        self._hover_label.hide()
+        super().mouseMoveEvent(ev)
+
+    def leaveEvent(self, ev) -> None:
+        self._hover_label.hide()
+        super().leaveEvent(ev)
 
     def set_camera_preset(self, name: str) -> None:
         """Front, side or top view (or the default three-quarter one), framed
@@ -218,6 +401,7 @@ class SkeletonViewport(gl.GLViewWidget):
         confidence: dict[str, float] | None = None,
         ghost_points: dict[str, np.ndarray] | None = None,
         lateral_axes: dict[str, np.ndarray] | None = None,
+        rotations: dict | None = None,
     ) -> None:
         """joint_positions: '<bone>.head'/'<bone>.tail' points in the engine Y-up
         frame (converted to the view's Z-up frame here -- see _engine_to_display):
@@ -234,8 +418,14 @@ class SkeletonViewport(gl.GLViewWidget):
         lateral_axes: optional bone name -> the bone's roll axis (engine frame,
         see skeleton.bone_lateral_axes); with it every bone also gets an
         octahedral body that turns with its roll.
+
+        rotations: optional bone name -> local Rotation, for the hover label's
+        Euler angles (F9).
         """
         self.clear_skeleton()
+        self._joint_positions = dict(joint_positions)
+        self._rotations = rotations
+        self._confidence = confidence
 
         vertices, colors = _bone_segments(joint_positions, confidence)
         self._bone_lines = gl.GLLinePlotItem(
@@ -245,16 +435,14 @@ class SkeletonViewport(gl.GLViewWidget):
 
         if lateral_axes:
             mesh_vertices, mesh_faces, face_colors = [], [], []
-            for bone in BONES:
-                lateral = lateral_axes.get(bone.name)
+            for name in _drawn_bones(joint_positions):
+                lateral = lateral_axes.get(name)
                 if lateral is None:
                     continue
-                verts, faces = octahedron_mesh(
-                    joint_positions[f"{bone.name}.head"], joint_positions[f"{bone.name}.tail"], lateral
-                )
+                verts, faces = octahedron_mesh(joint_positions[f"{name}.head"], joint_positions[f"{name}.tail"], lateral)
                 mesh_faces.append(faces + 6 * len(mesh_vertices))
                 mesh_vertices.append(verts)
-                color = LOW_CONFIDENCE_BODY_COLOR if _is_low_confidence(confidence, bone.name) else BONE_BODY_COLOR
+                color = LOW_CONFIDENCE_BODY_COLOR if _is_low_confidence(confidence, name) else BONE_BODY_COLOR
                 face_colors += [color] * len(faces)
             if mesh_vertices:
                 self._bone_bodies = gl.GLMeshItem(

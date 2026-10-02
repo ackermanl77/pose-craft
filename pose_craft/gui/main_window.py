@@ -53,24 +53,29 @@ from pose_craft.export.blender_pose import (
 from pose_craft.export.bvh_export import floor_root_position, save_bvh_animation, save_bvh_file
 from pose_craft.export.live_link import send_pose_document
 from pose_craft.gui.photo_view import PhotoOverlayPerson, PhotoView, legend_entries, legend_swatch
-from pose_craft.gui.viewport_3d import SkeletonViewport
+from pose_craft.gui.viewport_3d import SkeletonViewport, photo_backdrop_corners
 from pose_craft.imaging import PHOTO_GUIDANCE, assess_photo_quality, imread_unicode
 from pose_craft.retarget.skeleton import (
     BONE_NAMES,
+    DRAGGABLE_JOINTS,
     FLIPPABLE_BONES,
+    JOINT_LABELS,
     ORIENTATION_CORRECTIONS,
     apply_bone_overrides,
     apply_orientation_correction,
     bone_axes_rotation,
     bone_confidence,
     bone_lateral_axes,
+    flip_hand_depth,
     flip_limb_depth,
     floor_height,
     forward_kinematics,
     image_joint_positions_2d,
     joint_positions,
     measured_proportions,
+    mirror_hands,
     mirror_landmarks,
+    move_joint,
     rotate_joint_positions,
     solve_bone_rotations,
 )
@@ -119,6 +124,7 @@ class SolveWorker(QThread):
         model_variant: str,
         use_gpu: bool = True,
         group_photo: bool = False,
+        hands: bool = False,
         parent=None,
     ):
         super().__init__(parent)
@@ -128,6 +134,7 @@ class SolveWorker(QThread):
         self._model_variant = model_variant
         self._use_gpu = use_gpu
         self._group_photo = group_photo
+        self._hands = hands
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -153,6 +160,15 @@ class SolveWorker(QThread):
                 raise DownloadCancelled("solve cancelled")
             estimator.max_people = self._max_people
             estimator.group_photo = self._group_photo
+            estimator.hands = self._hands
+            if self._hands:
+                # B11: loads (on first use, downloads) the hand landmark model.
+                estimator.enable_hands(
+                    on_progress=lambda downloaded, total: self.progress.emit(downloaded, total),
+                    should_cancel=self._cancel.is_set,
+                )
+                if self._cancel.is_set():
+                    raise DownloadCancelled("solve cancelled")
             people = estimator.detect(self._image_bgr)
             if self._cancel.is_set():
                 raise DownloadCancelled("solve cancelled")
@@ -194,15 +210,20 @@ class WarmUpWorker(QThread):
 
 
 class VideoSolveWorker(QThread):
-    """Tracks one person through a video (estimation/video.py) off the UI thread."""
+    """Tracks up to max_people people through a video (estimation/video.py,
+    stable IDs per person) off the UI thread."""
 
     finished_ok = Signal(object, object)  # VideoSolve, PoseEstimator
     failed = Signal(str)
     cancelled = Signal()
     progress = Signal(int, int)  # frames done, total frames (0 if unknown)
 
-    def __init__(self, path: str, estimator: PoseEstimator | None, model_variant: str, use_gpu: bool, parent=None):
+    def __init__(
+        self, path: str, estimator: PoseEstimator | None, model_variant: str, use_gpu: bool, max_people: int = 1,
+        parent=None,
+    ):
         super().__init__(parent)
+        self._max_people = max_people
         self._path = path
         self._estimator = estimator
         self._model_variant = model_variant
@@ -225,6 +246,7 @@ class VideoSolveWorker(QThread):
             result = solve_video(
                 self._path,
                 estimator,
+                max_people=self._max_people,
                 on_progress=lambda done, total: self.progress.emit(done, total),
                 should_cancel=self._cancel.is_set,
             )
@@ -368,7 +390,7 @@ def _live_link_reply_message(reply: dict | None) -> tuple[str, bool]:
 
 
 def _preview_positions(
-    landmarks: np.ndarray, rotations: dict, correction
+    landmarks: np.ndarray, rotations: dict, correction, hands: dict | None = None, extra_points: dict | None = None
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     """What the 3D preview draws: (the skeleton posed by forward kinematics from
     the exported rotations, the raw landmark joints as a ghost). The FK skeleton
@@ -378,11 +400,16 @@ def _preview_positions(
     orientation fix the rotations already carry. Both are then lifted so the
     skeleton's lowest joint stands on the grid at Y = 0 (B6) -- the world
     landmarks are hip-centred, so without this every pose stood half through
-    the floor."""
-    raw = joint_positions(landmarks)
-    lengths, shoulder_half, hip_half = measured_proportions(landmarks)
+    the floor.
+
+    hands: the hand landmarks the rotations were solved with (B11), adding
+    finger joints to the ghost. extra_points: more ghost-space points (the
+    photo backdrop's corners, F9) to move the same way as the ghost; they're
+    returned in the ghost dict under their own keys."""
+    raw = joint_positions(landmarks, hands)
+    lengths, shoulder_half, hip_half = measured_proportions(landmarks, hands)
     solved = forward_kinematics(rotations, lengths, shoulder_half, hip_half, root_position=raw["spine.head"])
-    ghost = rotate_joint_positions(raw, correction, pivot=raw["spine.head"])
+    ghost = rotate_joint_positions({**raw, **(extra_points or {})}, correction, pivot=raw["spine.head"])
     lift = np.array([0.0, -floor_height(solved), 0.0])
     return {k: v + lift for k, v in solved.items()}, {k: v + lift for k, v in ghost.items()}
 
@@ -401,15 +428,50 @@ def _update_recent_files(recent: list[str], path: str, limit: int = MAX_RECENT_F
     return [str(Path(path))] + kept[: limit - 1]
 
 
+@dataclasses.dataclass
+class EditedPerson:
+    """A person after their manual edits (moved joints, then depth flips),
+    before mirroring: what every solve, export and overlay uses."""
+
+    landmarks: np.ndarray
+    image_xy: np.ndarray
+    visibility: np.ndarray
+    hands: dict  # "L"/"R" -> (21, 3) engine-frame hand landmarks (B11)
+    hands_xy: dict  # "L"/"R" -> (21, 2) normalized
+    hand_presence: dict  # "L"/"R" -> score
+
+
+def edited_person(person: DetectedPerson, edits: "PersonEdits | None", aspect: float = 1.0) -> EditedPerson:
+    """Applies a person's edits: each moved joint in landmark order (a parent
+    joint before its child, so a moved elbow then wrist keeps the forearm's
+    length from the moved elbow), then the depth flips (hands included)."""
+    landmarks = np.asarray(person.landmarks, dtype=float)
+    image_xy = np.asarray(person.image_landmarks_xy, dtype=float)
+    hands = person.hand_world() if hasattr(person, "hand_world") else {}
+    hands_xy = person.hand_image_xy() if hasattr(person, "hand_image_xy") else {}
+    if edits is not None:
+        for joint, xy in edits.moved:
+            landmarks, image_xy, hands, hands_xy = move_joint(
+                landmarks, image_xy, joint, xy, aspect, person.visibility, hands, hands_xy
+            )
+        for bone in sorted(edits.flipped):
+            hands = flip_hand_depth(landmarks, hands, bone)
+            landmarks = flip_limb_depth(landmarks, bone)
+    presence = person.hand_presence() if hasattr(person, "hand_presence") else {}
+    return EditedPerson(landmarks, image_xy, np.asarray(person.visibility), hands, hands_xy, presence)
+
+
 @dataclasses.dataclass(frozen=True)
 class PersonEdits:
     """Manual corrections for one person (F4): limbs whose depth is flipped
     (raw, unmirrored bone names -- what the user clicked in the photo), and
     per-bone rotation adjustments in degrees about the bone's own X/Y/Z axes
-    (exported bone names, as in the "Adjust bone" picker)."""
+    (exported bone names, as in the "Adjust bone" picker), and joints dragged
+    on the photo to a new image position (raw landmark indices; photos only)."""
 
     flipped: frozenset = frozenset()
     overrides: tuple = ()  # ((bone name, (x, y, z) degrees), ...), sorted
+    moved: tuple = ()  # ((landmark index, (x, y) normalized), ...), sorted by index
 
     def override_rotations(self) -> dict[str, Rotation]:
         return {name: bone_axes_rotation(name, angles) for name, angles in self.overrides}
@@ -426,16 +488,23 @@ class PersonEdits:
     def override_for(self, bone: str) -> tuple[float, float, float]:
         return dict(self.overrides).get(bone, (0.0, 0.0, 0.0))
 
+    def with_joint_moved(self, joint: int, xy: tuple[float, float] | None) -> "PersonEdits":
+        entries = {index: value for index, value in self.moved if index != joint}
+        if xy is not None:
+            entries[int(joint)] = (float(xy[0]), float(xy[1]))
+        return dataclasses.replace(self, moved=tuple(sorted(entries.items())))
+
     def is_empty(self) -> bool:
-        return not self.flipped and not self.overrides
+        return not self.flipped and not self.overrides and not self.moved
 
 
 class _EditCommand(QUndoCommand):
     """One manual correction as an undo step: swaps a person's PersonEdits."""
 
-    def __init__(self, window: "MainWindow", person_index: int, before: PersonEdits, after: PersonEdits, text: str):
+    def __init__(self, window: "MainWindow", person_key: int, before: PersonEdits, after: PersonEdits, text: str):
         super().__init__(text)
-        self._window, self._index, self._before, self._after = window, person_index, before, after
+        # person_key: the person's index in a photo, their track ID in a video.
+        self._window, self._index, self._before, self._after = window, person_key, before, after
 
     def redo(self) -> None:
         self._window._set_person_edits(self._index, self._after)
@@ -455,7 +524,12 @@ class MainWindow(QMainWindow):
         self._image_bgr: np.ndarray | None = None
         self._source_path: str | None = None
         self._people: list[DetectedPerson] = []
+        # Edit key per entry of _people: its index for a photo, its track ID
+        # for a video (so a person's edits follow them from frame to frame).
+        self._person_keys: list[int] = []
+        self._selected_track: int | None = None
         self._edits: dict[int, PersonEdits] = {}
+        self._preview_bgr: np.ndarray | None = None  # what the photo pane shows (backdrop, F9)
         self._video = None  # estimation.video.VideoSolve while a video is loaded
         self._worker: SolveWorker | None = None
         self._video_worker: VideoSolveWorker | None = None
@@ -506,6 +580,7 @@ class MainWindow(QMainWindow):
         self.photo_view.setAccessibleName("Photo")
         self.photo_view.clicked_normalized.connect(self._on_photo_clicked)
         self.photo_view.context_requested.connect(self._on_photo_context)
+        self.photo_view.joint_dragged.connect(self._on_joint_dragged)
         photo_layout.addWidget(self.photo_view, stretch=1)
         photo_layout.addWidget(self._build_legend())
 
@@ -517,6 +592,7 @@ class MainWindow(QMainWindow):
         preview_layout.addWidget(preview_label)
         self.viewport = SkeletonViewport()
         self.viewport.setMinimumSize(240, 240)
+        self.viewport.setToolTip("Hover a bone for its name, local rotation and confidence.")
         self.viewport.setAccessibleName("3D preview")
         preview_layout.addWidget(self.viewport, stretch=1)
 
@@ -654,6 +730,15 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self.group_photo_checkbox)
 
+        self.hands_checkbox = QCheckBox("&Hands and fingers")
+        self.hands_checkbox.setToolTip(
+            "Also runs MediaPipe's hand landmark model on each person's hands (cropped from the pose's wrist "
+            "and knuckles) and exports 15 finger bones per hand found (Rigify names: thumb.01.L, f_index.01.L, "
+            "...) in the JSON, BVH and Live Link. A few ms per hand; the first use downloads the hand model. "
+            "Off: the 15-bone body pose exactly as before."
+        )
+        layout.addWidget(self.hands_checkbox)
+
         self.solve_btn = QPushButton("Solve Pose")
         self.solve_btn.setToolTip("Detect and solve every person in the photo (F5)")
         self.solve_btn.clicked.connect(self._on_solve_pose)
@@ -708,7 +793,10 @@ class MainWindow(QMainWindow):
         (from the photo's right-click menu) flip a limb's depth."""
         group = QGroupBox("3. Correct")
         layout = QVBoxLayout(group)
-        hint = QLabel("Right-click a limb in the photo to flip its depth (toward / away from the camera).")
+        hint = QLabel(
+            "Drag a ringed joint on the photo to move it (its limb is re-solved); right-click a limb to flip "
+            "its depth (toward / away from the camera)."
+        )
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
@@ -766,11 +854,17 @@ class MainWindow(QMainWindow):
         layout.addLayout(frame_row)
         self.export_animation_btn = QPushButton("Export Animation BVH...")
         self.export_animation_btn.setToolTip(
-            "Every solved frame as one BVH animation, smoothed, standing on the floor, with planted feet "
-            "driving the root's motion."
+            "The selected person's solved frames as one BVH animation, smoothed, standing on the floor, with "
+            "planted feet driving the root's motion."
         )
         self.export_animation_btn.clicked.connect(self._on_export_animation)
         layout.addWidget(self.export_animation_btn)
+        self.export_all_tracks_btn = QPushButton("Export All People (BVH)...")
+        self.export_all_tracks_btn.setToolTip(
+            "One animated BVH per tracked person (<video>_person<N>.bvh), to a folder you choose."
+        )
+        self.export_all_tracks_btn.clicked.connect(self._on_export_all_tracks)
+        layout.addWidget(self.export_all_tracks_btn)
         self.video_group = group
         group.setVisible(False)
         return group
@@ -881,6 +975,11 @@ class MainWindow(QMainWindow):
         self._action(view_menu, "&Top", lambda: self.viewport.set_camera_preset("top"), "7")
         self._action(view_menu, "&Reset Camera", lambda: self.viewport.set_camera_preset("default"), "0")
         self.labels_action = self._action(view_menu, "Bone &Labels", self._on_toggle_labels, "L", checkable=True)
+        self.hover_action = self._action(view_menu, "&Hover Info", self._on_toggle_hover, "H", checkable=True)
+        self.hover_action.setChecked(True)
+        self.backdrop_action = self._action(
+            view_menu, "Photo &Backdrop", self._on_toggle_backdrop, "Shift+B", checkable=True
+        )
 
     # -- settings (F7) --------------------------------------------------------------
 
@@ -894,6 +993,8 @@ class MainWindow(QMainWindow):
         self.use_gpu_checkbox.setChecked(str(s.value("detect/use_gpu", "true")).lower() == "true")
         self.max_people_spin.setValue(int(s.value("detect/max_people", 4)))
         self.group_photo_checkbox.setChecked(str(s.value("detect/group_photo", "false")).lower() == "true")
+        self.hands_checkbox.setChecked(str(s.value("detect/hands", "false")).lower() == "true")
+        self.backdrop_action.setChecked(str(s.value("view/backdrop", "false")).lower() == "true")
         geometry = s.value("window/geometry")
         if geometry is not None:
             self.restoreGeometry(geometry)
@@ -910,6 +1011,8 @@ class MainWindow(QMainWindow):
         s.setValue("detect/use_gpu", "true" if self.use_gpu_checkbox.isChecked() else "false")
         s.setValue("detect/max_people", self.max_people_spin.value())
         s.setValue("detect/group_photo", "true" if self.group_photo_checkbox.isChecked() else "false")
+        s.setValue("detect/hands", "true" if self.hands_checkbox.isChecked() else "false")
+        s.setValue("view/backdrop", "true" if self.backdrop_action.isChecked() else "false")
         s.setValue("window/geometry", self.saveGeometry())
         s.setValue("window/splitter", self.splitter.saveState())
         s.sync()
@@ -947,7 +1050,7 @@ class MainWindow(QMainWindow):
         Cancel button and the busy cursor."""
         for widget in (
             self.load_btn, self.load_video_btn, self.solve_btn, self.max_people_spin,
-            self.model_variant_combo, self.use_gpu_checkbox, self.group_photo_checkbox,
+            self.model_variant_combo, self.use_gpu_checkbox, self.group_photo_checkbox, self.hands_checkbox,
         ):
             widget.setEnabled(not busy)
         for action in (self.open_action, self.open_video_action, self.solve_action, self.recent_menu.menuAction()):
@@ -980,6 +1083,7 @@ class MainWindow(QMainWindow):
         self.export_all_btn.setEnabled(has_people)
         self.export_all_action.setEnabled(has_people)
         self.export_animation_btn.setEnabled(self._video is not None and bool(self._video.solved_frames()))
+        self.export_all_tracks_btn.setEnabled(self._video is not None and len(self._video.track_ids()) > 0)
 
     def _worker_running(self) -> bool:
         return any(w is not None and w.isRunning() for w in (self._worker, self._video_worker))
@@ -1086,6 +1190,8 @@ class MainWindow(QMainWindow):
         self.person_combo.clear()
         self.person_combo.blockSignals(False)
         self._people = []
+        self._person_keys = []
+        self._selected_track = None
         self._edits = {}
         self.undo_stack.clear()
         self.viewport.clear_skeleton()
@@ -1093,6 +1199,7 @@ class MainWindow(QMainWindow):
         self._set_result_actions_enabled(False)
 
     def _set_photo_preview(self, image_bgr: np.ndarray) -> None:
+        self._preview_bgr = image_bgr
         rgb = np.ascontiguousarray(image_bgr[:, :, ::-1])
         h, w, _ = rgb.shape
         qimage = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
@@ -1136,6 +1243,7 @@ class MainWindow(QMainWindow):
             self.model_variant_combo.currentText(),
             self.use_gpu_checkbox.isChecked(),
             self.group_photo_checkbox.isChecked(),
+            self.hands_checkbox.isChecked(),
         )
         self._worker.finished_ok.connect(self._on_solve_finished)
         self._worker.failed.connect(self._on_solve_failed)
@@ -1153,9 +1261,9 @@ class MainWindow(QMainWindow):
         if total > 0:
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(downloaded * 100 // total)
-            self.statusBar().showMessage(f"Downloading pose model... {downloaded * 100 // total}%")
+            self.statusBar().showMessage(f"Downloading model... {downloaded * 100 // total}%")
         else:
-            self.statusBar().showMessage(f"Downloading pose model... {downloaded // 1024} KB")
+            self.statusBar().showMessage(f"Downloading model... {downloaded // 1024} KB")
 
     def _on_solve_finished(self, people: list[DetectedPerson], estimator: PoseEstimator) -> None:
         if self._closing:
@@ -1167,6 +1275,7 @@ class MainWindow(QMainWindow):
         self._estimator = estimator
         self._clear_results()
         self._people = people
+        self._person_keys = list(range(len(people)))
 
         if not people:
             # Clear everything the previous solve left behind -- the person list,
@@ -1189,6 +1298,9 @@ class MainWindow(QMainWindow):
         # append-onto-`status` pattern the max-people warning above already uses.
         previewed_confidence = bone_confidence(people[self.person_combo.currentIndex()].visibility)
         status += _low_confidence_status_suffix(previewed_confidence)
+        if self.hands_checkbox.isChecked():
+            hands = sum(len(getattr(person, "hands", {}) or {}) for person in people)
+            status += f" -- {hands} hand(s) found"
         self.statusBar().showMessage(status)
         self._update_preview_for_selected_person()
 
@@ -1265,7 +1377,8 @@ class MainWindow(QMainWindow):
         estimator = self._take_estimator()
         self._set_busy(True, f"Tracking {Path(path).name}...")
         self._video_worker = VideoSolveWorker(
-            path, estimator, self.model_variant_combo.currentText(), self.use_gpu_checkbox.isChecked()
+            path, estimator, self.model_variant_combo.currentText(), self.use_gpu_checkbox.isChecked(),
+            self.max_people_spin.value(),
         )
         self._video_worker.finished_ok.connect(self._on_video_finished)
         self._video_worker.failed.connect(self._on_video_failed)
@@ -1297,8 +1410,10 @@ class MainWindow(QMainWindow):
         self.frame_slider.setValue(0)
         self.frame_slider.blockSignals(False)
         self._on_frame_changed(0)
+        tracks = len(result.track_ids())
         self.statusBar().showMessage(
-            f"Tracked {solved} of {len(result.frames)} frames at {result.fps:.0f} fps on {estimator.device}"
+            f"Tracked {tracks} {'person' if tracks == 1 else 'people'} in {solved} of {len(result.frames)} frames "
+            f"at {result.fps:.0f} fps on {estimator.device}"
         )
 
     def _on_video_failed(self, message: str) -> None:
@@ -1320,15 +1435,20 @@ class MainWindow(QMainWindow):
         image = self._read_video_frame(index)
         if image is not None:
             self._set_photo_preview(image)
-        selected = self.person_combo.currentIndex()
-        self._people = [frame.person] if frame.person is not None else []
+        # Everyone tracked in this frame, by track ID (B12); the same person
+        # stays selected from frame to frame while they're in view.
+        self._person_keys = sorted(frame.people)
+        self._people = [frame.people[key] for key in self._person_keys]
+        if self._selected_track is None and self._person_keys:
+            self._selected_track = self._person_keys[0]
         self.person_combo.blockSignals(True)
         self.person_combo.clear()
-        for i, person in enumerate(self._people):
-            self.person_combo.addItem(_person_label(i, bone_confidence(person.visibility)))
+        for key, person in zip(self._person_keys, self._people):
+            self.person_combo.addItem(_person_label(key, bone_confidence(person.visibility)))
         self.person_combo.blockSignals(False)
         if self._people:
-            self.person_combo.setCurrentIndex(max(0, selected))
+            selected = self._person_keys.index(self._selected_track) if self._selected_track in self._person_keys else 0
+            self.person_combo.setCurrentIndex(selected)
         self._update_preview_for_selected_person()
 
     def _read_video_frame(self, index: int) -> np.ndarray | None:
@@ -1342,38 +1462,74 @@ class MainWindow(QMainWindow):
         finally:
             capture.release()
 
-    def _on_export_animation(self) -> None:
-        if self._video is None:
-            return
-        people = [frame.person for frame in self._video.solved_frames()]
-        if not people:
-            return
+    def _video_track_frames(self, track_id: int) -> tuple[list[dict], list]:
+        """(local rotations per frame, BVH root positions) for one tracked
+        person's solved frames, with their edits, the mirror and orientation fix."""
         from pose_craft.estimation.video import animation_root_positions
 
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Animation BVH", str(Path(self._last_dir()) / f"{Path(self._video.path).stem}.bvh"), "BVH (*.bvh)"
-        )
+        edits = self._edits.get(track_id)
+        frames = [
+            self._document_inputs_for(p, self.mirror_checkbox.isChecked(), self._orientation_correction(), edits)[0]
+            for p in self._video.people_of(track_id)
+        ]
+        return frames, animation_root_positions(frames, self._video.fps) if frames else []
+
+    def _current_track(self) -> int | None:
+        if self._video is None:
+            return None
+        if self._selected_track is not None and self._selected_track in self._video.track_ids():
+            return self._selected_track
+        tracks = self._video.track_ids()
+        return tracks[0] if tracks else None
+
+    def _on_export_animation(self) -> None:
+        track = self._current_track()
+        if track is None:
+            return
+        frames, roots = self._video_track_frames(track)
+        if not frames:
+            return
+        stem = Path(self._video.path).stem
+        name = f"{stem}.bvh" if len(self._video.track_ids()) == 1 else default_export_name(self._video.path, track, ".bvh")
+        path, _ = QFileDialog.getSaveFileName(self, "Export Animation BVH", str(Path(self._last_dir()) / name), "BVH (*.bvh)")
         if not path:
             return
-        edits = self._edits.get(0)
-        frames = [
-            self._document_inputs_for(
-                p.landmarks, p.visibility, self.mirror_checkbox.isChecked(), self._orientation_correction(), edits
-            )[0]
-            for p in people
-        ]
         try:
-            save_bvh_animation(
-                frames, path, frame_time=1.0 / self._video.fps, root_positions=animation_root_positions(frames, self._video.fps)
-            )
+            save_bvh_animation(frames, path, frame_time=1.0 / self._video.fps, root_positions=roots)
         except OSError as exc:
             self._report_export_error("Export Animation BVH", path, exc)
             return
-        self.statusBar().showMessage(f"Exported {len(frames)} frames to {path}")
+        self.statusBar().showMessage(f"Exported {len(frames)} frames of Person {track + 1} to {path}")
+
+    def _on_export_all_tracks(self) -> None:
+        """B12: one animated BVH per tracked person."""
+        if self._video is None or not self._video.track_ids():
+            return
+        directory = QFileDialog.getExistingDirectory(self, "Export All People To Folder", self._last_dir())
+        if not directory:
+            return
+        tracks = self._video.track_ids()
+        paths = {track: Path(directory) / default_export_name(self._video.path, track, ".bvh") for track in tracks}
+        existing = [p for p in paths.values() if p.exists()]
+        if existing and QMessageBox.question(
+            self, "Export All People", f"Overwrite {len(existing)} existing file(s) in\n{directory}?"
+        ) != QMessageBox.Yes:
+            return
+        for track, path in paths.items():
+            frames, roots = self._video_track_frames(track)
+            try:
+                save_bvh_animation(frames, path, frame_time=1.0 / self._video.fps, root_positions=roots)
+            except OSError as exc:
+                self._report_export_error("Export All People", str(path), exc)
+                return
+        self.statusBar().showMessage(f"Exported {len(tracks)} animation(s) to {directory}")
 
     # -- selection -----------------------------------------------------------------------
 
     def _on_person_changed(self) -> None:
+        index = self.person_combo.currentIndex()
+        if self._video is not None and 0 <= index < len(self._person_keys):
+            self._selected_track = self._person_keys[index]
         self._update_preview_for_selected_person()
 
     def _cycle_person(self, step: int) -> None:
@@ -1390,10 +1546,16 @@ class MainWindow(QMainWindow):
             return w / h if h else 1.0
         return 1.0
 
+    def _people_joints_2d(self) -> list[dict[str, np.ndarray]]:
+        """Every person's drawn 2D skeleton, edits included (what's on screen)."""
+        return [
+            image_joint_positions_2d(self._edited(i).image_xy) for i in range(len(self._people))
+        ]
+
     def _on_photo_clicked(self, x: float, y: float) -> None:
         if not self._people:
             return
-        joints = [image_joint_positions_2d(person.image_landmarks_xy) for person in self._people]
+        joints = self._people_joints_2d()
         index = _person_at(joints, x, y, self._photo_aspect())
         if index is not None:
             self.person_combo.setCurrentIndex(index)  # triggers _on_person_changed via the signal
@@ -1402,7 +1564,7 @@ class MainWindow(QMainWindow):
         """Right-click a limb (F4): offer to flip that limb's depth."""
         if not self._people:
             return
-        joints = [image_joint_positions_2d(person.image_landmarks_xy) for person in self._people]
+        joints = self._people_joints_2d()
         index = _person_at(joints, x, y, self._photo_aspect())
         if index is None:
             return
@@ -1417,13 +1579,14 @@ class MainWindow(QMainWindow):
         reset.triggered.connect(self._on_reset_edits)
         menu.exec(global_pos)
 
+    def _edited(self, index: int) -> EditedPerson:
+        return edited_person(self._people[index], self._person_edits(index), self._photo_aspect())
+
     def _selected_landmarks(self) -> np.ndarray | None:
         index = self.person_combo.currentIndex()
         if index < 0 or index >= len(self._people):
             return None
-        landmarks = self._people[index].landmarks
-        for bone in sorted(self._person_edits(index).flipped):
-            landmarks = flip_limb_depth(landmarks, bone)
+        landmarks = self._edited(index).landmarks
         if self.mirror_checkbox.isChecked():
             landmarks = mirror_landmarks(landmarks)
         return landmarks
@@ -1436,7 +1599,9 @@ class MainWindow(QMainWindow):
         if landmarks is None:
             self._set_result_actions_enabled(False)
             self.photo_view.set_skeleton_overlay([])
+            self.photo_view.set_drag_handles({})
             self.viewport.clear_skeleton()
+            self.viewport.set_backdrop(None)
             return
 
         # The preview draws the exported rotations themselves (forward
@@ -1444,22 +1609,39 @@ class MainWindow(QMainWindow):
         # export gets wrong shows up here before the user exports it. The
         # rotations already carry the mirror, orientation and manual fixes.
         selected_index = self.person_combo.currentIndex()
+        edited = self._edited(selected_index)
         rotations, selected_confidence = self._current_person_document_inputs()
-        positions, ghost = _preview_positions(landmarks, rotations, self._orientation_correction())
+        hands = mirror_hands(edited.hands) if self.mirror_checkbox.isChecked() else edited.hands
+        corners = self._backdrop_corners(edited) if self.backdrop_action.isChecked() else None
+        extra = {f"_backdrop.{i}": c for i, c in enumerate(corners)} if corners is not None else None
+        positions, ghost = _preview_positions(landmarks, rotations, self._orientation_correction(), hands, extra)
+        if corners is not None:
+            corners = np.array([ghost.pop(f"_backdrop.{i}") for i in range(4)])
         self.viewport.show_skeleton(
-            positions, confidence=selected_confidence, ghost_points=ghost, lateral_axes=bone_lateral_axes(rotations)
+            positions, confidence=selected_confidence, ghost_points=ghost, lateral_axes=bone_lateral_axes(rotations),
+            rotations=rotations,
         )
+        self._update_backdrop(corners)
         self._set_result_actions_enabled(True)
         self._sync_adjust_controls()
 
-        self.photo_view.set_skeleton_overlay([
-            PhotoOverlayPerson(
-                joints_2d=image_joint_positions_2d(person.image_landmarks_xy),
-                confidence=bone_confidence(person.visibility),
-                selected=(i == selected_index),
+        overlay = []
+        for i in range(len(self._people)):
+            person = self._edited(i)
+            overlay.append(
+                PhotoOverlayPerson(
+                    joints_2d=image_joint_positions_2d(person.image_xy, person.hands_xy),
+                    confidence=bone_confidence(person.visibility, person.hand_presence),
+                    selected=(i == selected_index),
+                )
             )
-            for i, person in enumerate(self._people)
-        ])
+        self.photo_view.set_skeleton_overlay(overlay)
+        # F4: the selected person's joints can be dragged (photos only -- a
+        # video frame's joints differ from frame to frame).
+        draggable = self._video is None and self._image_bgr is not None
+        self.photo_view.set_drag_handles(
+            {joint: edited.image_xy[joint] for joint in DRAGGABLE_JOINTS} if draggable else {}
+        )
         self.photo_view.setAccessibleDescription(self._overlay_description(selected_index, selected_confidence))
 
     def _overlay_description(self, selected_index: int, confidence: dict[str, float]) -> str:
@@ -1473,24 +1655,64 @@ class MainWindow(QMainWindow):
         self.viewport.show_labels = checked
         self._update_preview_for_selected_person()
 
+    def _on_toggle_hover(self, checked: bool) -> None:
+        self.viewport.hover_enabled = checked
+
+    def _on_toggle_backdrop(self, _checked: bool) -> None:
+        self._update_preview_for_selected_person()
+
+    def _backdrop_corners(self, edited: EditedPerson) -> np.ndarray | None:
+        """F9: where the photo goes behind the 3D preview, in the ghost's
+        space (mirrored with it when the mirror is on)."""
+        if self._preview_bgr is None:
+            return None
+        corners = photo_backdrop_corners(edited.landmarks, edited.image_xy, self._photo_aspect(), edited.visibility)
+        if corners is not None and self.mirror_checkbox.isChecked():
+            corners = corners * np.array([-1.0, 1.0, 1.0])  # the photo is mirrored with the pose
+        return corners
+
+    def _update_backdrop(self, corners: np.ndarray | None) -> None:
+        if corners is None or self._preview_bgr is None:
+            self.viewport.set_backdrop(None)
+            return
+        self.viewport.set_backdrop(np.ascontiguousarray(self._preview_bgr[:, :, ::-1]), corners)
+
     # -- manual correction (F4) ------------------------------------------------------------
 
-    def _person_edits(self, index: int) -> PersonEdits:
-        return self._edits.get(index, PersonEdits())
+    def _edit_key(self, index: int) -> int:
+        """The key a person's edits are stored under: their index in a photo,
+        their track ID in a video."""
+        return self._person_keys[index] if 0 <= index < len(self._person_keys) else index
 
-    def _set_person_edits(self, index: int, edits: PersonEdits) -> None:
+    def _person_edits(self, index: int) -> PersonEdits:
+        return self._edits.get(self._edit_key(index), PersonEdits())
+
+    def _set_person_edits(self, key: int, edits: PersonEdits) -> None:
         """Used by the undo commands: stores the edits and refreshes everything."""
         if edits.is_empty():
-            self._edits.pop(index, None)
+            self._edits.pop(key, None)
         else:
-            self._edits[index] = edits
-        if index == self.person_combo.currentIndex():
+            self._edits[key] = edits
+        if key == self._edit_key(self.person_combo.currentIndex()):
             self._update_preview_for_selected_person()
 
     def _push_edit(self, index: int, after: PersonEdits, text: str) -> None:
         before = self._person_edits(index)
         if after != before:
-            self.undo_stack.push(_EditCommand(self, index, before, after, text))
+            self.undo_stack.push(_EditCommand(self, self._edit_key(index), before, after, text))
+
+    def move_joint_to(self, index: int, joint: int, xy: tuple[float, float] | None) -> None:
+        """F4: moves one of person `index`'s joints to a normalized photo
+        position (None: back to where it was detected), as an undo step; the
+        limb is re-solved from the moved joint."""
+        label = JOINT_LABELS.get(joint, f"joint {joint}")
+        text = f"Reset {label}" if xy is None else f"Move {label}"
+        self._push_edit(index, self._person_edits(index).with_joint_moved(joint, xy), text)
+
+    def _on_joint_dragged(self, joint: int, x: float, y: float) -> None:
+        index = self.person_combo.currentIndex()
+        if 0 <= index < len(self._people) and self._video is None:
+            self.move_joint_to(index, joint, (x, y))
 
     def flip_bone_depth(self, index: int, bone: str) -> None:
         """Toggles a limb's depth flip for one person, as an undo step."""
@@ -1528,11 +1750,11 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _document_inputs_for(
-        landmarks: np.ndarray,
-        visibility: np.ndarray,
+        person: DetectedPerson,
         mirror: bool,
         orientation_correction=None,
         edits: PersonEdits | None = None,
+        aspect: float = 1.0,
     ) -> tuple[dict, dict]:
         """Shared by _current_person_document_inputs (the selected person) and
         _on_export_all (every detected person): mirror_landmarks swaps the
@@ -1548,48 +1770,51 @@ class MainWindow(QMainWindow):
         rotation so every export (JSON, BVH, Live Link) agrees with what's shown
         on screen.
 
-        edits: the person's manual corrections (F4) -- depth flips on the raw
-        landmarks before mirroring (they name what was clicked in the photo),
-        bone adjustments on the solved rotations.
+        edits: the person's manual corrections (F4) -- moved joints and depth
+        flips on the raw landmarks before mirroring (they name what was
+        clicked in the photo), bone adjustments on the solved rotations.
+        aspect: the photo's width / height, for turning a joint drag into 3D.
+
+        The person's hand landmarks (B11), when the hands were solved, add
+        finger bones; they're mirrored and flipped along with the body.
         """
-        landmarks = MainWindow._edited_landmarks(landmarks, edits)
+        edited = edited_person(person, edits, aspect)
+        landmarks, visibility, hands, presence = edited.landmarks, edited.visibility, edited.hands, edited.hand_presence
         if mirror:
             landmarks = mirror_landmarks(landmarks)
             visibility = mirror_landmarks(visibility)
-        rotations = solve_bone_rotations(landmarks, visibility=visibility)
+            hands = mirror_hands(hands)
+            presence = mirror_hands(presence)
+        rotations = solve_bone_rotations(landmarks, visibility=visibility, hands=hands)
         if edits is not None and edits.overrides:
             rotations = apply_bone_overrides(rotations, edits.override_rotations())
         if orientation_correction is not None:
             rotations = apply_orientation_correction(rotations, orientation_correction)
-        confidence = bone_confidence(visibility)
+        confidence = bone_confidence(visibility, presence)
         return rotations, confidence
-
-    @staticmethod
-    def _edited_landmarks(landmarks: np.ndarray, edits: PersonEdits | None) -> np.ndarray:
-        for bone in sorted(edits.flipped) if edits is not None else ():
-            landmarks = flip_limb_depth(landmarks, bone)
-        return landmarks
 
     def _current_person_document_inputs(self):
         index = self.person_combo.currentIndex()
         if index < 0 or index >= len(self._people):
             return None
-        person = self._people[index]
+        return self._person_document_inputs(index)
+
+    def _person_document_inputs(self, index: int):
         return self._document_inputs_for(
-            person.landmarks,
-            person.visibility,
+            self._people[index],
             self.mirror_checkbox.isChecked(),
             self._orientation_correction(),
             self._person_edits(index),
+            self._photo_aspect(),
         )
 
     def _root_for(self, index: int, rotations: dict) -> tuple[float, float]:
         """(hip_height, leg_length) in meters for person `index`'s export (B6)."""
-        person = self._people[index]
-        landmarks = self._edited_landmarks(person.landmarks, self._person_edits(index))
+        edited = self._edited(index)
+        landmarks, hands = edited.landmarks, edited.hands
         if self.mirror_checkbox.isChecked():
-            landmarks = mirror_landmarks(landmarks)
-        return root_measurements(rotations, landmarks)
+            landmarks, hands = mirror_landmarks(landmarks), mirror_hands(hands)
+        return root_measurements(rotations, landmarks, hands)
 
     def _export_path(self, title: str, name: str, file_filter: str) -> str:
         path, _ = QFileDialog.getSaveFileName(self, title, str(Path(self._last_dir()) / name), file_filter)
@@ -1644,7 +1869,7 @@ class MainWindow(QMainWindow):
 
         for index, (person, path) in enumerate(zip(self._people, paths)):
             rotations, confidence = self._document_inputs_for(
-                person.landmarks, person.visibility, mirror, orientation_correction, self._person_edits(index)
+                person, mirror, orientation_correction, self._person_edits(index), self._photo_aspect()
             )
             hip_height, leg_length = self._root_for(index, rotations)
             try:
