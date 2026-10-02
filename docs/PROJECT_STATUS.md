@@ -358,7 +358,8 @@ time each check ran, not guaranteed to stay true as the code changes.
     `device` now says "GPU (DirectML)"/"GPU (CUDA)". New
     `requirements-dml.txt` and a `POSECRAFT_FLAVOR=dml|cuda|cpu` switch in
     `PoseCraft.spec`, which also drops cuFFT, nvrtc, nvJitLink and cudnn_adv
-    (~520 MB) from CUDA builds. Not built.
+    (~520 MB) from CUDA builds. Built and smoke-tested on 2026-10-01 (see
+    Known Issues for the sizes).
   - **Large photos were warped straight from full resolution.**
     `landmarker.prepare_input_rgb` shrinks anything over 2048 px with
     `INTER_AREA` first. On the sample photos upscaled 8x with noise: median
@@ -820,14 +821,22 @@ time each check ran, not guaranteed to stay true as the code changes.
 
 ## Known Issues
 
-- **The CUDA build is large** (~2.2 GB before the ~520 MB trimmed in the P1
-  round and the ~100 MB of libraries trimmed in the P2 round; not re-measured,
-  since nothing was built). cuBLAS/cuBLASLt and
-  cuDNN alone are well over 1 GB. The DirectML flavour (`POSECRAFT_FLAVOR=dml`)
-  avoids them and was faster on the one GPU measured, but no DirectML build
-  has been made or tested yet, and which flavour to publish as the main
-  download is still a release decision. The DirectML wheel lags the main
-  onnxruntime release (1.24.4 vs 1.30.0) and DirectML is in maintenance mode.
+- **The CUDA build is large.** All three flavours were built and smoke-tested
+  on 2026-10-01 (Python 3.14.7, PyInstaller 6.22.3, models bundled). Each exe
+  started and ran its warm-up inference on the expected provider:
+
+  | Flavour | Size | Files | Provider | lite / full / heavy on an RTX 5080 |
+  |---|---|---|---|---|
+  | dml | 508 MB | 829 | DmlExecutionProvider | 1.3 / 1.6 / 2.6 ms |
+  | cpu | 472 MB | 829 | CPUExecutionProvider | 9.2 / 10.1 / 16.9 ms |
+  | cuda | 1.73 GB | 843 | CUDAExecutionProvider | 4.6 / 4.9 / 18.5 ms |
+
+  Timings are the median of one detector run plus one landmark-model run on
+  random input, not a full solve on a real photo. In the CUDA build the
+  `nvidia` folder is 1.02 GB (cuBLASLt alone 493 MB). The DirectML parity test
+  passes for all three variants. Which flavour to publish as the main download
+  is still a release decision. The DirectML wheel lags the main onnxruntime
+  release (1.24.4 vs 1.30.0) and DirectML is in maintenance mode.
 - **The ONNX pipeline is a re-implementation, not MediaPipe itself.** It follows
   MediaPipe's sources and matches its output closely (see "Recently Fixed"),
   but it isn't bit-identical, and a future MediaPipe model update that changes

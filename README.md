@@ -115,8 +115,8 @@ pyinstaller PoseCraft.spec
 ```
 
 Produces `dist/PoseCraft/PoseCraft.exe` plus its `_internal/` dependency
-folder -- about 2 GB for the CUDA build before the DLL and library trimming
-(~0.6 GB less now), far less for DirectML or CPU (not re-measured) -- ship the whole `dist/PoseCraft/` folder, not just
+folder -- measured on 2026-10-01 (Python 3.14, PyInstaller 6.22.3): DirectML
+508 MB, CPU 472 MB, CUDA 1.73 GB -- ship the whole `dist/PoseCraft/` folder, not just
 the `.exe`. With `build/models` present the converter (onnx/tflite) is left
 out of the build. `.github/workflows/release.yml` does all of this for the
 DirectML and CPU flavours on a `v*` tag (or a manual run), zips them with the
