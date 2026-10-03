@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QSettings, Qt, QThread, Signal
+from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QImage, QKeySequence, QPixmap, QUndoCommand, QUndoStack
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -45,13 +45,15 @@ from pose_craft.estimation.landmarker import (
 )
 from pose_craft.export import live_link
 from pose_craft.export.blender_pose import (
+    ANIMATION_FORMAT_NAME,
     LOW_CONFIDENCE_THRESHOLD,
+    build_animation_document,
     build_pose_document,
     root_measurements,
     save_pose_file,
 )
 from pose_craft.export.bvh_export import floor_root_position, save_bvh_animation, save_bvh_file
-from pose_craft.export.live_link import send_pose_document
+from pose_craft.export.live_link import send_animation_document, send_pose_document
 from pose_craft.gui.photo_view import PhotoOverlayPerson, PhotoView, legend_entries, legend_swatch
 from pose_craft.gui.viewport_3d import SkeletonViewport, photo_backdrop_corners
 from pose_craft.imaging import PHOTO_GUIDANCE, assess_photo_quality, imread_unicode
@@ -96,6 +98,8 @@ MAX_RECENT_FILES = 8
 # A click farther than this (as a fraction of the photo's diagonal) from every
 # person's drawn skeleton doesn't change the selection.
 PICK_MAX_DISTANCE = 0.05
+DEFAULT_VIDEO_ROTATION_SMOOTHING = 35
+DEFAULT_AUTO_SEND_DEBOUNCE_MS = 350
 
 
 def default_settings() -> QSettings:
@@ -280,7 +284,11 @@ class SendToBlenderWorker(QThread):
 
     def run(self) -> None:
         try:
-            reply = send_pose_document(self._document, host=self._host, port=self._port)
+            if self._document.get("format") == ANIMATION_FORMAT_NAME:
+                # Chunked under the add-on's payload cap (live_link.send_animation_document).
+                reply = send_animation_document(self._document, host=self._host, port=self._port)
+            else:
+                reply = send_pose_document(self._document, host=self._host, port=self._port)
             self.finished_ok.emit(reply)
         except (OSError, ValueError) as exc:  # ValueError: a malformed reply
             log.warning("Live Link send failed: %s", exc)
@@ -379,7 +387,16 @@ def _live_link_reply_message(reply: dict | None) -> tuple[str, bool]:
         return f"Blender didn't apply the pose: {reply.get('error') or 'unknown error'}", False
     applied = reply.get("applied") or []
     requested = reply.get("requested", len(applied))
-    message = f"Applied {len(applied)}/{requested} bones to '{reply.get('armature', '?')}'"
+    frame_count = int(reply.get("animation_frames") or 0)
+    if frame_count > 0:
+        message = (
+            f"Keyed {frame_count} frame(s), {len(applied)}/{requested} bones per frame, on "
+            f"'{reply.get('armature', '?')}'"
+        )
+        if reply.get("start_frame") is not None and reply.get("end_frame") is not None:
+            message += f" (Blender frames {reply['start_frame']}-{reply['end_frame']})"
+    else:
+        message = f"Applied {len(applied)}/{requested} bones to '{reply.get('armature', '?')}'"
     unmatched = reply.get("unmatched") or []
     if unmatched:
         message += f" (unmatched: {', '.join(unmatched)})"
@@ -539,12 +556,19 @@ class MainWindow(QMainWindow):
         self._pending_solve = False  # Solve clicked while the warm-up was still running
         self._closing = False  # set by closeEvent; suppresses the dialogs of work it cancelled
         self._syncing_adjust = False
+        self._send_origin = "manual"
+        self._auto_send_paused = False  # set when an automatic send couldn't reach Blender
+        self._track_frames_cache: dict = {}  # (video, track, options) -> (edits, result)
         self.undo_stack = QUndoStack(self)
         self.undo_stack.indexChanged.connect(lambda _index: self._sync_adjust_controls())
+        self._auto_send_timer = QTimer(self)
+        self._auto_send_timer.setSingleShot(True)
+        self._auto_send_timer.timeout.connect(self._send_auto_pose)
 
         self._build_ui()
         self._build_menus()
         self._restore_settings()
+        self._apply_accessibility_style()
         self._set_result_actions_enabled(False)
         if warm_up:
             self._start_warm_up()
@@ -617,6 +641,19 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.cancel_btn)
         self.statusBar().showMessage("Ready")
 
+    def _apply_accessibility_style(self) -> None:
+        """High-visibility keyboard focus cues on top of the platform theme."""
+        self.setStyleSheet(
+            """
+            QPushButton:focus, QToolButton:focus, QCheckBox:focus, QComboBox:focus,
+            QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus, QSlider:focus {
+                outline: 2px solid #f6c453;
+                outline-offset: 1px;
+                border: 1px solid #f6c453;
+            }
+            """
+        )
+
     def _build_banner(self) -> QWidget:
         """A non-modal warning strip above the photo (F6): photo-quality notes
         used to be a modal popup on every load."""
@@ -662,9 +699,11 @@ class MainWindow(QMainWindow):
 
         load_row = QHBoxLayout()
         self.load_btn = QPushButton("Load Photo...")
+        self.load_btn.setAccessibleName("Load photo")
         self.load_btn.clicked.connect(self._on_load_photo)
         load_row.addWidget(self.load_btn)
         self.load_video_btn = QPushButton("Load Video...")
+        self.load_video_btn.setAccessibleName("Load video")
         self.load_video_btn.setToolTip("Track one person through a video clip and export it as an animated BVH.")
         self.load_video_btn.clicked.connect(self._on_load_video)
         load_row.addWidget(self.load_video_btn)
@@ -690,6 +729,7 @@ class MainWindow(QMainWindow):
         self.max_people_spin = QSpinBox()
         self.max_people_spin.setRange(1, 8)
         self.max_people_spin.setValue(4)
+        self.max_people_spin.setAccessibleName("Maximum people to detect")
         self.max_people_spin.setToolTip(
             "A person beyond this count in a group photo won't be detected at all."
         )
@@ -703,6 +743,7 @@ class MainWindow(QMainWindow):
         self.model_variant_combo = QComboBox()
         self.model_variant_combo.addItems(list(MODEL_URLS))
         self.model_variant_combo.setCurrentText("full")
+        self.model_variant_combo.setAccessibleName("Model quality")
         self.model_variant_combo.setToolTip(
             "lite is fastest and best for low-end machines; heavy is the most accurate "
             "but slowest. Changing this after a solve rebuilds the pose model (and downloads "
@@ -713,6 +754,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(model_row)
 
         self.use_gpu_checkbox = QCheckBox("Use &GPU when available")
+        self.use_gpu_checkbox.setAccessibleName("Use GPU when available")
         self.use_gpu_checkbox.setChecked(True)
         self.use_gpu_checkbox.setToolTip(
             "Runs pose estimation on the GPU through ONNX Runtime: DirectML (any DirectX 12 GPU) "
@@ -724,6 +766,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.use_gpu_checkbox)
 
         self.group_photo_checkbox = QCheckBox("Group photo (slower)")
+        self.group_photo_checkbox.setAccessibleName("Group photo")
         self.group_photo_checkbox.setToolTip(
             "Also searches overlapping tiles of the photo, so people whose faces are only a few pixels "
             "wide in a wide group shot are found. Without it, tiles are only tried when nobody is found."
@@ -731,6 +774,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.group_photo_checkbox)
 
         self.hands_checkbox = QCheckBox("&Hands and fingers")
+        self.hands_checkbox.setAccessibleName("Hands and fingers")
         self.hands_checkbox.setToolTip(
             "Also runs MediaPipe's hand landmark model on each person's hands (cropped from the pose's wrist "
             "and knuckles) and exports 15 finger bones per hand found (Rigify names: thumb.01.L, f_index.01.L, "
@@ -740,6 +784,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.hands_checkbox)
 
         self.solve_btn = QPushButton("Solve Pose")
+        self.solve_btn.setAccessibleName("Solve pose")
         self.solve_btn.setToolTip("Detect and solve every person in the photo (F5)")
         self.solve_btn.clicked.connect(self._on_solve_pose)
         self.solve_btn.setEnabled(False)
@@ -755,6 +800,7 @@ class MainWindow(QMainWindow):
         person_label = QLabel("P&erson:")
         person_row.addWidget(person_label)
         self.person_combo = QComboBox()
+        self.person_combo.setAccessibleName("Selected person")
         self.person_combo.currentIndexChanged.connect(self._on_person_changed)
         person_label.setBuddy(self.person_combo)
         person_row.addWidget(self.person_combo)
@@ -764,6 +810,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(click_hint)
 
         self.mirror_checkbox = QCheckBox("&Mirror left/right")
+        self.mirror_checkbox.setAccessibleName("Mirror left and right")
         self.mirror_checkbox.setToolTip(
             "Body orientation fix: swaps the left and right sides if the estimate labeled them the wrong way round."
         )
@@ -775,6 +822,7 @@ class MainWindow(QMainWindow):
         orientation_row.addWidget(orientation_label)
         self.orientation_combo = QComboBox()
         self.orientation_combo.addItems(list(ORIENTATION_CORRECTIONS.keys()))
+        self.orientation_combo.setAccessibleName("Body orientation fix")
         self.orientation_combo.setToolTip(
             "If the solved pose comes out upside-down or facing the wrong way -- see "
             "_world_to_engine()'s axis-convention caveat -- pick the correction "
@@ -852,7 +900,26 @@ class MainWindow(QMainWindow):
         self.frame_label = QLabel("no video")
         frame_row.addWidget(self.frame_label)
         layout.addLayout(frame_row)
+        smoothing_row = QHBoxLayout()
+        smoothing_label = QLabel("Rotation smoo&thing:")
+        smoothing_row.addWidget(smoothing_label)
+        self.video_rotation_smoothing_spin = QSpinBox()
+        self.video_rotation_smoothing_spin.setRange(0, 100)
+        self.video_rotation_smoothing_spin.setValue(DEFAULT_VIDEO_ROTATION_SMOOTHING)
+        self.video_rotation_smoothing_spin.setSuffix("%")
+        self.video_rotation_smoothing_spin.setAccessibleName("Rotation smoothing")
+        self.video_rotation_smoothing_spin.setToolTip(
+            "Quaternion-aware smoothing of the animation's joint rotations (the preview, BVH export and "
+            "Send Animation all use it). Zero-phase, so it doesn't lag behind the video. "
+            "0% keeps every frame as solved; higher values reduce jitter after tracking."
+        )
+        self.video_rotation_smoothing_spin.valueChanged.connect(lambda _value: self._on_person_changed())
+        smoothing_label.setBuddy(self.video_rotation_smoothing_spin)
+        smoothing_row.addWidget(self.video_rotation_smoothing_spin)
+        smoothing_row.addStretch(1)
+        layout.addLayout(smoothing_row)
         self.export_animation_btn = QPushButton("Export Animation BVH...")
+        self.export_animation_btn.setAccessibleName("Export animation BVH")
         self.export_animation_btn.setToolTip(
             "The selected person's solved frames as one BVH animation, smoothed, standing on the floor, with "
             "planted feet driving the root's motion."
@@ -860,11 +927,20 @@ class MainWindow(QMainWindow):
         self.export_animation_btn.clicked.connect(self._on_export_animation)
         layout.addWidget(self.export_animation_btn)
         self.export_all_tracks_btn = QPushButton("Export All People (BVH)...")
+        self.export_all_tracks_btn.setAccessibleName("Export all tracked people as BVH")
         self.export_all_tracks_btn.setToolTip(
             "One animated BVH per tracked person (<video>_person<N>.bvh), to a folder you choose."
         )
         self.export_all_tracks_btn.clicked.connect(self._on_export_all_tracks)
         layout.addWidget(self.export_all_tracks_btn)
+        self.send_animation_btn = QPushButton("Send Animation to Blender")
+        self.send_animation_btn.setAccessibleName("Send animation to Blender")
+        self.send_animation_btn.setToolTip(
+            "Live Link the selected tracked person as keyed animation, spaced at the clip's fps from Blender's "
+            "current frame."
+        )
+        self.send_animation_btn.clicked.connect(self._on_send_animation_to_blender)
+        layout.addWidget(self.send_animation_btn)
         self.video_group = group
         group.setVisible(False)
         return group
@@ -874,19 +950,29 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(group)
 
         self.export_btn = QPushButton("Export Pose JSON...")
+        self.export_btn.setAccessibleName("Export pose JSON")
         self.export_btn.clicked.connect(self._on_export_pose)
         self.export_btn.setEnabled(False)
         layout.addWidget(self.export_btn)
 
         self.export_all_btn = QPushButton("Export All People...")
+        self.export_all_btn.setAccessibleName("Export all people as pose JSON")
         self.export_all_btn.clicked.connect(self._on_export_all)
         self.export_all_btn.setEnabled(False)
         layout.addWidget(self.export_all_btn)
 
         self.export_bvh_btn = QPushButton("Export BVH...")
+        self.export_bvh_btn.setAccessibleName("Export BVH")
         self.export_bvh_btn.clicked.connect(self._on_export_bvh)
         self.export_bvh_btn.setEnabled(False)
         layout.addWidget(self.export_bvh_btn)
+
+        self.export_all_bvh_btn = QPushButton("Export All People (BVH)...")
+        self.export_all_bvh_btn.setAccessibleName("Export all people as BVH")
+        self.export_all_bvh_btn.setToolTip("One BVH per detected person (<photo>_person<N>.bvh), to a folder you choose.")
+        self.export_all_bvh_btn.clicked.connect(self._on_export_all_bvh)
+        self.export_all_bvh_btn.setEnabled(False)
+        layout.addWidget(self.export_all_bvh_btn)
 
         return group
 
@@ -898,6 +984,7 @@ class MainWindow(QMainWindow):
         host_label = QLabel("Blender &host:")
         live_link_row.addWidget(host_label)
         self.live_link_host_edit = QLineEdit(live_link.DEFAULT_HOST)
+        self.live_link_host_edit.setAccessibleName("Blender host")
         self.live_link_host_edit.setMaximumWidth(100)
         self.live_link_host_edit.setToolTip(
             "The Blender add-on only ever listens on 127.0.0.1 (localhost) -- change this "
@@ -911,6 +998,7 @@ class MainWindow(QMainWindow):
         self.live_link_port_spin = QSpinBox()
         self.live_link_port_spin.setRange(1, 65535)
         self.live_link_port_spin.setValue(live_link.DEFAULT_PORT)
+        self.live_link_port_spin.setAccessibleName("Blender port")
         self.live_link_port_spin.setToolTip(
             "Must match the port set in Blender's PoseCraft panel before Live Link is started there."
         )
@@ -919,10 +1007,39 @@ class MainWindow(QMainWindow):
         layout.addLayout(live_link_row)
 
         self.send_to_blender_btn = QPushButton("Send to Blender (Live Link)")
+        self.send_to_blender_btn.setAccessibleName("Send to Blender")
         self.send_to_blender_btn.setToolTip("Ctrl+B")
         self.send_to_blender_btn.clicked.connect(self._on_send_to_blender)
         self.send_to_blender_btn.setEnabled(False)
         layout.addWidget(self.send_to_blender_btn)
+
+        auto_row = QHBoxLayout()
+        self.auto_send_checkbox = QCheckBox("A&uto-send on change")
+        self.auto_send_checkbox.setAccessibleName("Auto-send on change")
+        self.auto_send_checkbox.setToolTip(
+            "After a short debounce, re-send the currently shown pose whenever the selection, video frame, "
+            "manual edits or pose options change. Pauses itself if Blender's Live Link can't be reached "
+            "(a manual Send, or ticking this again, resumes it)."
+        )
+        self.auto_send_checkbox.toggled.connect(self._on_auto_send_toggled)
+        auto_row.addWidget(self.auto_send_checkbox)
+        auto_row.addStretch(1)
+        layout.addLayout(auto_row)
+
+        debounce_row = QHBoxLayout()
+        debounce_label = QLabel("&Debounce:")
+        debounce_row.addWidget(debounce_label)
+        self.auto_send_debounce_spin = QSpinBox()
+        self.auto_send_debounce_spin.setRange(50, 5000)
+        self.auto_send_debounce_spin.setSingleStep(50)
+        self.auto_send_debounce_spin.setValue(DEFAULT_AUTO_SEND_DEBOUNCE_MS)
+        self.auto_send_debounce_spin.setAccessibleName("Auto-send debounce")
+        self.auto_send_debounce_spin.setSuffix(" ms")
+        self.auto_send_debounce_spin.setToolTip("How long PoseCraft waits after a change before auto-sending.")
+        debounce_label.setBuddy(self.auto_send_debounce_spin)
+        debounce_row.addWidget(self.auto_send_debounce_spin)
+        debounce_row.addStretch(1)
+        layout.addLayout(debounce_row)
 
         return group
 
@@ -994,7 +1111,10 @@ class MainWindow(QMainWindow):
         self.max_people_spin.setValue(int(s.value("detect/max_people", 4)))
         self.group_photo_checkbox.setChecked(str(s.value("detect/group_photo", "false")).lower() == "true")
         self.hands_checkbox.setChecked(str(s.value("detect/hands", "false")).lower() == "true")
+        self.video_rotation_smoothing_spin.setValue(int(s.value("video/rotation_smoothing", DEFAULT_VIDEO_ROTATION_SMOOTHING)))
         self.backdrop_action.setChecked(str(s.value("view/backdrop", "false")).lower() == "true")
+        self.auto_send_checkbox.setChecked(str(s.value("live_link/auto_send", "false")).lower() == "true")
+        self.auto_send_debounce_spin.setValue(int(s.value("live_link/auto_send_debounce_ms", DEFAULT_AUTO_SEND_DEBOUNCE_MS)))
         geometry = s.value("window/geometry")
         if geometry is not None:
             self.restoreGeometry(geometry)
@@ -1012,7 +1132,10 @@ class MainWindow(QMainWindow):
         s.setValue("detect/max_people", self.max_people_spin.value())
         s.setValue("detect/group_photo", "true" if self.group_photo_checkbox.isChecked() else "false")
         s.setValue("detect/hands", "true" if self.hands_checkbox.isChecked() else "false")
+        s.setValue("video/rotation_smoothing", self.video_rotation_smoothing_spin.value())
         s.setValue("view/backdrop", "true" if self.backdrop_action.isChecked() else "false")
+        s.setValue("live_link/auto_send", "true" if self.auto_send_checkbox.isChecked() else "false")
+        s.setValue("live_link/auto_send_debounce_ms", self.auto_send_debounce_spin.value())
         s.setValue("window/geometry", self.saveGeometry())
         s.setValue("window/splitter", self.splitter.saveState())
         s.sync()
@@ -1073,7 +1196,7 @@ class MainWindow(QMainWindow):
     def _set_result_actions_enabled(self, has_person: bool) -> None:
         """Everything that needs a solved, selected person (and Export All, which
         needs any people)."""
-        for widget in (self.export_btn, self.export_bvh_btn, self.send_to_blender_btn, self.reset_bone_btn,
+        for widget in (self.export_btn, self.export_bvh_btn, self.export_all_bvh_btn, self.send_to_blender_btn, self.reset_bone_btn,
                        self.reset_edits_btn, self.adjust_bone_combo, *self.adjust_spins):
             widget.setEnabled(has_person)
         for action in (self.export_action, self.export_bvh_action, self.send_action,
@@ -1081,9 +1204,43 @@ class MainWindow(QMainWindow):
             action.setEnabled(has_person)
         has_people = bool(self._people) and self._video is None
         self.export_all_btn.setEnabled(has_people)
+        self.export_all_bvh_btn.setEnabled(has_people)
         self.export_all_action.setEnabled(has_people)
         self.export_animation_btn.setEnabled(self._video is not None and bool(self._video.solved_frames()))
         self.export_all_tracks_btn.setEnabled(self._video is not None and len(self._video.track_ids()) > 0)
+        self.send_animation_btn.setEnabled(self._video is not None and bool(self._video.solved_frames()))
+
+    def _on_auto_send_toggled(self, checked: bool) -> None:
+        self._auto_send_paused = False  # ticking it again is how a paused auto-send resumes
+        if checked:
+            self._queue_auto_send()
+        else:
+            self._auto_send_timer.stop()
+
+    def _has_selected_person(self) -> bool:
+        return 0 <= self.person_combo.currentIndex() < len(self._people)
+
+    def _queue_auto_send(self) -> None:
+        """(Re)starts the debounce: a burst of changes (scrubbing, dragging a
+        spin box) sends once, after it settles. Nothing is queued without a
+        selected person, while paused or while closing."""
+        if not self.auto_send_checkbox.isChecked() or self._closing or self._auto_send_paused:
+            return
+        if not self._has_selected_person():
+            self._auto_send_timer.stop()
+            return
+        self._auto_send_timer.start(self.auto_send_debounce_spin.value())
+
+    def _send_auto_pose(self) -> None:
+        if self._closing or self._auto_send_paused or not self.auto_send_checkbox.isChecked():
+            return
+        if self._send_worker is not None and self._send_worker.isRunning():
+            self._queue_auto_send()  # one send at a time; try again after another debounce
+            return
+        document = self._current_live_link_document()
+        if document is None:
+            return
+        self._start_live_link_send(document, automatic=True)
 
     def _worker_running(self) -> bool:
         return any(w is not None and w.isRunning() for w in (self._worker, self._video_worker))
@@ -1100,6 +1257,7 @@ class MainWindow(QMainWindow):
         # hide the window now and finish closing when the worker returns (the
         # download's socket timeout bounds how long that can take).
         self._closing = True
+        self._auto_send_timer.stop()
         workers = (self._worker, self._video_worker, self._warmup_worker, self._send_worker)
         running = [w for w in workers if w is not None and w.isRunning()]
         for worker in running:
@@ -1193,6 +1351,7 @@ class MainWindow(QMainWindow):
         self._person_keys = []
         self._selected_track = None
         self._edits = {}
+        self._track_frames_cache = {}
         self.undo_stack.clear()
         self.viewport.clear_skeleton()
         self.photo_view.set_skeleton_overlay([])
@@ -1424,6 +1583,7 @@ class MainWindow(QMainWindow):
 
     def _clear_video(self) -> None:
         self._video = None
+        self._track_frames_cache = {}
         self.video_group.setVisible(False)
         self.frame_label.setText("no video")
 
@@ -1462,17 +1622,53 @@ class MainWindow(QMainWindow):
         finally:
             capture.release()
 
-    def _video_track_frames(self, track_id: int) -> tuple[list[dict], list]:
-        """(local rotations per frame, BVH root positions) for one tracked
-        person's solved frames, with their edits, the mirror and orientation fix."""
-        from pose_craft.estimation.video import animation_root_positions
+    def _video_rotation_smoothing_strength(self) -> float:
+        return self.video_rotation_smoothing_spin.value() / 100.0
+
+    def _video_track_frames(self, track_id: int) -> tuple[list[int], list[dict], list]:
+        """(frame indices, local rotations per solved frame, BVH root positions)
+        for one tracked person, with their edits, mirror/orientation fix, and
+        optional quaternion-aware rotation smoothing."""
+        from pose_craft.estimation.video import animation_root_positions, smooth_rotation_frames
 
         edits = self._edits.get(track_id)
+        # Solving every frame of a track isn't free, and the preview, auto-send
+        # and every export ask for it on each change: keep the last result per
+        # track until the video, the person's edits or an option changes.
+        key = (
+            id(self._video), track_id, self.mirror_checkbox.isChecked(), self.orientation_combo.currentText(),
+            self.video_rotation_smoothing_spin.value(), self._photo_aspect(),
+        )
+        cached = self._track_frames_cache.get(key)
+        if cached is not None and cached[0] == edits:
+            return cached[1]
+        frame_indices = [frame.index for frame in self._video.solved_frames(track_id)]
         frames = [
-            self._document_inputs_for(p, self.mirror_checkbox.isChecked(), self._orientation_correction(), edits)[0]
+            self._document_inputs_for(
+                p, self.mirror_checkbox.isChecked(), self._orientation_correction(), edits, self._photo_aspect()
+            )[0]
             for p in self._video.people_of(track_id)
         ]
-        return frames, animation_root_positions(frames, self._video.fps) if frames else []
+        frames = smooth_rotation_frames(frames, self._video_rotation_smoothing_strength(), frame_indices)
+        result = (frame_indices, frames, animation_root_positions(frames, self._video.fps) if frames else [])
+        # One entry per track: a changed option replaces it.
+        self._track_frames_cache = {k: v for k, v in self._track_frames_cache.items() if k[:2] != key[:2]}
+        self._track_frames_cache[key] = (edits, result)
+        return result
+
+    def _video_frame_rotations(self, index: int, rotations: dict) -> dict:
+        """Person `index` of the current video frame: their rotations as their
+        track's animation has them (rotation smoothing included); `rotations`
+        unchanged for a photo -- so the preview and Live Link show exactly
+        what the animation export writes."""
+        if self._video is None or not (0 <= index < len(self._person_keys)):
+            return rotations
+        indices, rotation_frames, _roots = self._video_track_frames(self._person_keys[index])
+        frame_index = self.frame_slider.value()
+        for index_value, frame_rotations in zip(indices, rotation_frames):
+            if index_value == frame_index:
+                return frame_rotations
+        return rotations
 
     def _current_track(self) -> int | None:
         if self._video is None:
@@ -1486,7 +1682,7 @@ class MainWindow(QMainWindow):
         track = self._current_track()
         if track is None:
             return
-        frames, roots = self._video_track_frames(track)
+        _indices, frames, roots = self._video_track_frames(track)
         if not frames:
             return
         stem = Path(self._video.path).stem
@@ -1516,7 +1712,7 @@ class MainWindow(QMainWindow):
         ) != QMessageBox.Yes:
             return
         for track, path in paths.items():
-            frames, roots = self._video_track_frames(track)
+            _indices, frames, roots = self._video_track_frames(track)
             try:
                 save_bvh_animation(frames, path, frame_time=1.0 / self._video.fps, root_positions=roots)
             except OSError as exc:
@@ -1611,6 +1807,9 @@ class MainWindow(QMainWindow):
         selected_index = self.person_combo.currentIndex()
         edited = self._edited(selected_index)
         rotations, selected_confidence = self._current_person_document_inputs()
+        # The displayed person's own track (not _selected_track, which may be
+        # out of this frame while someone else is shown).
+        rotations = self._video_frame_rotations(selected_index, rotations)
         hands = mirror_hands(edited.hands) if self.mirror_checkbox.isChecked() else edited.hands
         corners = self._backdrop_corners(edited) if self.backdrop_action.isChecked() else None
         extra = {f"_backdrop.{i}": c for i, c in enumerate(corners)} if corners is not None else None
@@ -1633,6 +1832,7 @@ class MainWindow(QMainWindow):
                     joints_2d=image_joint_positions_2d(person.image_xy, person.hands_xy),
                     confidence=bone_confidence(person.visibility, person.hand_presence),
                     selected=(i == selected_index),
+                    label=f"Person {self._edit_key(i) + 1}",  # a video's track ID, as in the Person list
                 )
             )
         self.photo_view.set_skeleton_overlay(overlay)
@@ -1643,6 +1843,7 @@ class MainWindow(QMainWindow):
             {joint: edited.image_xy[joint] for joint in DRAGGABLE_JOINTS} if draggable else {}
         )
         self.photo_view.setAccessibleDescription(self._overlay_description(selected_index, selected_confidence))
+        self._queue_auto_send()
 
     def _overlay_description(self, selected_index: int, confidence: dict[str, float]) -> str:
         low = [name for name, score in confidence.items() if score < LOW_CONFIDENCE_THRESHOLD]
@@ -1903,6 +2104,75 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(f"Exported BVH to {path}")
 
+    def _on_export_all_bvh(self) -> None:
+        if not self._people or self._video is not None:
+            return
+        directory = QFileDialog.getExistingDirectory(self, "Export All BVHs To Folder", self._last_dir())
+        if not directory:
+            return
+        paths = [Path(directory) / default_export_name(self._source_path, i, ".bvh") for i in range(len(self._people))]
+        existing = [p for p in paths if p.exists()]
+        if existing and QMessageBox.question(
+            self, "Export All People (BVH)", f"Overwrite {len(existing)} existing file(s) in\n{directory}?"
+        ) != QMessageBox.Yes:
+            return
+        for index, (person, path) in enumerate(zip(self._people, paths)):
+            rotations, _confidence = self._document_inputs_for(
+                person, self.mirror_checkbox.isChecked(), self._orientation_correction(), self._person_edits(index),
+                self._photo_aspect(),
+            )
+            try:
+                save_bvh_file(rotations, path, root_position=floor_root_position(rotations))
+            except OSError as exc:
+                self._report_export_error("Export All People (BVH)", str(path), exc)
+                return
+        self.statusBar().showMessage(f"Exported {len(paths)} BVH file(s) to {directory}")
+
+    def _current_live_link_document(self) -> dict | None:
+        inputs = self._current_person_document_inputs()
+        if inputs is None:
+            return None
+        rotations, confidence = inputs
+        rotations = self._video_frame_rotations(self.person_combo.currentIndex(), rotations)
+        hip_height, leg_length = self._root_for(self.person_combo.currentIndex(), rotations)
+        return build_pose_document(
+            rotations, source_note="Sent live from PoseCraft", bone_confidence=confidence,
+            hip_height=hip_height, leg_length=leg_length,
+        )
+
+    def _current_animation_live_link_document(self, track: int) -> dict | None:
+        if self._video is None:
+            return None
+        frame_indices, rotations_by_frame, _roots = self._video_track_frames(track)
+        if not rotations_by_frame:
+            return None
+        return build_animation_document(
+            list(zip(frame_indices, rotations_by_frame)), self._video.fps,
+            source=f"{Path(self._video.path).name}, Person {track + 1}",
+        )
+
+    def _start_live_link_send(self, document: dict, automatic: bool = False) -> None:
+        if self._send_worker is not None and self._send_worker.isRunning():
+            if not automatic:
+                self.statusBar().showMessage("Still sending to Blender -- try again in a moment")
+            return
+        if not automatic:
+            self._auto_send_paused = False  # a manual send is how a paused auto-send resumes
+        animation = document.get("format") == ANIMATION_FORMAT_NAME
+        host = self.live_link_host_edit.text().strip() or live_link.DEFAULT_HOST
+        port = self.live_link_port_spin.value()
+        self._send_origin = "auto" if automatic else "manual"
+        self.send_to_blender_btn.setEnabled(False)
+        self.send_animation_btn.setEnabled(False)
+        what = f"{len(document.get('frames') or [])}-frame animation" if animation else "pose"
+        self.statusBar().showMessage(
+            f"{'Auto-sending' if automatic else 'Sending'} {what} to Blender at {host}:{port}..."
+        )
+        self._send_worker = SendToBlenderWorker(document, host, port)
+        self._send_worker.finished_ok.connect(self._on_send_to_blender_finished)
+        self._send_worker.failed.connect(self._on_send_to_blender_failed)
+        self._send_worker.start()
+
     def _report_export_error(self, title: str, path: str, exc: OSError) -> None:
         """A failed write (read-only folder, locked file, OneDrive placeholder)
         used to raise inside the Qt slot, which the windowed build has no
@@ -1912,41 +2182,46 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, title, f"Could not write:\n{path}\n\n{exc}")
 
     def _on_send_to_blender(self) -> None:
-        if self._send_worker is not None and self._send_worker.isRunning():
+        document = self._current_live_link_document()
+        if document is None:
             return
+        self._start_live_link_send(document, automatic=False)
 
-        inputs = self._current_person_document_inputs()
-        if inputs is None:
+    def _on_send_animation_to_blender(self) -> None:
+        track = self._current_track()
+        if track is None:
             return
-        rotations, confidence = inputs
-        hip_height, leg_length = self._root_for(self.person_combo.currentIndex(), rotations)
-        document = build_pose_document(
-            rotations, source_note="Sent live from PoseCraft", bone_confidence=confidence,
-            hip_height=hip_height, leg_length=leg_length,
-        )
-
-        host = self.live_link_host_edit.text().strip() or live_link.DEFAULT_HOST
-        port = self.live_link_port_spin.value()
-
-        self.send_to_blender_btn.setEnabled(False)
-        self.statusBar().showMessage(f"Sending pose to Blender at {host}:{port}...")
-
-        self._send_worker = SendToBlenderWorker(document, host, port)
-        self._send_worker.finished_ok.connect(self._on_send_to_blender_finished)
-        self._send_worker.failed.connect(self._on_send_to_blender_failed)
-        self._send_worker.start()
+        document = self._current_animation_live_link_document(track)
+        if document is None:
+            return
+        self._start_live_link_send(document, automatic=False)
 
     def _on_send_to_blender_finished(self, reply: dict | None) -> None:
         self.send_to_blender_btn.setEnabled(bool(self._people))
+        self.send_animation_btn.setEnabled(self._video is not None and bool(self._video.solved_frames()))
         message, ok = _live_link_reply_message(reply)
         self.statusBar().showMessage(message)
-        if not ok and not self._closing:
+        if not ok and not self._closing and self._send_origin != "auto":
             QMessageBox.warning(self, "Send to Blender", message)
+        self._send_origin = "manual"
 
     def _on_send_to_blender_failed(self, message: str) -> None:
         self.send_to_blender_btn.setEnabled(bool(self._people))
+        self.send_animation_btn.setEnabled(self._video is not None and bool(self._video.solved_frames()))
+        if self._send_origin == "auto" and not self._closing:
+            # Don't retry on every later change: an unreachable Live Link would
+            # mean a failed connection (and a status flash) per edit or frame.
+            self._auto_send_paused = True
+            self._auto_send_timer.stop()
+            self.statusBar().showMessage(
+                "Auto-send paused: Blender's Live Link isn't reachable -- start it in Blender, then Send "
+                "manually or re-tick Auto-send to resume"
+            )
+            self._send_origin = "manual"
+            return
         self.statusBar().showMessage("Send to Blender failed")
         if self._closing:
+            self._send_origin = "manual"
             return
         QMessageBox.warning(
             self,
@@ -1956,3 +2231,4 @@ class MainWindow(QMainWindow):
             "then try again.\n\n"
             f"Details: {message}",
         )
+        self._send_origin = "manual"

@@ -35,6 +35,8 @@ SELECTED_BONE_COLOR = QColor(77, 204, 255)  # matches viewport_3d.BONE_COLOR
 SELECTED_LOW_CONFIDENCE_COLOR = QColor(255, 100, 60)  # matches viewport_3d.LOW_CONFIDENCE_BONE_COLOR
 SELECTED_JOINT_COLOR = QColor(255, 255, 255)  # matches viewport_3d.JOINT_COLOR
 UNSELECTED_COLOR = QColor(190, 190, 190, 150)  # dim/translucent so the selected person pops
+HOVER_COLOR = QColor(255, 214, 90)
+HOVER_PERSON_COLOR = QColor(130, 220, 255, 220)
 DRAG_HANDLE_COLOR = QColor(255, 220, 90)
 # A press within this many pixels of a handle grabs it; a drag shorter than
 # DRAG_MIN_PIXELS is a click.
@@ -58,6 +60,7 @@ class PhotoOverlayPerson:
     joints_2d: dict[str, np.ndarray]
     confidence: dict[str, float]
     selected: bool
+    label: str = ""  # how the hover tooltip names this person ("Person 2"); empty: by position
 
 
 def bone_pen_style(selected: bool, confidence: float) -> tuple[QColor, float, Qt.PenStyle]:
@@ -116,7 +119,13 @@ class PhotoView(QLabel):
         self._overlay_people: list[PhotoOverlayPerson] = []
         self._handles: dict[int, np.ndarray] = {}
         self._drag: dict | None = None  # {"joint", "start" (widget px), "point" (normalized)}
-        self.setMouseTracking(False)
+        self._hover_person: int | None = None
+        self._hover_bone: str | None = None
+        self._hover_joint: str | None = None
+        self._hover_pos: QPointF | None = None  # last mouse position over the widget, for re-hit-testing
+        # Hover highlighting (F5): the bone/joint/person under the mouse is
+        # highlighted and named in a tooltip, so mouse tracking is on.
+        self.setMouseTracking(True)
 
     # -- joint dragging (F4) ---------------------------------------------------
 
@@ -198,6 +207,7 @@ class PhotoView(QLabel):
     def clear_photo(self) -> None:
         self._source_pixmap = None
         self._overlay_people = []
+        self._clear_hover()
         self.clear()
         self.setText("No photo loaded")
 
@@ -206,7 +216,34 @@ class PhotoView(QLabel):
         to clear. Triggers a repaint; the actual drawing happens in paintEvent.
         """
         self._overlay_people = people
+        # A redraw while the mouse rests (an edit, the next video frame) keeps
+        # highlighting whatever is under it now, not a stale index.
+        if self._hover_pos is not None:
+            self._set_hover(self._hover_pos)
+        else:
+            self._clear_hover()
         self.update()
+
+    def hover_info(self) -> tuple[int | None, str | None, str | None]:
+        """(person index, bone, joint key) under the mouse; None for each
+        that isn't there."""
+        return self._hover_person, self._hover_bone, self._hover_joint
+
+    def hover_text(self) -> str:
+        """What the tooltip says about the hovered person/bone/joint ("" for nothing)."""
+        if self._hover_person is None or not (0 <= self._hover_person < len(self._overlay_people)):
+            return ""
+        person = self._overlay_people[self._hover_person]
+        name = person.label or f"Person {self._hover_person + 1}"
+        if self._hover_joint is not None:
+            return f"{name}: {self._hover_joint}"
+        if self._hover_bone is not None:
+            return f"{name}: {self._hover_bone}"
+        return name
+
+    def _clear_hover(self) -> None:
+        self._hover_person = self._hover_bone = self._hover_joint = None
+        self.setToolTip("")
 
     def _apply_scaled_pixmap(self) -> None:
         if self._source_pixmap is None:
@@ -260,8 +297,11 @@ class PhotoView(QLabel):
 
     def mouseMoveEvent(self, event) -> None:
         super().mouseMoveEvent(event)
+        pos = event.position() if hasattr(event, "position") else event.pos()
         if self._drag is not None:
-            self.drag_to(event.position() if hasattr(event, "position") else event.pos())
+            self.drag_to(pos)
+            return
+        self._set_hover(pos)
 
     def mouseReleaseEvent(self, event) -> None:
         super().mouseReleaseEvent(event)
@@ -273,6 +313,61 @@ class PhotoView(QLabel):
             point = self.normalized_point(start)
             if point is not None:
                 self.clicked_normalized.emit(*point)
+
+    def leaveEvent(self, event) -> None:
+        super().leaveEvent(event)
+        self._hover_pos = None
+        if self._hover_person is not None or self._hover_bone is not None or self._hover_joint is not None:
+            self._clear_hover()
+            self.update()
+
+    def _set_hover(self, pos) -> None:
+        self._hover_pos = QPointF(pos)
+        person, bone, joint = self._hover_hit(pos)
+        if (person, bone, joint) != (self._hover_person, self._hover_bone, self._hover_joint):
+            self._hover_person, self._hover_bone, self._hover_joint = person, bone, joint
+            self.setToolTip(self.hover_text())
+            self.update()
+
+    def _hover_hit(self, pos) -> tuple[int | None, str | None, str | None]:
+        geometry = self._displayed_pixmap_geometry()
+        if geometry is None:
+            return None, None, None
+        pixmap, offset_x, offset_y = geometry
+        width, height = pixmap.width(), pixmap.height()
+
+        def to_widget_point(normalized_xy: np.ndarray) -> QPointF:
+            return QPointF(offset_x + float(normalized_xy[0]) * width, offset_y + float(normalized_xy[1]) * height)
+
+        best_bone_person, best_bone, best_bone_distance = None, None, 12.0
+        best_joint_person, best_joint, best_joint_distance = None, None, 9.0
+        for index, person in enumerate(self._overlay_people):
+            for key, xy in person.joints_2d.items():
+                point = to_widget_point(xy)
+                distance = float(np.hypot(point.x() - pos.x(), point.y() - pos.y()))
+                if distance <= best_joint_distance:
+                    best_joint_person, best_joint, best_joint_distance = index, key, distance
+            for name in ALL_BONE_NAMES:
+                head_key, tail_key = f"{name}.head", f"{name}.tail"
+                if head_key not in person.joints_2d or tail_key not in person.joints_2d:
+                    continue
+                head = to_widget_point(person.joints_2d[head_key])
+                tail = to_widget_point(person.joints_2d[tail_key])
+                segment = np.array([tail.x() - head.x(), tail.y() - head.y()], dtype=float)
+                length_sq = float(np.dot(segment, segment))
+                if length_sq <= 1e-12:
+                    continue
+                rel = np.array([pos.x() - head.x(), pos.y() - head.y()], dtype=float)
+                t = float(np.clip(np.dot(rel, segment) / length_sq, 0.0, 1.0))
+                nearest = np.array([head.x(), head.y()], dtype=float) + t * segment
+                distance = float(np.hypot(*(nearest - np.array([pos.x(), pos.y()], dtype=float))))
+                if distance <= best_bone_distance:
+                    best_bone_person, best_bone, best_bone_distance = index, name, distance
+        if best_joint is not None:
+            return best_joint_person, best_bone if best_bone_person == best_joint_person else None, best_joint
+        if best_bone is not None:
+            return best_bone_person, best_bone, None
+        return None, None, None
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
@@ -289,8 +384,8 @@ class PhotoView(QLabel):
         try:
             # Unselected people first, so the selected one's lines/joints always
             # render on top even where two people's overlays overlap.
-            for person in sorted(self._overlay_people, key=lambda p: p.selected):
-                self._draw_person(painter, person, offset_x, offset_y, pixmap.width(), pixmap.height())
+            for index, person in sorted(enumerate(self._overlay_people), key=lambda item: item[1].selected):
+                self._draw_person(painter, person, index, offset_x, offset_y, pixmap.width(), pixmap.height())
             self._draw_handles(painter)
         finally:
             painter.end()
@@ -310,7 +405,7 @@ class PhotoView(QLabel):
                 painter.drawEllipse(QRectF(point.x() - 6, point.y() - 6, 12, 12))
 
     def _draw_person(
-        self, painter: QPainter, person: PhotoOverlayPerson, offset_x: float, offset_y: float, width: int, height: int
+        self, painter: QPainter, person: PhotoOverlayPerson, person_index: int, offset_x: float, offset_y: float, width: int, height: int
     ) -> None:
         def to_widget_point(normalized_xy: np.ndarray) -> QPointF:
             return QPointF(offset_x + float(normalized_xy[0]) * width, offset_y + float(normalized_xy[1]) * height)
@@ -321,6 +416,10 @@ class PhotoView(QLabel):
             head = to_widget_point(person.joints_2d[f"{name}.head"])
             tail = to_widget_point(person.joints_2d[f"{name}.tail"])
             color, pen_width, style = bone_pen_style(person.selected, person.confidence.get(name, 1.0))
+            if person_index == self._hover_person and not person.selected:
+                color, pen_width = HOVER_PERSON_COLOR, max(2.5, pen_width)
+            if person_index == self._hover_person and name == self._hover_bone:
+                color, pen_width = HOVER_COLOR, max(4.0, pen_width + 1.0)
             if name in _FINGER_BONES:
                 pen_width = max(1.0, pen_width / 2.0)
             pen = QPen(color)
@@ -330,9 +429,17 @@ class PhotoView(QLabel):
             painter.drawLine(head, tail)
 
         painter.setPen(Qt.NoPen)
-        painter.setBrush(SELECTED_JOINT_COLOR if person.selected else UNSELECTED_COLOR)
+        joint_brush = SELECTED_JOINT_COLOR if person.selected else UNSELECTED_COLOR
+        if person_index == self._hover_person and not person.selected:
+            joint_brush = HOVER_PERSON_COLOR
+        painter.setBrush(joint_brush)
         radius = 3.5 if person.selected else 2.5
         for key, position in person.joints_2d.items():
             point = to_widget_point(position)
             r = radius / 2.0 if key.rsplit(".", 1)[0] in _FINGER_BONES else radius
+            if person_index == self._hover_person and key == self._hover_joint:
+                painter.setBrush(HOVER_COLOR)
+                r = max(r, 5.0)
+            else:
+                painter.setBrush(joint_brush)
             painter.drawEllipse(point, r, r)
