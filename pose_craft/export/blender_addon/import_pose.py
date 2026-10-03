@@ -108,9 +108,13 @@ app flagged "low_confidence" (likely occluded in the source photo) are called
 out separately -- expect to need manual correction for those, the same
 caveat PoseForge gives for DAZ.
 
-NOTE: this file has not been loaded into a real Blender instance or tested
-against an actual Rigify-generated armature -- no Blender install exists in the
-dev environment this was written in. See docs/PROJECT_STATUS.md's Known Issues.
+Checked headless in a real Blender 5.2.2 (tests/test_real_blender.py, opt-in
+via POSECRAFT_BLENDER): install/register/unregister, Load Pose JSON on a
+PoseCraft-shaped, a Mixamo-style and a generated Rigify rig (fingers, FK
+switch, FK spine), rotation modes, keyframes, Keep feet on the floor, and a
+real Live Link server receiving a pose and a chunked animation. The panel
+itself (drawing, the file browser) needs Blender's UI and wasn't checked.
+See docs/PROJECT_STATUS.md.
 """
 from __future__ import annotations
 
@@ -125,7 +129,7 @@ from mathutils import Quaternion, Vector
 bl_info = {
     "name": "PoseCraft Pose Importer",
     "author": "PoseCraft",
-    "version": (0, 7, 0),
+    "version": (0, 7, 1),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > PoseCraft",
     "description": "Applies a PoseCraft .json pose export (file or Live Link) to an armature's pose bones",
@@ -1414,6 +1418,11 @@ def _stop_live_link_server() -> None:
     if _server_socket is not None:
         _server_socket.close()
         _server_socket = None
+    # Checked in Blender 5.2: without this the persistent timer stayed
+    # registered after Stop and after the add-on was disabled, until its next
+    # tick noticed the closed socket.
+    if bpy.app.timers.is_registered(_poll_live_link_server):
+        bpy.app.timers.unregister(_poll_live_link_server)
     _live_link_status = "Stopped"
 
 

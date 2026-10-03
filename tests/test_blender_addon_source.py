@@ -654,3 +654,33 @@ def test_floor_contact_moves_the_root_by_the_drop_of_the_lowest_point():
     rest = Rotation.from_euler("x", 90, degrees=True)  # a root bone lying along +Z (Y axis up)
     location = loaded["armature_translation_to_location"](_RotQuat(rest), np.array([0.0, 0.0, -0.4]))
     np.testing.assert_allclose(rest.apply(location), [0.0, 0.0, -0.4], atol=1e-12)  # moves the head down 0.4
+
+
+# --- Live Link: stopping unregisters the timer (found in a real Blender 5.2) -----------------
+
+
+def test_stopping_live_link_unregisters_its_timer():
+    loaded = _load_pure_functions("_stop_live_link_server", "_drop_connection", "_poll_live_link_server")
+    registered = {loaded["_poll_live_link_server"]}
+
+    class _Timers:
+        def is_registered(self, function):
+            return function in registered
+
+        def unregister(self, function):
+            registered.remove(function)
+
+    class _Socket:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    server, stalled = _Socket(), _Socket()
+    loaded["bpy"] = type("bpy", (), {"app": type("app", (), {"timers": _Timers()})})
+    loaded.update(_server_socket=server, _live_link_status="Listening", _connections={stalled: object()})
+    loaded["_stop_live_link_server"]()
+    assert registered == set()  # was still registered after Stop / disabling the add-on
+    assert server.closed and stalled.closed and loaded["_connections"] == {}
+    assert loaded["_server_socket"] is None and loaded["_live_link_status"] == "Stopped"
+    loaded["_stop_live_link_server"]()  # stopping twice is harmless
