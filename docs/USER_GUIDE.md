@@ -529,10 +529,14 @@ Worth knowing before you rely on an exported pose:
   helps re-identify someone after they were lost, not while two people
   overlap); the root moves horizontally only through planted feet, and Send
   Animation sends rotations only.
-- **The Blender add-on** (bone-name matching, the Bone Mapping UI, Rigify
-  support and Live Link) hasn't been run in a real Blender yet, let alone
-  against every possible rig -- if something looks off, the Bone Mapping
-  panel is exactly the tool for fixing bone-name mismatches by hand.
+- **The Blender add-on** has been checked in Blender 5.2.2 on a few rigs
+  (PoseCraft's own shape, a Mixamo-style rig, a freshly generated Rigify
+  Human rig) and with Live Link, but not against every possible rig or
+  Blender version -- if something looks off, the Bone Mapping panel is
+  exactly the tool for fixing bone-name mismatches by hand.
+- **Sending a 30 fps clip into a 24 fps scene** keys a few clip frames onto
+  the same Blender frame (the later one wins); the timing stays right. Set
+  the scene to the clip's frame rate to keep every frame.
 - **DAZ Studio isn't a supported export target** -- PoseCraft only exports to
   Blender.
 - The packaged `.exe` isn't code-signed, so expect a Windows SmartScreen

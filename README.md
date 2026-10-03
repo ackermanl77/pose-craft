@@ -180,6 +180,6 @@ See [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) for architecture, and its
 roll is inferred rather than measured, the torso is one bone, the
 world-landmark axis convention hasn't been checked end to end against a real
 photo in Blender, finger poses and multi-person video tracking haven't been
-checked on real footage, and the Blender add-on (including the rig-aware
-retargeting, Rigify support and the Live Link server) hasn't been run in a
-real Blender install.
+checked on real footage, and the Blender add-on has been checked headless in
+Blender 5.2.2 only (a PoseCraft-shaped, a Mixamo-style and a generated Rigify
+rig, the BVH importer and a real Live Link server -- not its panel UI).
