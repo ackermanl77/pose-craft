@@ -86,19 +86,28 @@ right-click menu, and any bone can be rotated by hand in "3. Correct" (all
 with undo). Tick **Hands and fingers** before solving to also estimate the
 fingers (15 bones per hand, Rigify names; off by default -- the first use
 downloads MediaPipe's pinned hand model). **Load Video...** tracks up to "Max
-people" people through a clip, each with a stable number, and exports an
-animated BVH per person. In the 3D preview, hover a bone for its name, local
+people" people through a clip, each with a stable number (re-identified after
+a short loss by where they were and what they look like), and exports an
+animated BVH per person, optionally with **Rotation smoothing** (zero-phase,
+on by default at 35%; 0% exports the frames as solved) -- or sends the
+selected person's animation straight to Blender. Hover the photo for the
+bone, joint or person under the mouse (highlighted, named in a tooltip). In the 3D preview, hover a bone for its name, local
 rotation and confidence; **View > Photo Backdrop** puts the photo behind the
 skeleton. From there:
 
-- **Export Pose JSON** / **Export BVH** / **Export All People...** (one JSON
-  per detected person, to a folder you choose, named after the photo; the
+- **Export Pose JSON** / **Export BVH** / **Export All People...** /
+  **Export All People (BVH)...** (one file per detected person, to a folder
+  you choose, named after the photo, asking before overwriting; the
   mirror checkbox, if used, applies to everyone in a batch export the same way
   it applies to a single person; the BVH stands on the floor), or
 - **Send to Blender (Live Link)** -- needs Blender running with the add-on's
   Live Link started first (see below). The host/port fields next to the
   button default to `127.0.0.1:8642` and only need changing if that port is
-  already in use.
+  already in use. **Auto-send on change** (off by default, remembered)
+  re-sends the shown pose a short debounce after each change and pauses itself
+  if Blender can't be reached. For a video, **Send Animation to Blender** keys
+  the selected person's whole track on the rig (add-on 0.7.0+; long clips go
+  in chunks under the add-on's 256 KB message cap).
 
 Inside Blender, install `pose_craft/export/blender_addon/import_pose.py` as an
 add-on (Edit > Preferences > Add-ons > Install...), select an armature, and

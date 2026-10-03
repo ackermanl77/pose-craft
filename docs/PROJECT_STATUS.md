@@ -25,9 +25,10 @@ PoseEstimator (pose_craft/estimation/landmarker.py)
   -- video (estimation/video.py): up to max_people people with stable track
      IDs (MultiPersonTracker: each followed from its own previous landmarks,
      detector on frame 0, on a loss and every 10 frames while under the
-     limit; lost tracks re-identified by keypoint distance for 30 frames;
-     converged tracks merged), per-person One Euro smoothing, floor contact
-     and foot-locked root motion
+     limit; lost tracks re-identified by keypoint distance plus an RGB
+     appearance histogram for 30 frames; converged tracks merged), per-person
+     One Euro smoothing, optional zero-phase rotation smoothing
+     (smooth_rotation_frames), floor contact and foot-locked root motion
         |  landmarks converted to the engine frame (right-handed, Y-up, +X image right =
         |  subject's left, +Z toward camera = the way the subject faces);
         |  each DetectedPerson also carries 2D image-space landmarks + per-landmark visibility
@@ -252,7 +253,8 @@ round): **298 passed, 6 skipped** (the LiteRT parity test, the real-photo
 golden test, and the four opt-in GPU parity tests). After the "important
 items" round (2026-10-02): **357 passed, 6 skipped** (same skips; the new
 real-hand-model test runs because the hand model is cached locally and skips
-without it). `tests/test_gui_flows.py`
+without it). After the video/Live Link round (2026-10-03): **401 passed, 6
+skipped**. `tests/test_gui_flows.py`
 now drives the real window on an offscreen Qt event loop with fake
 estimators: busy states, cancel, the close-waits-for-the-worker guarantee,
 the non-blocking send, warm-up, settings, drag-and-drop, picking, manual
@@ -308,6 +310,58 @@ checked" above as weaker evidence than an automated test -- it was true at the
 time each check ran, not guaranteed to stay true as the code changes.
 
 ## Recently Fixed
+
+- **Video / Live Link round (2026-10-03): B12, F5, F8, F10.** 357 passed / 6
+  skipped before, 401 / 6 after (new: `tests/test_blender_animation.py`,
+  `test_gui_live_link.py`, `test_rotation_smoothing.py`; more in
+  `test_video_tracking.py`). Finishes work that was half-wired in the tree:
+  - **Appearance re-identification (B12).** A lost track is matched by
+    keypoint distance + 0.35 x an RGB-histogram distance (4x4x4 bins over the
+    landmark box). Fixed: the histogram is now a strided sample of at most
+    ~4096 pixels via `bincount` (was `histogramdd` over every pixel of a
+    full-HD box each frame), and a track's signature is a running blend (0.8
+    memory) so one occluded frame doesn't overwrite it. A scripted crossing
+    behind an occluder keeps its IDs with appearance and swaps without it.
+  - **Rotation smoothing (B12).** "Rotation smoothing" (0-100 %, default 35,
+    remembered) smooths each track's solved bone rotations. Fixed: it was a
+    one-way exponential filter (up to ~9 frames of lag at 100 %) that bridged
+    tracking gaps as if the frames were adjacent and built a scipy Slerp per
+    bone per frame; it's now a vectorized shortest-arc slerp run forwards and
+    backwards (zero-phase), gap-aware (catches up by `1 - keep**gap`), sign-flip
+    safe; 0 returns the very same Rotation objects. The window caches each
+    track's solved frames (they were re-solved twice on every preview update)
+    and uses the displayed person's track -- with the selected person out of
+    frame, the person shown used to get the unsmoothed pose.
+  - **Send Animation to Blender (B12).** The app's half was there; the add-on
+    rejected the document ("Not a PoseCraft pose file"). Add-on 0.7.0 adds
+    `pose_craft_animation` (Live Link protocol 3): the whole chunk is
+    validated first, each frame is posed through `apply_pose_document` (the
+    same retarget path) at `start + round((index - first) * scene_fps /
+    clip_fps)` and keyed, the current frame is restored, quaternion keys are
+    kept in one hemisphere, and one undo step is pushed after the last chunk.
+    The 256 KB payload cap is kept: `live_link.send_animation_document` splits
+    the clip into chunks of at most 30 frames / 200 KB, the first reply's
+    start frame anchors the rest. Single poses still say protocol 2, so a
+    0.4-0.6 add-on keeps working; an older add-on refuses animations with
+    "update the add-on". Root motion isn't sent. Tested with the add-on's
+    functions on a simulated scene and through a real socket with the
+    add-on's framing -- unverified in a real Blender.
+  - **Auto-send on change (F10)** (off by default; it and its debounce are
+    remembered): debounced, one send in flight at a time, no send without a
+    selected person, pauses after an unreachable Live Link instead of
+    retrying on every change (a manual send resumes it), no dialogs, and the
+    timer stops on close. Fixed: the queue check built a whole Live Link
+    document (re-solving a video track) on every change. **Export All People
+    (BVH)** for photos (F10), asking before overwriting.
+  - **Photo hover (F5).** Hovering highlights the bone/joint/person and a
+    tooltip names it (with the track's number in a video); a redraw while
+    the mouse rests keeps the highlight; a bone without its tail no longer
+    raises.
+  - **Accessibility (F8).** A yellow keyboard-focus outline, accessible names
+    on every new and existing control (a test checks every button, combo,
+    spin box, slider and field has a name or buddy label), and mnemonics that
+    don't collide (`&Rotation smoothing` clashed with `po&rt`). No real
+    screen-reader check.
 
 - **"Important items" round (2026-10-02): B5 Rigify, B11, B12, F4, F9.** 307
   passed / 6 skipped before, 357 / 6 after (new: `tests/test_hands.py`,
@@ -993,11 +1047,14 @@ Ranked roughly by how much they affect whether an exported pose is usable:
   isn't measured (the knuckle segment is framed by the palm, the rest are
   hinges, the thumb's roll follows the palm), hands whose pose landmarks are
   under 0.5 visibility aren't searched, and video is body-only.
-- **Video identities are heuristic (B12).** Tracks are matched by crop
-  overlap and keypoint distance, not appearance, so two people crossing
-  closely can swap IDs, and someone gone for over 30 frames comes back as a
-  new person. There's no rotation-space smoothing, and the root's horizontal
-  motion comes only from planted feet (a jump or a slide has none).
+- **Video identities are heuristic (B12).** Tracks are followed by crop
+  overlap; a lost track is re-identified by keypoint distance plus a colour
+  histogram, so two similarly dressed people crossing closely can still
+  swap IDs (appearance isn't used while two tracks overlap), and someone gone
+  for over 30 frames comes back as a new person. The root's horizontal motion
+  comes only from planted feet (a jump or a slide has none), and Send
+  Animation to Blender sends rotations only (no root motion). Tested on
+  scripted scenes, not real footage.
 - **No DAZ Studio export target -- deliberately not started, not just missing.**
   PoseCraft only exports to Blender; the original PoseForge this project is
   inspired by targets DAZ Studio directly. Investigated adding a `.duf` export

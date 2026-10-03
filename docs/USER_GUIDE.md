@@ -171,6 +171,9 @@ top of the image; the legend under the photo shows the same line styles:
   without relying on colour.
 - Everyone **not** currently selected is dimmed gray underneath, so it's
   obvious who you're about to export.
+- **Hover** the photo: the bone or joint under the mouse is highlighted in
+  yellow (a hovered unselected person turns light blue), and a tooltip names
+  it ("Person 2: forearm.L").
 
 **Mirror left/right** (**M**; a body orientation fix) swaps which side of the body
 feeds which exported bone and mirrors the pose (a left arm raised becomes a
@@ -226,8 +229,10 @@ previous frame (fast: one model run per person per frame, about 10 ms on a
 CPU); the detector runs on the first frame, whenever someone is lost, and
 every 10 frames while fewer than the maximum are tracked, to pick up
 newcomers. Someone who disappears for up to 30 frames (walking behind
-something) gets their number back when they reappear near where they left;
-after longer they get a new number. With Max people set to 1 only the
+something) gets their number back when they reappear near where they left
+and look the same (a small colour histogram of each person's box is compared
+too, so two people who cross behind something are less likely to come back
+with swapped numbers); after longer they get a new number. With Max people set to 1 only the
 clearest person is tracked, as before. Each person's landmarks are smoothed
 over time on their own (a One Euro filter: strong smoothing while the body
 is still, little lag when it moves fast).
@@ -242,6 +247,25 @@ on the floor, and while a foot is planted the root moves so that foot stays
 put, which is what moves a walk forward. **Export All People (BVH)...** writes
 one such file per tracked person (`clip_person1.bvh`, `clip_person2.bvh`, ...)
 into a folder, asking before it overwrites anything.
+
+**Rotation smoothing** (0-100%, default 35%, remembered) additionally smooths
+the solved joint rotations of each tracked person (quaternion slerp, run
+forwards and backwards so the motion doesn't lag the video; across frames
+where the person was lost it catches up instead of blending the two sides).
+The preview, both BVH exports, Live Link and Send Animation all use it; 0%
+keeps every frame exactly as solved.
+
+**Send Animation to Blender** sends the selected person's whole track over
+Live Link: Blender keys every solved frame on the target rig, starting at
+Blender's current frame and spaced at the clip's timing in the scene's frame
+rate (a 30 fps clip in a 24 fps scene keeps its length). Frames where the
+person was lost get no key. Each frame goes through the same bone mapping,
+rest-pose matching and Rigify handling as a single pose, and the whole
+animation is one undo step in Blender. Long clips are sent in several parts
+(at most 30 frames and about 200 KB each); the status bar says how many
+frames were keyed and on which Blender frames. Needs add-on 0.7.0 or newer --
+an older one replies "update the add-on". Root motion isn't sent: use the
+add-on's **Keep feet on the floor** for height, or the BVH for walking motion.
 
 ## 4. Export
 
@@ -264,6 +288,9 @@ the person, like `IMG_0042_person2.json`.
 - **Export BVH...** (**Ctrl+Shift+S**) saves the selected person as a single-frame `.bvh` file
   (Y up, facing +Z), for tools that read BVH rather than PoseCraft's JSON. The
   skeleton stands on the floor (Y = 0), so a crouch comes out lowered.
+- **Export All People (BVH)...** does the same for every detected person
+  (`IMG_0042_person1.bvh`, ...), into a folder you choose, asking before
+  overwriting.
 
 With **Hands and fingers** on, a person whose hands were found also has 15
 finger bones per hand in the JSON (same format, same keys per bone) and the
@@ -286,6 +313,16 @@ dialog for every attempt.
   solved pose. This needs Blender open, the add-on installed, and its **Start
   Live Link** button already clicked -- otherwise you'll get a popup
   explaining that and pointing you at the Blender side.
+
+- **Auto-send on change** (off by default, remembered with its **Debounce**,
+  default 350 ms) re-sends the shown pose once changes settle -- a new
+  selection, video frame, correction, mirror or orientation change -- so a
+  burst of changes (scrubbing, a spin box held down) becomes one send, and
+  only one send is ever in flight. Nothing is sent without a selected person.
+  If Blender can't be reached, auto-send pauses itself (the status bar says
+  so, no popup); a manual **Send to Blender**, or ticking the box again,
+  resumes it. Closing the app cancels a pending send.
+- **Send Animation to Blender** (in the Video section) -- see [Video](#video).
 
 Sending runs in the background, so the app doesn't freeze while it connects
 -- useful because the most common failure (Blender's Live Link isn't started
@@ -351,7 +388,9 @@ camera's distance and center re-fit automatically.
 | H / Shift+B | Toggle the 3D hover info / the photo backdrop |
 
 Most control labels have an underlined letter: Alt plus that letter jumps to
-it. **File > Open Recent** lists the last eight photos and videos.
+it. The control with keyboard focus gets a yellow outline, and every control
+has an accessible name for screen readers (not yet checked with a real
+screen reader). **File > Open Recent** lists the last eight photos and videos.
 
 ## Setting up the Blender add-on
 
@@ -433,7 +472,10 @@ since been renamed or deleted.
 then click **Start Live Link**. The armature becomes the **Live Link target**
 (shown in the panel; pick another there any time), so you can select other
 objects while you work and poses still go to the rig. Each received pose is
-its own undo step (**Ctrl+Z** in Blender). Receiving never stalls Blender:
+its own undo step (**Ctrl+Z** in Blender); an animation from **Send Animation
+to Blender** is keyed frame by frame (whatever **Insert keyframes** says, and
+without **Then advance**), the current frame is put back afterwards, and the
+whole animation is a single undo step. Receiving never stalls Blender:
 a sender that stops halfway is dropped after two seconds. The status line
 underneath shows whether it's
 listening, and reports the result of the most recently received pose. Click
@@ -482,9 +524,11 @@ Worth knowing before you rely on an exported pose:
   frame isn't searched, a finger's twist isn't estimated (fingers bend and
   spread; the thumb's roll follows the palm), and video stays body-only. Real
   photos haven't been checked against known finger poses yet.
-- **Video identities can swap** when two people cross closely or one is
-  hidden for more than about a second; the root moves horizontally only
-  through planted feet.
+- **Video identities can still swap** when two similarly dressed people
+  cross closely or one is hidden for more than about a second (appearance only
+  helps re-identify someone after they were lost, not while two people
+  overlap); the root moves horizontally only through planted feet, and Send
+  Animation sends rotations only.
 - **The Blender add-on** (bone-name matching, the Bone Mapping UI, Rigify
   support and Live Link) hasn't been run in a real Blender yet, let alone
   against every possible rig -- if something looks off, the Bone Mapping
