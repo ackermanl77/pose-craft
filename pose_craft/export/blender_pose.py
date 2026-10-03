@@ -45,6 +45,10 @@ from pose_craft.retarget.skeleton import (
 
 FORMAT_NAME = "pose_craft_pose"
 FORMAT_VERSION = 2
+# A whole tracked video person sent over Live Link (build_animation_document);
+# mirrored by the add-on's ANIMATION_FORMAT_NAME / MAX_SUPPORTED_ANIMATION_VERSION.
+ANIMATION_FORMAT_NAME = "pose_craft_animation"
+ANIMATION_FORMAT_VERSION = 1
 
 # Below this MediaPipe visibility score, a bone is flagged "low_confidence" in the
 # exported file -- a hint (surfaced by the Blender add-on) that this joint was
@@ -116,6 +120,32 @@ def build_pose_document(
         if leg_length is not None:
             document["root"]["leg_length"] = float(leg_length)
     return document
+
+
+def build_animation_document(
+    frames: list[tuple[int, dict[str, Rotation]]], fps: float, *, source: str = ""
+) -> dict:
+    """A tracked person's solved video frames for Live Link's "Send Animation
+    to Blender" (add-on 0.7.0+): {"format": ANIMATION_FORMAT_NAME, "version":
+    ANIMATION_FORMAT_VERSION, "fps", "source", "frames": [{"frame_index",
+    "pose"}]}, each pose an ordinary build_pose_document() so the add-on
+    retargets every frame exactly like a single pose. frames: (clip frame
+    index, local rotations), indices increasing -- gaps are frames the
+    tracker lost, which the add-on leaves unkeyed. live_link.send_animation_document
+    splits it into chunks under the add-on's payload cap."""
+    indices = [int(index) for index, _rotations in frames]
+    if any(b <= a for a, b in zip(indices, indices[1:])):
+        raise ValueError("animation frame indices must increase")
+    return {
+        "format": ANIMATION_FORMAT_NAME,
+        "version": ANIMATION_FORMAT_VERSION,
+        "fps": float(fps),
+        "source": source,
+        "frames": [
+            {"frame_index": index, "pose": build_pose_document(rotations)}
+            for index, (_frame, rotations) in zip(indices, frames)
+        ],
+    }
 
 
 def root_measurements(

@@ -50,7 +50,8 @@ def test_send_pose_document_wire_format():
     thread.join(timeout=2.0)
     server.close()
     sent = dict(received["document"])
-    assert sent.pop("live_link_protocol") == live_link.PROTOCOL_VERSION
+    # A single pose says the lowest protocol that understands it, so a 0.4-0.6 add-on still takes it.
+    assert sent.pop("live_link_protocol") == live_link.POSE_REQUEST_PROTOCOL == 2
     assert sent == document
 
 
@@ -98,7 +99,7 @@ def test_send_returns_what_blender_applied():
 
     thread.join(timeout=2.0)
     assert result == reply
-    assert received["document"]["live_link_protocol"] == live_link.PROTOCOL_VERSION
+    assert received["document"]["live_link_protocol"] == live_link.POSE_REQUEST_PROTOCOL
 
 
 def test_send_to_an_addon_without_replies_returns_none():

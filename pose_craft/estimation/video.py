@@ -10,12 +10,16 @@
   tracked, and every
   REDETECT_EVERY_FRAMES frames while fewer than max_people are tracked. A new
   detection that overlaps a tracked person is ignored; the rest are matched
-  to recently lost tracks by keypoint distance (re-identified), and only then
-  become new IDs. Two tracks that converge on one person are merged.
+  to recently lost tracks by keypoint distance plus an appearance signature
+  (a compact RGB histogram over the person's landmark box, reducing ID swaps
+  after crossings/occlusion), and only then become new IDs. Two tracks that
+  converge on one person are merged.
 - Smoothing: a One Euro filter (Casiez et al., CHI 2012) on the world
   landmarks, per coordinate and per person -- strong smoothing when the body
   is still, little lag when it moves fast. `min_cutoff` (Hz) lowers jitter,
-  `beta` lowers lag.
+  `beta` lowers lag. Animated export can additionally smooth the solved bone
+  rotations themselves (smooth_rotation_frames: a zero-phase exponential
+  slerp per bone, gap-aware, the "Rotation smoothing" setting).
 - Ground contact and foot locking: each frame's hips are lifted to stand the
   pose on the floor (skeleton.hip_height_above_floor), and while a foot rests
   on the floor the root moves so that foot stays put (foot_locked_root_xz) --
@@ -64,6 +68,11 @@ DEFAULT_D_CUTOFF = 1.0
 FOOT_LOCK_HEIGHT_CM = 3.0
 FOOT_LOCK_MAX_VERTICAL_CM_S = 30.0
 FOOT_LOCK_MAX_SLIDE_CM_S = 400.0
+APPEARANCE_HISTOGRAM_BINS = 4
+APPEARANCE_WEIGHT = 0.35
+# A track's signature keeps this much of its history each frame (blend_appearance).
+APPEARANCE_MEMORY = 0.8
+APPEARANCE_MAX_SAMPLES = 4096
 
 
 def _smoothing_factor(cutoff: float, dt: float) -> float:
@@ -192,6 +201,68 @@ def match_cost(previous, current) -> float:
     return float(distances.mean()) / diagonal
 
 
+def appearance_signature(
+    image_rgb: np.ndarray,
+    image_xy: np.ndarray,
+    visibility: np.ndarray | None = None,
+    bins: int = APPEARANCE_HISTOGRAM_BINS,
+) -> np.ndarray | None:
+    """A compact RGB histogram over the landmark box, normalized to sum to 1.
+
+    Small and cheap on purpose: the tracker only needs enough appearance
+    signal to tell two nearby people apart after crossings/brief occlusions.
+    Returns None when the landmark box is empty or outside the frame.
+    """
+    image = np.asarray(image_rgb)
+    if image.ndim != 3 or image.shape[2] < 3:
+        return None
+    box = landmark_box(image_xy, visibility)
+    h, w = image.shape[:2]
+    x0 = int(np.floor(np.clip(box[0], 0.0, 1.0) * w))
+    x1 = int(np.ceil(np.clip(box[2], 0.0, 1.0) * w))
+    y0 = int(np.floor(np.clip(box[1], 0.0, 1.0) * h))
+    y1 = int(np.ceil(np.clip(box[3], 0.0, 1.0) * h))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    # Every pixel isn't needed for a 64-bin histogram: a strided sample of at
+    # most ~APPEARANCE_MAX_SAMPLES keeps this cheap on a full-HD person box.
+    stride = max(1, int(np.sqrt((x1 - x0) * (y1 - y0) / APPEARANCE_MAX_SAMPLES)))
+    crop = image[y0:y1:stride, x0:x1:stride, :3]
+    if crop.size == 0:
+        return None
+    levels = crop.reshape(-1, 3).astype(np.int64) * bins // 256  # 0..bins-1 per channel
+    flat = (levels[:, 0] * bins + levels[:, 1]) * bins + levels[:, 2]
+    signature = np.bincount(flat, minlength=bins**3).astype(np.float64)
+    total = float(signature.sum())
+    return signature / total if total > 0 else None
+
+
+def blend_appearance(previous: np.ndarray | None, current: np.ndarray | None) -> np.ndarray | None:
+    """A track's running appearance: mostly what it looked like so far, a
+    little of this frame (APPEARANCE_MEMORY), so a frame where someone walks
+    in front of the person doesn't overwrite their signature."""
+    if previous is None or current is None:
+        return current if previous is None else previous
+    return APPEARANCE_MEMORY * previous + (1.0 - APPEARANCE_MEMORY) * current
+
+
+def appearance_cost(previous: np.ndarray | None, current: np.ndarray | None) -> float:
+    """0 for identical appearance, 1 for maximally different.
+
+    Missing signatures are treated as neutral rather than as evidence against a
+    match, so geometry-only tracking keeps working on tiny or out-of-frame
+    crops.
+    """
+    if previous is None or current is None:
+        return 0.0
+    return float(np.abs(previous - current).sum() / 2.0)
+
+
+def track_match_cost(previous, current, previous_appearance: np.ndarray | None, current_appearance: np.ndarray | None) -> float:
+    """Geometry-first identity cost, nudged by appearance to break crossings."""
+    return match_cost(previous, current) + APPEARANCE_WEIGHT * appearance_cost(previous_appearance, current_appearance)
+
+
 def greedy_assignment(costs: np.ndarray, max_cost: float) -> list[tuple[int, int]]:
     """(row, column) pairs, cheapest first, each row and column used once,
     every pair under max_cost."""
@@ -215,6 +286,7 @@ def greedy_assignment(costs: np.ndarray, max_cost: float) -> list[tuple[int, int
 class _Track:
     id: int
     last: object  # PoseResult
+    appearance: np.ndarray | None = None
     missed: int = 0  # frames since last seen
 
 
@@ -257,6 +329,7 @@ class MultiPersonTracker:
         image_rgb = np.ascontiguousarray(image_rgb)
         h, w = image_rgb.shape[:2]
         current: dict = {}
+        current_appearance: dict[int, np.ndarray | None] = {}
         lost_now = False
         # 1. Follow everyone seen in the previous frame from their own landmarks.
         for track in self._tracks:
@@ -268,10 +341,12 @@ class MultiPersonTracker:
                 lost_now = True
             else:
                 current[track.id] = result
+                current_appearance[track.id] = appearance_signature(image_rgb, result.image_xy, result.visibility)
         # 2. Two tracks that drifted onto one person: the older ID keeps them.
         for track_id in sorted(current):
             if self._overlaps(current[track_id], [current[o] for o in current if o < track_id]):
                 del current[track_id]
+                current_appearance.pop(track_id, None)
                 lost_now = True
         # 3. Look for newcomers and lost people.
         if self._frame == 0 or not current or (
@@ -279,33 +354,45 @@ class MultiPersonTracker:
         ):
             self.detector_runs += 1
             candidates = []
+            candidate_appearance = []
             for roi in self._pose.detect_rois(image_rgb, self.max_people, self.min_detection_confidence):
                 result = self._pose.landmarks_for_roi(image_rgb, roi, self.min_presence_confidence)
                 if result is None or self._overlaps(result, list(current.values()) + candidates):
                     continue
                 candidates.append(result)
+                candidate_appearance.append(appearance_signature(image_rgb, result.image_xy, result.visibility))
             lost = [t for t in self._tracks if t.id not in current and t.missed < self.max_missed]
-            costs = np.array([[match_cost(t.last, c) for c in candidates] for t in lost], dtype=float)
+            costs = np.array(
+                [
+                    [track_match_cost(t.last, c, t.appearance, candidate_appearance[i]) for i, c in enumerate(candidates)]
+                    for t in lost
+                ],
+                dtype=float,
+            )
             costs = costs.reshape(len(lost), len(candidates))
             used = set()
             for row, column in greedy_assignment(costs, MATCH_MAX_COST):
                 if len(current) >= self.max_people:
                     break
                 current[lost[row].id] = candidates[column]
+                current_appearance[lost[row].id] = candidate_appearance[column]
                 used.add(column)
             newcomers = sorted(
-                (c for i, c in enumerate(candidates) if i not in used), key=lambda r: float(np.mean(r.image_xy[:, 0]))
+                ((i, c) for i, c in enumerate(candidates) if i not in used),
+                key=lambda item: float(np.mean(item[1].image_xy[:, 0])),
             )
-            for result in newcomers:
+            for index, result in newcomers:
                 if len(current) >= self.max_people:
                     break
-                self._tracks.append(_Track(self._next_id, result))
+                self._tracks.append(_Track(self._next_id, result, candidate_appearance[index]))
                 current[self._next_id] = result
+                current_appearance[self._next_id] = candidate_appearance[index]
                 self._next_id += 1
         # 4. Bookkeeping: seen tracks reset, the rest age and eventually expire.
         for track in self._tracks:
             if track.id in current:
                 track.last, track.missed = current[track.id], 0
+                track.appearance = blend_appearance(track.appearance, current_appearance.get(track.id))
             else:
                 track.missed += 1
         self._tracks = [t for t in self._tracks if t.missed <= self.max_missed]
@@ -389,6 +476,85 @@ def smooth_tracks(
             if person is not None:
                 smoothed[index][track_id] = person
     return smoothed
+
+
+def slerp_quaternions(q0: np.ndarray, q1: np.ndarray, alpha) -> np.ndarray:
+    """Row-wise spherical interpolation between unit quaternions (scipy's
+    x, y, z, w order) by `alpha` (a scalar or one value per row), always
+    along the shorter arc: q and -q are the same rotation, so a sign flip
+    between frames is not a 360-degree turn."""
+    q0 = np.asarray(q0, dtype=float).reshape(-1, 4)
+    q1 = np.asarray(q1, dtype=float).reshape(-1, 4)
+    alpha = np.broadcast_to(np.asarray(alpha, dtype=float), (len(q0),))
+    dot = np.sum(q0 * q1, axis=1)
+    q1 = np.where(dot[:, None] < 0.0, -q1, q1)
+    theta = np.arccos(np.clip(np.abs(dot), 0.0, 1.0))
+    sin_theta = np.sin(theta)
+    near = sin_theta < 1e-6  # (nearly) the same rotation: plain lerp is exact enough
+    safe = np.where(near, 1.0, sin_theta)
+    w0 = np.where(near, 1.0 - alpha, np.sin((1.0 - alpha) * theta) / safe)
+    w1 = np.where(near, alpha, np.sin(alpha * theta) / safe)
+    out = w0[:, None] * q0 + w1[:, None] * q1
+    return out / np.linalg.norm(out, axis=1, keepdims=True)
+
+
+def _exponential_rotation_pass(
+    frames_rotations: list[dict[str, Rotation]], frame_indices: list[int], keep: float
+) -> list[dict[str, Rotation]]:
+    """One causal pass: each bone moves `1 - keep` of the way from its
+    filtered value toward each new frame (more after a gap: `1 - keep**gap`,
+    as if the skipped frames had been filtered too). A bone seen for the
+    first time starts the filter at its own value."""
+    previous_quat: dict[str, np.ndarray] = {}
+    previous_index: dict[str, int] = {}
+    out: list[dict[str, Rotation]] = []
+    for frame, index in zip(frames_rotations, frame_indices):
+        result: dict[str, Rotation] = {}
+        names = [name for name in frame if name in previous_quat]
+        if names:
+            current = np.array([frame[name].as_quat() for name in names])
+            before = np.array([previous_quat[name] for name in names])
+            gaps = np.array([max(1, index - previous_index[name]) for name in names], dtype=float)
+            filtered = Rotation.from_quat(slerp_quaternions(before, current, 1.0 - keep**gaps))
+            for k, name in enumerate(names):
+                result[name] = filtered[k]
+        for name, rotation in frame.items():
+            if name not in result:
+                result[name] = rotation
+            previous_quat[name] = result[name].as_quat()
+            previous_index[name] = index
+        out.append({name: result[name] for name in frame})
+    return out
+
+
+def smooth_rotation_frames(
+    frames_rotations: list[dict[str, Rotation]],
+    strength: float = 0.0,
+    frame_indices: list[int] | None = None,
+) -> list[dict[str, Rotation]]:
+    """Quaternion-aware smoothing over one person's solved bone rotations.
+
+    `strength` is 0..1: 0 leaves the animation untouched (the same Rotation
+    objects come back), 1 is the strongest practical smoothing. Each bone is
+    filtered on its own with an exponential slerp, run forward and then
+    backward over the clip (zero-phase), so the smoothed motion doesn't lag
+    behind the video. frame_indices: each entry's frame number in the clip
+    (default 0, 1, 2, ...): across frames the tracker lost, the filter
+    catches up by the size of the gap instead of treating the frames either
+    side as neighbours (a bone missing from some frames is treated the same
+    way, and never invented there). Call it per person (track): tracks never
+    share a filter.
+    """
+    if not frames_rotations or strength <= 0:
+        return [dict(frame) for frame in frames_rotations]
+    indices = list(range(len(frames_rotations))) if frame_indices is None else [int(i) for i in frame_indices]
+    if len(indices) != len(frames_rotations):
+        raise ValueError("frame_indices must have one entry per frame")
+    strength = float(np.clip(strength, 0.0, 1.0))
+    keep = 0.9 * strength  # per frame: how much of the filtered value stays
+    forward = _exponential_rotation_pass(frames_rotations, indices, keep)
+    backward = _exponential_rotation_pass(forward[::-1], [-i for i in indices[::-1]], keep)
+    return backward[::-1]
 
 
 def solve_video(
@@ -476,6 +642,7 @@ def animation_rotations(
     fps: float,
     mirror: Callable[[np.ndarray], np.ndarray] | None = None,
     orientation_correction: Rotation | None = None,
+    rotation_smoothing: float = 0.0,
 ) -> tuple[list[dict[str, Rotation]], list[tuple[float, float, float]]]:
     """(local rotations per frame, BVH root position per frame in cm) for
     solved frames -- see animation_root_positions."""
@@ -490,4 +657,5 @@ def animation_rotations(
         if orientation_correction is not None:
             rotations = apply_orientation_correction(rotations, orientation_correction)
         frames.append(rotations)
+    frames = smooth_rotation_frames(frames, rotation_smoothing)
     return frames, animation_root_positions(frames, fps)

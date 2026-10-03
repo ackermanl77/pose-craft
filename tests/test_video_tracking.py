@@ -207,3 +207,78 @@ def test_video_frame_keeps_its_single_person_constructor():
     assert solve.track_ids() == [0, 3] and len(solve.solved_frames()) == 2
     with pytest.raises(KeyError):
         solve.frames[2].people[0]
+
+
+# --- appearance re-identification (B12) ---------------------------------------------------------
+
+_COLORS = {"a": (220, 40, 40), "b": (40, 60, 220)}
+
+
+def _painted(people: dict, size=200) -> np.ndarray:
+    """A frame with each person's landmark box filled with their own colour."""
+    image = np.full((size, size, 3), 30, dtype=np.uint8)
+    for name, (cx, cy) in people.items():
+        x0, x1 = int((cx - 0.04) * size), int(np.ceil((cx + 0.04) * size))
+        y0, y1 = int((cy - 0.15) * size), int(np.ceil((cy + 0.15) * size))
+        image[y0:y1, x0:x1] = _COLORS[name]
+    return image
+
+
+def _run_painted(frames: list[dict]) -> list[dict]:
+    scene = _Scene(frames)
+    tracker = video.MultiPersonTracker(scene, 4)
+    out = []
+    for index, people in enumerate(frames):
+        scene.frame = index
+        out.append({tid: chr(int(r.world[0, 0])) for tid, r in tracker.step(_painted(people)).items()})
+    return out
+
+
+def _crossing_behind_an_occluder() -> list[dict]:
+    """Two people walk toward each other behind something (both lost for three
+    frames) and come out having swapped sides -- each now nearer the OTHER
+    one's last position, which is all keypoint distance can go on."""
+    frames = [{"a": (0.30, 0.5), "b": (0.62, 0.5)} for _ in range(5)]
+    frames += [{} for _ in range(3)]
+    frames += [{"a": (0.50, 0.5), "b": (0.42, 0.5)} for _ in range(3)]
+    return frames
+
+
+def test_appearance_keeps_identities_through_a_crossing_occlusion():
+    ids = _run_painted(_crossing_behind_an_occluder())
+    assert ids[0] == {0: "a", 1: "b"}
+    assert all(frame == {} for frame in ids[5:8])
+    assert all(frame == {0: "a", 1: "b"} for frame in ids[8:])
+
+
+def test_without_appearance_the_same_crossing_swaps_ids(monkeypatch):
+    """The regression the appearance term exists for: geometry alone swaps."""
+    monkeypatch.setattr(video, "APPEARANCE_WEIGHT", 0.0)
+    ids = _run_painted(_crossing_behind_an_occluder())
+    assert ids[-1] == {0: "b", 1: "a"}
+
+
+def test_appearance_signature_and_cost():
+    image = _painted({"a": (0.3, 0.5), "b": (0.7, 0.5)})
+    xy_a = _result((0.3, 0.5)).image_xy
+    xy_b = _result((0.7, 0.5)).image_xy
+    a, b = video.appearance_signature(image, xy_a), video.appearance_signature(image, xy_b)
+    assert a.shape == (video.APPEARANCE_HISTOGRAM_BINS**3,) and a.sum() == pytest.approx(1.0)
+    assert video.appearance_cost(a, a) == 0.0
+    assert video.appearance_cost(a, b) > 0.8  # different clothes: nearly maximal
+    assert video.appearance_cost(None, b) == 0.0  # no signature is neutral, not evidence
+    assert video.appearance_signature(image, np.full((33, 2), 1.5)) is None  # box outside the frame
+    assert video.appearance_signature(np.zeros((10, 10)), xy_a) is None  # not an RGB image
+    # A big box is sampled, not histogrammed pixel by pixel -- same answer.
+    big = np.random.default_rng(1).integers(0, 256, (1080, 1920, 3), dtype=np.uint8)
+    box = np.array([[0.05, 0.05], [0.95, 0.95]])
+    sampled = video.appearance_signature(big, box)
+    full, _ = np.histogramdd(big[54:1026, 96:1824].reshape(-1, 3), bins=(4, 4, 4), range=[(0, 256)] * 3)
+    assert video.appearance_cost(sampled, full.ravel() / full.sum()) < 0.1  # pure noise: the hardest case
+
+
+def test_a_tracks_appearance_is_a_running_blend():
+    old, new = np.array([1.0, 0.0]), np.array([0.0, 1.0])
+    blended = video.blend_appearance(old, new)
+    assert blended == pytest.approx([video.APPEARANCE_MEMORY, 1 - video.APPEARANCE_MEMORY])
+    assert video.blend_appearance(None, new) is new and video.blend_appearance(old, None) is old

@@ -87,6 +87,21 @@ keyframes" (or Blender's auto-keying) keys every applied bone at the current
 frame, and "Then advance" steps the frame forward for the next pose. Each
 bone keeps its own rotation mode (Euler, axis-angle or quaternion).
 
+Animation (Live Link, add-on 0.7.0+): the app's "Send Animation to Blender"
+sends a tracked video person as a "pose_craft_animation" document -- one
+ordinary pose document per solved video frame plus the clip's fps. Every
+frame goes through the same retarget path as a single pose (bone mapping,
+Match rig rest pose, Rigify controls, Keep feet on the floor) and is keyed
+into the armature's action, whatever "Insert keyframes" says; the first
+frame lands on Blender's current frame and the rest are spaced at the clip's
+fps converted to the scene's fps, so a 30 fps clip in a 24 fps scene keeps
+its timing. Frames the tracker lost get no key (Blender interpolates over
+the gap), quaternion keys are kept in one hemisphere so they don't spin the
+long way, and the current frame is restored afterwards. Long clips arrive in
+several requests ("chunks", each under MAX_LIVE_LINK_PAYLOAD_BYTES and at
+most a few dozen frames, so no single timer tick blocks Blender for long);
+the whole animation is one undo step, pushed after the last chunk.
+
 Bones that still can't be resolved either way are reported in the Blender
 status bar / console rather than silently skipped, and bones the PoseCraft
 app flagged "low_confidence" (likely occluded in the source photo) are called
@@ -110,7 +125,7 @@ from mathutils import Quaternion, Vector
 bl_info = {
     "name": "PoseCraft Pose Importer",
     "author": "PoseCraft",
-    "version": (0, 6, 0),
+    "version": (0, 7, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > PoseCraft",
     "description": "Applies a PoseCraft .json pose export (file or Live Link) to an armature's pose bones",
@@ -150,6 +165,11 @@ POSECRAFT_FINGER_BONE_NAMES = [
 # import that package. A document whose version is newer than this add-on
 # understands is rejected rather than silently (mis)applied.
 MAX_SUPPORTED_FORMAT_VERSION = 2
+# Mirrors pose_craft/export/blender_pose.py::ANIMATION_FORMAT_NAME/_VERSION:
+# a Live Link request carrying a whole tracked video person (see
+# parse_animation_document).
+ANIMATION_FORMAT_NAME = "pose_craft_animation"
+MAX_SUPPORTED_ANIMATION_VERSION = 1
 
 # Name-guessing templates, tried in order. {name} is the PoseCraft bone name
 # ("upper_arm.L"); {base}/{side} split it into "upper_arm" / ".L" (side is ""
@@ -221,10 +241,16 @@ DEFAULT_LIVE_LINK_PORT = 8642
 # Mirrors pose_craft/export/live_link.py::PROTOCOL_VERSION. Version 2: every
 # request gets a length-prefixed JSON reply saying what was applied (see
 # build_live_link_reply). A request without the field is from an older app.
-LIVE_LINK_PROTOCOL_VERSION = 2
+# Version 3: animation requests (pose_craft_animation, chunked). A request
+# carries the lowest protocol that understands it -- single poses still say 2,
+# so they keep working with a 0.4-0.6 add-on, while an animation says 3 and an
+# older add-on refuses it with "update the add-on" instead of misreading it.
+LIVE_LINK_PROTOCOL_VERSION = 3
 _POLL_INTERVAL_SECONDS = 0.1
 # A 15-bone document is about 4 KB; guards against a bogus or hostile length
-# header making the server buffer an unbounded read.
+# header making the server buffer an unbounded read. Animations are not an
+# exception: the app splits them into chunks under this cap (live_link.py's
+# ANIMATION_CHUNK_MAX_BYTES) rather than this cap being raised.
 MAX_LIVE_LINK_PAYLOAD_BYTES = 262144  # 256 KB (a plain literal: the tests read it from the source)
 # A connection has this long, from accept, to deliver its whole message before
 # it's dropped. Reads never block: each timer tick takes whatever has arrived.
@@ -592,10 +618,15 @@ class LiveLinkReader:
         return now > self.deadline
 
 
-def build_live_link_reply(applied=(), requested=0, unmatched=(), low_confidence=(), armature=None, error=None) -> dict:
+def build_live_link_reply(
+    applied=(), requested=0, unmatched=(), low_confidence=(), armature=None, error=None, animation=None
+) -> dict:
     """The reply the Live Link server sends back after each pose (protocol 2),
-    read by the app's send_pose_document(). Pure (no bpy)."""
-    return {
+    read by the app's send_pose_document(). For an animation chunk (protocol
+    3), `animation` adds "animation_frames" (frames keyed by this request),
+    "start_frame"/"end_frame" (the Blender frames they span) and
+    "chunk_index"/"chunk_count". Pure (no bpy)."""
+    reply = {
         "ok": error is None,
         "applied": list(applied),
         "requested": int(requested),
@@ -606,6 +637,9 @@ def build_live_link_reply(applied=(), requested=0, unmatched=(), low_confidence=
         "protocol": LIVE_LINK_PROTOCOL_VERSION,
         "error": error,
     }
+    if animation:
+        reply.update(animation)
+    return reply
 
 
 def encode_live_link_message(message: dict) -> bytes:
@@ -745,10 +779,130 @@ def _validate_vector(exported_name: str, data: dict, key: str, size: int) -> tup
     return numbers
 
 
+def validate_pose_document(document) -> tuple[dict, dict, dict]:
+    """(bones, quaternions, world_targets) of a pose document, every bone
+    checked before anything is applied, so a single bad entry aborts cleanly
+    instead of leaving the armature half-posed. Raises ValueError. Pure (no
+    bpy)."""
+    if not isinstance(document, dict) or document.get("format") != "pose_craft_pose":
+        raise ValueError("Not a PoseCraft pose file")
+
+    version = document.get("version")
+    if not isinstance(version, int) or version > MAX_SUPPORTED_FORMAT_VERSION:
+        raise ValueError(
+            f"Unsupported pose format version {version!r} (this add-on understands up to "
+            f"version {MAX_SUPPORTED_FORMAT_VERSION}); update the PoseCraft add-on."
+        )
+
+    bones = document.get("bones")
+    if not isinstance(bones, dict):
+        raise ValueError("Malformed pose file: 'bones' must be an object")
+
+    quaternions = {name: _validate_quaternion(name, data) for name, data in bones.items()}
+    world_targets = {}
+    for name, data in bones.items():
+        world = _validate_vector(name, data, "world_quaternion_wxyz", 4)
+        rest_direction = _validate_vector(name, data, "rest_direction", 3)
+        if world is not None and rest_direction is not None:
+            world_targets[name] = (world, rest_direction)
+    return bones, quaternions, world_targets
+
+
+def is_animation_document(document) -> bool:
+    return isinstance(document, dict) and document.get("format") == ANIMATION_FORMAT_NAME
+
+
+def _plain_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def parse_animation_document(document) -> dict:
+    """Checks a whole pose_craft_animation request (or one chunk of it) before
+    anything is keyed and returns {"fps", "frames": [(frame_index, pose)],
+    "first_frame_index", "start_frame", "chunk_index", "chunk_count"}.
+
+    frames: the clip's solved frames, frame_index strictly increasing (gaps are
+    frames the tracker lost). first_frame_index: the clip frame that lands on
+    start_frame -- the first frame of the WHOLE animation, so every chunk is
+    spaced from the same anchor. start_frame: None on the first chunk (the
+    add-on uses Blender's current frame and replies with it); later chunks
+    repeat what the first reply said. Raises ValueError. Pure (no bpy)."""
+    if not is_animation_document(document):
+        raise ValueError("Not a PoseCraft animation")
+    version = document.get("version")
+    if not _plain_int(version) or version > MAX_SUPPORTED_ANIMATION_VERSION:
+        raise ValueError(
+            f"Unsupported animation format version {version!r} (this add-on understands up to "
+            f"version {MAX_SUPPORTED_ANIMATION_VERSION}); update the PoseCraft add-on."
+        )
+    fps = document.get("fps")
+    if isinstance(fps, bool) or not isinstance(fps, (int, float)) or not math.isfinite(fps) or fps <= 0:
+        raise ValueError(f"Malformed animation: 'fps' must be a positive number, got {fps!r}")
+    frames = document.get("frames")
+    if not isinstance(frames, list) or not frames:
+        raise ValueError("Malformed animation: 'frames' must be a non-empty list")
+    parsed = []
+    for position, entry in enumerate(frames):
+        if not isinstance(entry, dict):
+            raise ValueError(f"Malformed animation: frame {position} must be an object")
+        frame_index = entry.get("frame_index")
+        if not _plain_int(frame_index) or frame_index < 0:
+            raise ValueError(f"Malformed animation: frame {position} needs a non-negative 'frame_index'")
+        if parsed and frame_index <= parsed[-1][0]:
+            raise ValueError("Malformed animation: 'frame_index' must increase from frame to frame")
+        try:
+            validate_pose_document(entry.get("pose"))
+        except ValueError as exc:
+            raise ValueError(f"Animation frame {frame_index}: {exc}") from None
+        parsed.append((frame_index, entry["pose"]))
+    first = document.get("first_frame_index", parsed[0][0])
+    if not _plain_int(first) or first > parsed[0][0]:
+        raise ValueError("Malformed animation: 'first_frame_index' must be an integer no later than the first frame")
+    start_frame = document.get("start_frame")
+    if start_frame is not None and not _plain_int(start_frame):
+        raise ValueError("Malformed animation: 'start_frame' must be an integer")
+    chunk = document.get("chunk") or {"index": 0, "count": 1}
+    index, count = (chunk.get("index"), chunk.get("count")) if isinstance(chunk, dict) else (None, None)
+    if not (_plain_int(index) and _plain_int(count) and 0 <= index < count):
+        raise ValueError("Malformed animation: 'chunk' must be {'index': i, 'count': n} with 0 <= i < n")
+    if index > 0 and start_frame is None:
+        raise ValueError("Malformed animation: a later chunk must repeat the first chunk's 'start_frame'")
+    return {
+        "fps": float(fps),
+        "frames": parsed,
+        "first_frame_index": first,
+        "start_frame": start_frame,
+        "chunk_index": index,
+        "chunk_count": count,
+    }
+
+
+def animation_frame_numbers(frame_indices, first_frame_index: int, start_frame: int, clip_fps: float, scene_fps: float):
+    """The Blender frame each clip frame is keyed on: start_frame for
+    first_frame_index, the rest at the clip's timing in the scene's fps
+    (rounded to whole frames). Pure (no bpy)."""
+    scale = float(scene_fps) / float(clip_fps)
+    return [int(start_frame + math.floor((index - first_frame_index) * scale + 0.5)) for index in frame_indices]
+
+
+def keep_quaternion_hemisphere(previous, current) -> tuple:
+    """`current` (w, x, y, z), negated when it points away from `previous`:
+    the same rotation, but Blender interpolates quaternion F-curves component
+    by component, so a sign flip between two keys would spin the bone the long
+    way round in between. Pure (no bpy)."""
+    current = tuple(float(v) for v in current)
+    if previous is not None and sum(float(p) * c for p, c in zip(previous, current)) < 0.0:
+        return tuple(-c for c in current)
+    return current
+
+
 def _write_rotation(pose_bone, quaternion) -> str:
     """Sets a pose bone's basis rotation in its own rotation mode (see
     rotation_channel) and returns the data path written, for keyframing."""
     data_path, value = rotation_channel(pose_bone.rotation_mode, quaternion, pose_bone.rotation_euler.copy())
+    if data_path == "rotation_quaternion":
+        # Same rotation, but on the current key's side (animation: no long-way spins between keys).
+        value = Quaternion(keep_quaternion_hemisphere(pose_bone.rotation_quaternion, value))
     setattr(pose_bone, data_path, value)
     return data_path
 
@@ -788,29 +942,7 @@ def apply_pose_document(
     rig's own floor (_keep_feet_on_floor).
     pose_controls: redirect constraint-driven bones (Rigify DEF-/ORG-) to the
     controls that drive them, and switch the Rigify limbs being posed to FK."""
-    if not isinstance(document, dict) or document.get("format") != "pose_craft_pose":
-        raise ValueError("Not a PoseCraft pose file")
-
-    version = document.get("version")
-    if not isinstance(version, int) or version > MAX_SUPPORTED_FORMAT_VERSION:
-        raise ValueError(
-            f"Unsupported pose format version {version!r} (this add-on understands up to "
-            f"version {MAX_SUPPORTED_FORMAT_VERSION}); update the PoseCraft add-on."
-        )
-
-    bones = document.get("bones")
-    if not isinstance(bones, dict):
-        raise ValueError("Malformed pose file: 'bones' must be an object")
-
-    # Validate every bone's data before applying any of it, so a single bad
-    # entry aborts cleanly instead of leaving the armature half-posed.
-    quaternions = {name: _validate_quaternion(name, data) for name, data in bones.items()}
-    world_targets = {}
-    for name, data in bones.items():
-        world = _validate_vector(name, data, "world_quaternion_wxyz", 4)
-        rest_direction = _validate_vector(name, data, "rest_direction", 3)
-        if world is not None and rest_direction is not None:
-            world_targets[name] = (world, rest_direction)
+    bones, quaternions, world_targets = validate_pose_document(document)
 
     pose_bones = armature_obj.pose.bones
     applied, unmatched, low_confidence = [], [], []
@@ -873,13 +1005,16 @@ def apply_pose_document(
     return applied, unmatched, low_confidence
 
 
-def _keyframe_applied(armature_obj: bpy.types.Object, bone_names: list[str], scene) -> None:
+def _keyframe_applied(
+    armature_obj: bpy.types.Object, bone_names: list[str], scene, frame=None, advance: bool = True
+) -> None:
     """B18: keys each applied bone's rotation (and the root's location, which
-    floor contact may have moved) at the current frame, then advances the
-    frame by the panel's step -- a sequence of photos becomes blocked-out
-    animation."""
+    floor contact may have moved) at the current frame (or `frame`), then
+    advances the frame by the panel's step -- a sequence of photos becomes
+    blocked-out animation. An animation request keys its own frames and
+    passes advance=False."""
     pose_bones = armature_obj.pose.bones
-    frame = scene.frame_current
+    frame = scene.frame_current if frame is None else frame
     for name in bone_names:
         pose_bone = pose_bones[name]
         pose_bone.keyframe_insert(rotation_data_path(pose_bone.rotation_mode), frame=frame, group=name)
@@ -887,7 +1022,7 @@ def _keyframe_applied(armature_obj: bpy.types.Object, bone_names: list[str], sce
         parents = {bone.name: (bone.parent.name if bone.parent else None) for bone in armature_obj.data.bones}
         root = top_ancestor(bone_names[0], parents)
         pose_bones[root].keyframe_insert("location", frame=frame, group=root)
-    if scene.posecraft_frame_step:
+    if advance and scene.posecraft_frame_step:
         scene.frame_set(frame + scene.posecraft_frame_step)
 
 
@@ -1068,6 +1203,57 @@ def _tag_view3d_redraw() -> None:
                 area.tag_redraw()
 
 
+def _scene_fps(scene) -> float:
+    render = scene.render
+    return float(render.fps) / float(render.fps_base or 1.0)
+
+
+def _apply_animation_document(armature_obj, document: dict, scene) -> dict:
+    """Keys one animation request (or chunk) on `armature_obj`: each frame is
+    posed through apply_pose_document -- the same retarget path as a single
+    pose -- at its own Blender frame (animation_frame_numbers) and keyed
+    there. Everything is validated first (parse_animation_document), and the
+    scene's current frame is restored afterwards. Returns the reply's
+    animation fields plus the union of applied/unmatched/low-confidence
+    bones. (No bpy annotations: tests/test_blender_animation.py runs it
+    against a simulated scene.)"""
+    animation = parse_animation_document(document)
+    original_frame = scene.frame_current
+    start_frame = original_frame if animation["start_frame"] is None else animation["start_frame"]
+    frames = animation["frames"]
+    numbers = animation_frame_numbers(
+        [index for index, _pose in frames], animation["first_frame_index"], start_frame,
+        animation["fps"], _scene_fps(scene),
+    )
+    applied_all, unmatched_all, low_all, requested = [], [], [], 0
+    try:
+        for (_index, pose), frame in zip(frames, numbers):
+            scene.frame_set(frame)  # evaluate the rig (and any keys already there) at this frame
+            applied, unmatched, low_confidence = apply_pose_document(
+                armature_obj, pose, scene.posecraft_match_rig_rest, scene.posecraft_floor_contact,
+                scene.posecraft_pose_controls,
+            )
+            _keyframe_applied(armature_obj, applied, scene, frame=frame, advance=False)
+            for target, names in ((applied_all, applied), (unmatched_all, unmatched), (low_all, low_confidence)):
+                target.extend(name for name in names if name not in target)
+            requested = max(requested, len(pose["bones"]))
+    finally:
+        scene.frame_set(original_frame)
+    return {
+        "applied": applied_all,
+        "unmatched": unmatched_all,
+        "low_confidence": low_all,
+        "requested": requested,
+        "animation": {
+            "animation_frames": len(frames),
+            "start_frame": start_frame,
+            "end_frame": numbers[-1],
+            "chunk_index": animation["chunk_index"],
+            "chunk_count": animation["chunk_count"],
+        },
+    }
+
+
 def _apply_live_link_document(document) -> dict:
     """Applies one received document to the Live Link target (main thread) and
     returns the reply for the app."""
@@ -1082,6 +1268,25 @@ def _apply_live_link_document(document) -> dict:
     if armature_obj is None:
         _live_link_status = "Received a pose but no target armature is set or selected"
         return build_live_link_reply(error="No target armature in Blender: pick one in the PoseCraft panel")
+    if is_animation_document(document):
+        result = _apply_animation_document(armature_obj, document, scene)
+        info = result["animation"]
+        summary, _level = _summarize(result["applied"], result["unmatched"], result["low_confidence"])
+        _live_link_status = (
+            f"Keyed {info['animation_frames']} frame(s) at {info['start_frame']}-{info['end_frame']} "
+            f"(part {info['chunk_index'] + 1}/{info['chunk_count']}); {summary}"
+        )
+        if info["chunk_index"] == info["chunk_count"] - 1:
+            try:
+                # One Ctrl+Z step for the whole animation: nothing is pushed
+                # between its chunks, so undoing returns to before the first.
+                bpy.ops.ed.undo_push(message="PoseCraft animation")
+            except RuntimeError:
+                pass
+        return build_live_link_reply(
+            result["applied"], result["requested"], result["unmatched"], result["low_confidence"],
+            armature_obj.name, animation=info,
+        )
     applied, unmatched, low_confidence = apply_pose_document(
         armature_obj, document, scene.posecraft_match_rig_rest, scene.posecraft_floor_contact,
         scene.posecraft_pose_controls,
