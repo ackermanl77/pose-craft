@@ -65,13 +65,19 @@ export/blender_pose.py -- axis-converts Y-up -> Blender Z-up, writes JSON (forma
 pose_craft_pose .json file            export/live_link.py: length-prefixed
         |                              JSON over TCP to host:port (UI-configurable,
         |                              default 127.0.0.1:8642); the add-on replies
-        |                              with what it applied (protocol 2)
+        |                              with what it applied (protocol 2 for a
+        |                              pose; protocol 3 for a video track sent as
+        |                              a "pose_craft_animation" document, v1, in
+        |                              chunks of <= 30 frames / 200 KB)
         v                                              |
-export/blender_addon/import_pose.py (installed inside Blender)
+export/blender_addon/import_pose.py (installed inside Blender; add-on 0.7.1,
+  bl_info minimum Blender 3.6, verified in Blender 5.2.2)
   -- Load Pose JSON operator, or a Live Link server (bpy.app.timers-polled,
      fully non-blocking: accept and incremental reads with a 2 s per-message
      deadline, 256 KB cap) that applies a received pose to the captured
-     target armature, as its own undo step, optionally keyframed
+     target armature, as its own undo step, optionally keyframed -- or keys
+     a whole animation (every frame through the same retarget path, at the
+     clip's timing in the scene's frame rate, one undo step)
   -- bone name resolution: an explicit per-armature manual mapping row
      (POSECRAFT_BoneMapping, saved with the .blend file) wins if set, else
      falls back to name-guessing (exact, Rigify upper_arm_fk.L/_ik, DEF-/ORG-, Mixamo)
@@ -134,13 +140,16 @@ that draws `retarget.skeleton.forward_kinematics()` of the exported rotations (r
 auto-frames the camera to the skeleton's own bounding box on every update
 (`_compute_camera_frame`) -- it has no other state of its own beyond the
 current skeleton, `main_window.py` always calls `clear_skeleton()` before
-`show_skeleton()` on every update rather than diffing. The window is a three-pane `QSplitter` (scrollable controls, photo, 3D view); the control
-panel is split into four `QGroupBox` sections (`_build_detect_group`,
-`_build_person_group`, `_build_export_group`, `_build_live_link_group`)
-instead of one flat stack of ~15 controls, plus a "3. Correct" group (per-bone
-adjustment spin boxes; depth flips come from the photo's right-click menu)
-and a "Video" group (frame slider, animation export) that appears once a
-video is tracked.
+`show_skeleton()` on every update rather than diffing; it also draws the
+hover label and the optional photo backdrop. The window is a three-pane
+`QSplitter` (scrollable controls, photo, 3D view); the control panel is split
+into `QGroupBox` sections -- "1. Load & Detect" (`_build_detect_group`), "2.
+Select Person" (`_build_person_group`), "3. Correct"
+(`_build_correction_group`: per-bone adjustment spin boxes; joint drags and
+depth flips happen on the photo), "4. Export" (`_build_export_group`), "5.
+Blender Live Link" (`_build_live_link_group`, incl. auto-send) -- plus a
+"Video" group (`_build_video_group`: frame slider, rotation smoothing,
+animation export, Send Animation) that appears once a video is tracked.
 
 Added in the P2 round (2026-09-30): busy state lives in `_set_busy()` and
 `_set_result_actions_enabled()` (one place for what a running solve disables,
@@ -151,16 +160,18 @@ waits for it); `VideoSolveWorker` tracks a video; manual corrections are
 `PersonEdits` per person, changed only through `QUndoStack` commands, and
 applied in `_document_inputs_for()` so every export path gets them; settings
 (last folder, recent files, host/port, model, GPU, group photo, max people,
-window and splitter geometry) persist through `QSettings` (an INI under the
-user's config folder; `tests/conftest.py` points it at a temp folder).
+hands, rotation smoothing, photo backdrop, auto-send and its debounce, window
+and splitter geometry) persist through `QSettings` (an INI under the user's
+config folder; `tests/conftest.py` points it at a temp folder).
 
-The retargeting math (`retarget/skeleton.py`), the axis-conversion math
-(`export/blender_pose.py`), the atomic-download logic and unicode-path
-handling (`estimation/landmarker.py`, `imaging.py`), and the Live Link wire
-protocol (`export/live_link.py`) are the modules with real unit test coverage
-because they're pure numpy/scipy/stdlib with no GUI/model/Blender dependency
--- see "Verification" below for why the GUI and Blender add-on are checked
-differently.
+The pure modules -- retargeting (`retarget/skeleton.py`), axis conversion and
+the file formats (`export/blender_pose.py`, `export/bvh_export.py`), model
+download/conversion and the ONNX pipeline (`estimation/`), video tracking and
+smoothing (`estimation/video.py`), `imaging.py` and the Live Link wire
+protocol (`export/live_link.py`) -- are unit-tested directly; the GUI is
+driven on an offscreen Qt event loop with fake estimators, and the add-on's
+pure helpers are compiled out of its source with `ast` (plus an opt-in run in
+a real Blender) -- see "Verification" below.
 
 ## Primary Entry Points
 
@@ -179,16 +190,21 @@ differently.
 | Live Blender link client (app side) | `pose_craft/export/live_link.py` |
 | Blender-side importer + Live Link server (install manually inside Blender, not via pip) | `pose_craft/export/blender_addon/import_pose.py` |
 | Unicode-safe image loading + pre-solve photo quality checks | `pose_craft/imaging.py` |
-| Clickable/resizable photo widget | `pose_craft/gui/photo_view.py` |
-| PyInstaller build spec | `PoseCraft.spec` |
+| Main window: controls, workers, undo, settings, menus | `pose_craft/gui/main_window.py` |
+| Photo widget: overlay, click/hover picking, joint drag | `pose_craft/gui/photo_view.py` |
+| 3D preview: FK skeleton, floor/gizmo, hover label, photo backdrop | `pose_craft/gui/viewport_3d.py` |
+| Log file + uncaught-exception dialogs | `pose_craft/diagnostics.py` |
+| PyInstaller build spec (`POSECRAFT_FLAVOR=dml` default, `cuda`, `cpu`) | `PoseCraft.spec` |
+| CI (compileall + pytest, Ubuntu, Python 3.12, `requirements-test.txt`) | `.github/workflows/ci.yml` |
+| Real-photo golden generator / real-Blender add-on check (opt-in) | `scripts/generate_goldens.py`, `tests/test_real_blender.py` |
 | App icon generation (re-run only if the design changes) | `scripts/generate_icon.py` |
 
 ## Release
 
 ```text
-dist/PoseCraft/PoseCraft.exe        -- now built with assets/icon.ico as the exe icon
-dist/PoseCraft/_internal/           -- PySide6, OpenCV, ONNX Runtime + (GPU build) the CUDA 13/cuDNN 9 DLLs
-dist/PoseCraft/_internal/models/    -- pre-converted ONNX models + manifest.json (when build/models existed)
+dist/PoseCraft/PoseCraft.exe        -- built with assets/icon.ico as the exe icon
+dist/PoseCraft/_internal/           -- PySide6, OpenCV, ONNX Runtime (DirectML, CPU or CUDA build) + (CUDA flavour only) the CUDA 13/cuDNN 9 DLLs
+dist/PoseCraft/_internal/models/    -- pre-converted ONNX models (lite/full/heavy + shared detector + hand) + manifest.json (when build/models existed)
 ```
 
 Built with `pyinstaller PoseCraft.spec` (onedir, `--windowed`, `collect_all`
@@ -199,8 +215,12 @@ shared detector and a manifest to `build/models`, and the spec then bundles
 them under `models/` and leaves the converter out, so the app needs no
 download or network on first run. The spec also excludes matplotlib, PIL and
 the unused Qt modules (Quick/Qml/Network/Test/Pdf/VirtualKeyboard) and filters
-their DLLs. None of these spec changes has been through a real build yet.
-A CUDA build (`POSECRAFT_FLAVOR=cuda`) also bundles
+their DLLs. All three flavours were built with these spec changes on
+2026-10-01 (sizes under "Known Issues"); the hand model was added to the
+bundle afterwards (2026-10-02) and hasn't been through a full build since.
+`POSECRAFT_FLAVOR` picks the flavour: `dml` (the default when unset; the
+build venv must have `onnxruntime-directml`, or the spec stops), `cuda` or
+`cpu`. A CUDA build (`POSECRAFT_FLAVOR=cuda`) also bundles
 the NVIDIA CUDA/cuDNN DLLs from the pip `nvidia-*` packages kept in their
 site-packages layout under `_internal/nvidia/` (where `onnxruntime.preload_dlls()` looks) when installed -- that's what makes the GPU build
 so much bigger than the old ~480 MB one; a build from a venv without
@@ -213,7 +233,8 @@ machine other than the one it was built on.
 
 `requirements.txt` is now pinned to the exact versions this project was built
 and tested against (was unpinned before); `requirements-test.txt` is a
-separate, lighter pin set (numpy/scipy/opencv-python-headless/pytest) for CI.
+separate, lighter pin set (numpy/scipy/opencv-python-headless/pytest plus the
+CPU onnxruntime, onnx and tflite) for CI.
 `.github/workflows/ci.yml` runs `compileall` + `pytest` on push/PR using only
 `requirements-test.txt` -- verified locally by installing that file into a
 throwaway venv and confirming the same pass/skip counts CI would see. There is
@@ -227,11 +248,20 @@ the FFmpeg video reader the video path needs).
 
 ## Verification
 
-```bash
-pytest
+```powershell
+$env:QT_QPA_PLATFORM = "offscreen"
+.venv\Scripts\python.exe -m pytest -q
 ```
 
-covers `retarget/skeleton.py` (including `image_joint_positions_2d()`, the 2D
+**Current count (2026-10-03, after the real-Blender check): 402 passed, 7
+skipped** in about 18 s. The seven skips are the LiteRT reference test, the
+real-photo golden test (no photos committed), the four opt-in GPU parity
+tests (`POSECRAFT_GPU_TESTS=1`) and the opt-in real-Blender test
+(`POSECRAFT_BLENDER`). Earlier counts: 298/6 after the P2 round
+(2026-09-30), 357/6 after the "important items" round (2026-10-02), 401/6
+after the video/Live Link round (2026-10-03).
+
+The suite covers `retarget/skeleton.py` (including `image_joint_positions_2d()`, the 2D
 overlay math), `export/blender_pose.py`, `estimation/landmarker.py` (atomic
 download logic and the progress-callback contract, with `urlretrieve`
 mocked), `imaging.py` (real cv2 encode/decode round trips, including a
@@ -248,15 +278,13 @@ mirror/confidence consistency fix (see "Recently Fixed"), and
 `tests/test_viewport_camera.py` covers the auto-framing math
 (`_compute_camera_frame`); both guard their PySide6 import with
 `pytest.importorskip`, so they run locally and skip cleanly in CI's lighter
-venv. Last full local run (with PySide6 installed, 2026-09-30, after the P2
-round): **298 passed, 6 skipped** (the LiteRT parity test, the real-photo
-golden test, and the four opt-in GPU parity tests). After the "important
-items" round (2026-10-02): **357 passed, 6 skipped** (same skips; the new
-real-hand-model test runs because the hand model is cached locally and skips
-without it). After the video/Live Link round (2026-10-03): **401 passed, 6
-skipped**. After the real-Blender check (2026-10-03): **402 passed, 7
-skipped** (the new skip is the opt-in `tests/test_real_blender.py`). `tests/test_gui_flows.py`
-now drives the real window on an offscreen Qt event loop with fake
+venv. The hands, Rigify, video tracking, rotation smoothing, animation and
+Live Link GUI tests (`test_hands.py`, `test_rigify.py`,
+`test_video_tracking.py`, `test_rotation_smoothing.py`,
+`test_blender_animation.py`, `test_gui_important.py`,
+`test_gui_live_link.py`) cover the 2026-10-02/03 features; the real-hand-model
+test runs only where the hand model is cached. `tests/test_gui_flows.py`
+drives the real window on an offscreen Qt event loop with fake
 estimators: busy states, cancel, the close-waits-for-the-worker guarantee,
 the non-blocking send, warm-up, settings, drag-and-drop, picking, manual
 correction with undo, exports and video scrubbing -- the threading checks
@@ -266,9 +294,8 @@ it passed on CUDA (RTX 5080) and fails, as it should, with TF32 switched back
 on. CI's lighter venv also skips the Qt
 tests; re-run `pytest` rather than trusting a number written here.
 
-Everything else has been checked manually rather than by automated test,
-since it needs a real display/GPU/Blender install that isn't available in
-this dev environment:
+Everything else has been checked manually (or by an opt-in test) rather than
+by the default suite, since it needs a real display, GPU or Blender install:
 
 - The GUI's imports and `MainWindow` construction were smoke-tested (`QApplication` +
   `MainWindow()` + `processEvents()`, no crash, `isVisible()` true) after every
@@ -298,8 +325,9 @@ this dev environment:
   landmarks were given deliberately low visibility renders in the low-confidence
   color. Confirms the drawing code runs and looks right for that one
   synthetic case; not a substitute for seeing it against a real photo.
-- The built `.exe` was launched and confirmed to stay running (no immediate
-  missing-DLL crash) rather than close under it and left running.
+- Each built flavour's `.exe` (2026-10-01) was launched, stayed running (no
+  missing-DLL crash) and ran its warm-up inference on the expected provider
+  (see "Known Issues" for sizes and timings).
 - The Blender add-on (`import_pose.py`) was run in a **real Blender 5.2.2
   LTS, headless** (`--background --factory-startup`, user folders pointed at
   a temporary folder so the real preferences/add-ons were untouched), with
@@ -500,7 +528,7 @@ time each check ran, not guaranteed to stay true as the code changes.
     then the previous frame's landmarks give the next crop: 1 detector run for
     40 frames, ~11 ms/frame on the CPU), smooths with a One Euro filter, and
     exports an animated BVH whose root follows planted feet. Scrub frames with
-    the slider.
+    the slider. (Superseded 2026-10-02 by multi-person tracking, see above.)
   - **Live Link (B16-B18, plus B19/B20).** The server no longer blocks
     Blender's UI: reads are non-blocking and incremental with a 2 s deadline
     per message and a 256 KB cap. The target armature is captured when Live
@@ -529,7 +557,8 @@ time each check ran, not guaranteed to stay true as the code changes.
     against LiteRT) -- the first step toward finger poses (B11).
   - **Tests and release (T3, T5, K4, K5).** GUI flow tests, the opt-in GPU
     parity test, spec trimming, headless OpenCV and a release workflow (see
-    "Release"; none of it built or run yet).
+    "Release"; the spec changes were built on 2026-10-01, the workflow
+    hasn't run).
   - **Stale docs (C2).** Fixed the pass count, the Live Link timeout
     contradiction, the CI comment, and the user guide's missing orientation
     fix; two historical entries below now say what superseded them.
@@ -812,9 +841,9 @@ time each check ran, not guaranteed to stay true as the code changes.
   button in the add-on's panel; the app gained a "Send to Blender (Live Link)"
   button that posts the currently selected person's pose to
   `127.0.0.1:8642`. Verified with `tests/test_live_link.py` against a real
-  loopback socket server standing in for the add-on's side of the protocol --
-  the add-on's actual Blender-side server code is still unverified in a real
-  Blender instance, see "Known Issues".
+  loopback socket server standing in for the add-on's side of the protocol
+  (the add-on's Blender-side server has since been run in a real Blender
+  5.2.2, see "Verification").
 - **No batch export across multiple detected people.** **Fixed**: added an
   "Export All People..." button that writes one `pose_personN.json` per
   detected person into a chosen folder.
@@ -952,10 +981,9 @@ time each check ran, not guaranteed to stay true as the code changes.
   stays fixed at `127.0.0.1` deliberately -- exposing this socket (arbitrary
   bone rotations applied on request, no authentication) to other network
   interfaces needs to be an explicit choice this add-on doesn't make for you,
-  not a side effect of a UI field. Not verified in a real Blender instance
-  (same caveat as the rest of this add-on, see "Known Issues") -- the fix is
-  a straightforward `bpy.props.IntProperty` plumbed through, but review it
-  there before trusting a non-default port works.
+  not a side effect of a UI field. Since verified in Blender 5.2.2: the
+  real-Blender check starts the server on a non-default port and the app's
+  client reaches it (see "Verification").
 - **`landmarker.detect_poses()` was dead code.** The one-shot convenience
   wrapper it provided was fully superseded once `PoseEstimator` + `SolveWorker`
   started handling caching directly in `main_window.py`; nothing in the app or
@@ -988,9 +1016,9 @@ time each check ran, not guaranteed to stay true as the code changes.
   ask for. Verified: `tests/test_blender_addon_source.py` parses the add-on's
   source with `ast` (rather than importing it, which needs `bpy`) to confirm
   `POSECRAFT_BONE_NAMES` stays in sync with `skeleton.BONE_NAMES`, and that
-  the file is syntactically valid -- the actual Blender-side behavior (the
-  UI list, `prop_search`, property registration/persistence) is unverified in
-  a real Blender instance, same standing caveat as the rest of this add-on.
+  the file is syntactically valid. In Blender 5.2.2 (see "Verification")
+  registration, Auto-Guess and posing through mapping rows have since been
+  checked; the UI list and `prop_search` drawing still haven't.
 - **Nothing was drawn on the photo, and the control panel had grown into one
   flat, ungrouped stack of ~15 controls.** `DetectedPerson.image_landmarks_xy`
   and `bone_confidence` were already computed but only used internally
@@ -1100,9 +1128,10 @@ Ranked roughly by how much they affect whether an exported pose is usable:
   the clip's frame rate to keep every frame.
 - **No code signing** on the built `.exe` -- expect SmartScreen to flag it as
   unrecognized on a machine other than the one it was built on.
-- **The release workflow has never run** (`.github/workflows/release.yml`),
-  and the spec's K3/K4 changes have never been through a build: run it once
-  (a manual `workflow_dispatch`) and launch each zip before trusting it. No
+- **The release workflow has never run** (`.github/workflows/release.yml`;
+  no tag has been pushed), and no local build has bundled the hand model yet
+  (the 2026-10-01 builds predate it): run the workflow once (a manual
+  `workflow_dispatch`) and launch each zip before trusting it. No
   headless-Blender job runs in CI (no Blender on the runners); the opt-in
   `tests/test_real_blender.py` is the local equivalent (T4).
 - **Fingers are unverified on real photos (B11).** The hand pass follows

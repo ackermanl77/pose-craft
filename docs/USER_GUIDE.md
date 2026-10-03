@@ -35,7 +35,10 @@ feature-by-feature version of both.
 **Packaged app**: if you have `dist/PoseCraft/PoseCraft.exe`, double-click it
 -- no Python install needed. Windows SmartScreen may flag it as unrecognized
 the first time (it isn't code-signed); choose "More info" > "Run anyway" if
-you trust the source.
+you trust the source. The main build is the **DirectML** one (it uses any
+DirectX 12 graphics card -- NVIDIA, AMD or Intel -- and falls back to the
+CPU); there is also a CPU-only build and a much larger NVIDIA-only CUDA
+build. All give the same results.
 
 **From source**:
 
@@ -100,6 +103,11 @@ Once a photo loads:
 looks for in one photo. A person beyond this count in a group photo won't be
 detected at all -- raise it before solving a bigger group shot. Changing it
 takes effect on the next Solve Pose, with no model reload needed.
+
+**Model quality** (*lite*, *full* or *heavy*; default *full*, remembered)
+picks the pose model: *lite* is the fastest and suits low-end machines,
+*heavy* is the most accurate but slowest. A source install downloads each
+one the first time you solve with it.
 
 **Use GPU when available** (on by default) runs the pose model on the graphics
 card: through DirectML (any DirectX 12 GPU, NVIDIA, AMD or Intel) in a
@@ -394,9 +402,14 @@ screen reader). **File > Open Recent** lists the last eight photos and videos.
 
 ## Setting up the Blender add-on
 
-1. In Blender: **Edit > Preferences > Add-ons > Install...**, pick
-   `pose_craft/export/blender_addon/import_pose.py`, and enable "PoseCraft
-   Pose Importer".
+1. In Blender: **Edit > Preferences > Add-ons > Install...** (in Blender
+   4.2 and later: the **v** menu at the top right > **Install from Disk...**),
+   pick `pose_craft/export/blender_addon/import_pose.py` (or the
+   `posecraft-blender-addon-<version>.zip` from a release), and enable
+   "PoseCraft Pose Importer". The current add-on is version 0.7.1 (Blender
+   3.6 or newer; checked in Blender 5.2.2). After updating PoseCraft, install
+   the matching add-on too -- **Send Animation to Blender** needs 0.7.0 or
+   newer.
 2. A **PoseCraft** tab appears in the 3D viewport's sidebar (press `N` if the
    sidebar isn't open).
 3. Select the armature you want to pose, then open that PoseCraft tab.

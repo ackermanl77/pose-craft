@@ -9,12 +9,16 @@ the Live Link.
 
 ## Current Status
 
-- MVP stage: the full pipeline (photo -> pose estimation (MediaPipe's BlazePose
-  models on ONNX Runtime, GPU-accelerated on NVIDIA cards) -> bone
-  retargeting -> JSON export or live Blender link -> Blender add-on) is
-  implemented and the `.exe` builds and launches, but the Blender add-on and
-  the real-photo accuracy of the retargeting have not been verified end to
-  end -- see `docs/PROJECT_STATUS.md`'s "Verification" and "Known Issues".
+- MVP stage: the full pipeline (photo or video -> pose estimation
+  (MediaPipe's BlazePose models, plus the optional hand model, on ONNX
+  Runtime -- DirectML or CUDA on a GPU, else the CPU) -> bone retargeting ->
+  JSON/BVH export or the live Blender link -> Blender add-on 0.7.1) is
+  implemented, and all three build flavours build and launch. The add-on has
+  been run headless in a real Blender 5.2.2 (PoseCraft-shaped, Mixamo-style
+  and generated Rigify rigs, the BVH importer, a real Live Link server); its
+  panel UI, and the accuracy of a solve on real photos and footage, have not
+  been checked end to end -- see `docs/PROJECT_STATUS.md`'s "Verification"
+  and "Known Issues".
 - `docs/PROJECT_STATUS.md` is the authoritative reference for architecture,
   entry points, and known issues -- this README only covers day-to-day
   commands.
@@ -24,16 +28,18 @@ the Live Link.
 
 ## Install
 
-PySide6 and ONNX Runtime ship wheels that can lag behind the newest CPython
-release; if `pip install` can't find a match for your interpreter, use a
-3.10-3.12 venv instead (`py -0` on Windows lists what's installed):
+The pins are known to work on Python 3.14 (the dev venv and the release
+build) and 3.12 (CI's test job). If `pip install` can't find a wheel for your
+interpreter, use one of those (`py -0` on Windows lists what's installed):
 
-```bash
+```bat
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-pip install -r requirements-gpu.txt   # optional: NVIDIA GPU acceleration (CUDA)
 ```
+
+`requirements.txt` installs `onnxruntime-gpu`, which also runs on the CPU, so
+this alone works without a GPU.
 
 Two GPU options, each in its own venv (both install the same `onnxruntime`
 module, so they can't be combined):
@@ -134,9 +140,11 @@ The app's menus list every keyboard shortcut; the user guide has the table.
 
 ## Build the .exe
 
-```bash
-python scripts/convert_models.py           # pre-convert the models into build/models (bundled, no first-run download)
-set POSECRAFT_FLAVOR=dml   # the default when unset (needs requirements-dml.txt); or cuda / cpu
+```bat
+:: pre-convert the models into build/models (bundled, no first-run download)
+python scripts/convert_models.py
+:: dml is the default when unset (needs requirements-dml.txt); or cuda / cpu
+set POSECRAFT_FLAVOR=dml
 pyinstaller PoseCraft.spec
 ```
 
@@ -152,9 +160,14 @@ you've changed `assets/icon.png`/`assets/icon.ico`.
 
 ## Test
 
-```bash
-pytest
+```powershell
+$env:QT_QPA_PLATFORM = "offscreen"
+.venv\Scripts\python.exe -m pytest -q
 ```
+
+Last run 2026-10-03: **402 passed, 7 skipped** (the skips: the LiteRT
+reference test, the real-photo golden test, four opt-in GPU parity tests and
+the opt-in real-Blender test) -- re-run it rather than trusting this number.
 
 Needs `requirements-test.txt` (numpy/scipy/opencv-python-headless/pytest plus
 CPU onnxruntime/onnx/tflite, not the Qt stack or the GPU runtime) -- covers the
@@ -167,7 +180,9 @@ same lightweight suite on every push/PR. With PySide6 installed, run it with
 `QT_QPA_PLATFORM=offscreen` to include the GUI flow tests (real Qt event loop,
 fake estimators; no pytest-qt needed). Before a release, also run the GPU/CPU
 parity tests: `set POSECRAFT_GPU_TESTS=1` then `pytest -m gpu` (needs a GPU
-provider and the cached models). See `docs/PROJECT_STATUS.md`'s
+provider and the cached models) and, with Blender installed, the real-Blender
+add-on check: set `POSECRAFT_BLENDER` to `blender.exe`, then
+`pytest tests/test_real_blender.py` (about 5 s). See `docs/PROJECT_STATUS.md`'s
 "Verification" section for what is and isn't covered by an automated test
 today.
 
