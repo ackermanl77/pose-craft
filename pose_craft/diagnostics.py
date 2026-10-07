@@ -86,3 +86,53 @@ def install_excepthooks(on_error: Callable[[str], None] | None = None) -> None:
     threading.excepthook = lambda args: _report(
         args.exc_type, args.exc_value, args.exc_traceback, f"in thread {getattr(args.thread, 'name', '?')}"
     )
+
+
+def diagnostics_report(estimator=None) -> list[tuple[str, str]]:
+    """Help > Diagnostics (R4): what a person needs to see why the GPU isn't used
+    -- versions, the ONNX Runtime providers this build has, the GPUs DirectML can
+    use, and the loaded model's device and fallback reason -- as (label, value)
+    rows. Never raises: a failing probe is reported as its own value."""
+    import platform
+
+    from pose_craft import __version__
+
+    rows: list[tuple[str, str]] = [
+        ("PoseCraft", __version__),
+        ("Python", f"{platform.python_version()} ({'built app' if getattr(sys, 'frozen', False) else 'from source'})"),
+        ("Windows" if sys.platform == "win32" else "OS", platform.platform()),
+    ]
+    try:
+        import onnxruntime as ort
+
+        rows.append(("ONNX Runtime", ort.__version__))
+        rows.append(("Providers in this build", ", ".join(ort.get_available_providers())))
+    except Exception as error:  # noqa: BLE001 -- the report must always open
+        rows.append(("ONNX Runtime", f"unavailable: {error}"))
+    try:
+        from pose_craft.estimation.onnx_pose import best_directml_adapter, directml_adapters
+
+        adapters = directml_adapters()
+        best = best_directml_adapter()
+        listed = []
+        for adapter in adapters:
+            pick = " -- DirectML's pick" if best is not None and adapter.index == best.index else ""
+            listed.append(f"{adapter.name} ({adapter.dedicated_memory_mb} MB){pick}")
+        rows.append(("DirectX 12 GPUs", "; ".join(listed) or "none found"))
+    except Exception as error:  # noqa: BLE001
+        rows.append(("DirectX 12 GPUs", f"could not be listed: {error}"))
+    if estimator is None:
+        rows.append(("Pose model", "not loaded yet (it loads in the background after start-up)"))
+    else:
+        variant = getattr(estimator, "variant", None) or "custom"
+        rows.append(("Pose model", f"{variant} on {estimator.device}"))
+        reason = getattr(estimator, "gpu_fallback_reason", None)
+        rows.append(("GPU not used because", reason or "-- (the GPU is used, or wasn't requested)"))
+    rows.append(("Log file", log_file_hint()))
+    return rows
+
+
+def format_report(rows: list[tuple[str, str]]) -> str:
+    """The report as plain text, for the dialog and its Copy button."""
+    width = max(len(label) for label, _value in rows)
+    return "\n".join(f"{label.ljust(width)}  {value}" for label, value in rows)

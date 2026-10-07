@@ -9,8 +9,11 @@ import numpy as np
 from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QImage, QKeySequence, QPixmap, QUndoCommand, QUndoStack
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
@@ -21,6 +24,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -35,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 from scipy.spatial.transform import Rotation
 
-from pose_craft.diagnostics import log_file_hint
+from pose_craft.diagnostics import diagnostics_report, format_report, log_file_hint
 from pose_craft.estimation.landmarker import (
     MODEL_URLS,
     DetectedPerson,
@@ -513,6 +517,12 @@ class PersonEdits:
 
     def is_empty(self) -> bool:
         return not self.flipped and not self.overrides and not self.moved
+
+
+ABOUT_TEXT = (
+    "PoseCraft {version}\n\nTurns a photo of a person into a Blender pose: MediaPipe BlazePose landmarks "
+    "on ONNX Runtime, retargeted to an armature.\n\nHelp > Diagnostics shows the runtime and GPU details."
+)
 
 
 class _EditCommand(QUndoCommand):
@@ -1098,6 +1108,40 @@ class MainWindow(QMainWindow):
             view_menu, "Photo &Backdrop", self._on_toggle_backdrop, "Shift+B", checkable=True
         )
 
+        help_menu = bar.addMenu("&Help")
+        self.diagnostics_action = self._action(help_menu, "&Diagnostics...", self._on_show_diagnostics)
+        self._action(help_menu, "&About PoseCraft", self._on_about)
+
+    # -- help (R4) -----------------------------------------------------------------------
+
+    def _on_show_diagnostics(self) -> QDialog:
+        """Versions, providers, GPUs and why the GPU isn't used, with Copy (R4)."""
+        text = format_report(diagnostics_report(self._estimator))
+        dialog = QDialog(self)
+        dialog.setWindowTitle("PoseCraft Diagnostics")
+        layout = QVBoxLayout(dialog)
+        view = QPlainTextEdit(text)
+        view.setReadOnly(True)
+        view.setObjectName("diagnosticsText")
+        font = view.font()
+        font.setFamily("Consolas")
+        view.setFont(font)
+        view.setMinimumSize(640, 220)
+        layout.addWidget(view)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        copy_button = buttons.addButton("&Copy", QDialogButtonBox.ActionRole)
+        copy_button.clicked.connect(lambda: QApplication.clipboard().setText(text))
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.setAttribute(Qt.WA_DeleteOnClose)
+        dialog.show()
+        return dialog
+
+    def _on_about(self) -> None:
+        from pose_craft import __version__
+
+        QMessageBox.about(self, "About PoseCraft", ABOUT_TEXT.format(version=__version__))
+
     # -- settings (F7) --------------------------------------------------------------
 
     def _restore_settings(self) -> None:
@@ -1505,6 +1549,11 @@ class MainWindow(QMainWindow):
             reason = getattr(estimator, "gpu_fallback_reason", None)
             note = f" (GPU not used: {reason})" if reason else ""
             self.statusBar().showMessage(f"Ready -- pose model loaded on {estimator.device}{note}")
+            # The message is replaced by the next status; the tooltip keeps the reason (R4).
+            self.statusBar().setToolTip(
+                f"Pose model on {estimator.device}." + (f" GPU not used: {reason}." if reason else "")
+                + " Help > Diagnostics has the details."
+            )
         else:
             estimator.close()  # the model or device was changed meanwhile
         self._resume_pending_solve()

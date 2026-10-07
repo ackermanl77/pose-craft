@@ -62,7 +62,10 @@ laptop with integrated graphics too) and never on a software renderer such as
 Microsoft Basic Render Driver. When the model loads, each GPU model is also run
 once on a probe image and compared with the CPU; if a GPU fails, returns
 invalid values or differs by more than 1% of an output's range, PoseCraft uses
-the CPU instead and the status bar says why ("GPU not used: ...").
+the CPU instead and the status bar says why ("GPU not used: ...", kept in its
+tooltip). **Help > Diagnostics** lists the ONNX Runtime version and providers, the
+DirectX 12 GPUs, the loaded model's device, the fallback reason and the log file,
+with a Copy button for bug reports.
 
 `requirements.txt` is pinned to known-working versions; if you deliberately
 want the latest of everything instead, drop the `==` pins.
