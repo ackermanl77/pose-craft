@@ -176,7 +176,10 @@ model-download logic, the pose pipeline's pre/post-processing and the model
 converter, unicode-safe image loading, the Live Link wire protocol, and (when golden
 photos and the cached model are present, see `scripts/generate_goldens.py`)
 a real-photo end-to-end golden test. `.github/workflows/ci.yml` runs this
-same lightweight suite on every push/PR. With PySide6 installed, run it with
+same lightweight suite on every push/PR on Ubuntu, the full suite (Qt included,
+with coverage) on Windows, and the linters: `python -m ruff check pose_craft tests
+scripts` and `python -m mypy` (configured in `pyproject.toml`; mypy covers
+`pose_craft/retarget` and `pose_craft/export` so far). With PySide6 installed, run it with
 `QT_QPA_PLATFORM=offscreen` to include the GUI flow tests (real Qt event loop,
 fake estimators; no pytest-qt needed). Before a release, also run the GPU/CPU
 parity tests: `set POSECRAFT_GPU_TESTS=1` then `pytest -m gpu` (needs a GPU

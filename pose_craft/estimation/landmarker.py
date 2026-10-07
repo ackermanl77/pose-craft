@@ -22,8 +22,8 @@ import os
 import sys
 import tempfile
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 
@@ -463,7 +463,7 @@ class PoseEstimator:
         use_gpu: bool = True,
         on_progress: Callable[[int, int], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
-    ) -> "PoseEstimator":
+    ) -> PoseEstimator:
         """The estimator for a model variant, from bundled pre-converted models
         when the build has them, else downloading/converting on first use."""
         paths = resolve_onnx_models(variant, on_progress=on_progress, should_cancel=should_cancel)
@@ -529,7 +529,7 @@ class PoseEstimator:
         # dropping the reference is all "closing" needs to do.
         self._pose = None
 
-    def __enter__(self) -> "PoseEstimator":
+    def __enter__(self) -> PoseEstimator:
         return self
 
     def __exit__(self, *exc_info) -> None:

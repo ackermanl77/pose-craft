@@ -7,12 +7,12 @@ pytest.importorskip("PySide6")  # this module needs a real Qt/OpenGL install; CI
 
 from pose_craft.export.blender_pose import LOW_CONFIDENCE_THRESHOLD  # noqa: E402
 from pose_craft.gui.viewport_3d import (  # noqa: E402
+    _MIN_CAMERA_DISTANCE,
     BONE_COLOR,
     LOW_CONFIDENCE_BONE_COLOR,
     _bone_line_colors,
     _compute_camera_frame,
     _engine_to_display,
-    _MIN_CAMERA_DISTANCE,
 )
 from pose_craft.retarget.skeleton import BONE_NAMES  # noqa: E402
 

@@ -1,0 +1,48 @@
+# Project metadata and tool configuration (C3 in the improvement report). The app is run from
+# source or the PyInstaller build (PoseCraft.spec), not installed as a package; the dependencies
+# stay in requirements*.txt, which pin exact versions per runtime flavour.
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "posecraft"
+description = "Turn a photo of a person into a Blender pose: BlazePose landmarks retargeted to an armature."
+requires-python = ">=3.12"
+dynamic = ["version"]
+
+[tool.setuptools.dynamic]
+version = { attr = "pose_craft.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["pose_craft*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 130
+target-version = "py312"
+extend-exclude = ["build", "dist", "build-venv*"]
+
+[tool.ruff.lint]
+# pycodestyle errors, pyflakes, import order, pyupgrade and bugbear. Ruff 0.16's own default
+# set is far wider; this is the agreed baseline -- widen it deliberately.
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+# zip(strict=...) would turn silent length mismatches into exceptions at ~40 call sites whose
+# inputs are built to match; adopt it case by case instead of all at once.
+ignore = ["B905"]
+
+[tool.ruff.lint.per-file-ignores]
+# The Blender add-on also runs on Blender 3.6 / Python 3.10 (bl_info "blender": (3, 6, 0)).
+"pose_craft/export/blender_addon/*" = ["UP"]
+
+[tool.mypy]
+# Started with the pure modules (retargeting math and exporters); the GUI and the model
+# converter come later.
+files = ["pose_craft/retarget", "pose_craft/export"]
+exclude = ["pose_craft/export/blender_addon/"]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_ignores = true
+check_untyped_defs = true

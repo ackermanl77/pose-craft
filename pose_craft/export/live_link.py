@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import socket
+from typing import Any
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
@@ -60,7 +61,7 @@ ANIMATION_TIMEOUT_SECONDS = 30.0
 def _recv_exact_or_none(sock: socket.socket, size: int) -> bytes | None:
     """Reads exactly `size` bytes, or returns None if the peer closes before
     sending anything at all (an add-on that doesn't reply)."""
-    chunks = []
+    chunks: list[bytes] = []
     remaining = size
     while remaining > 0:
         chunk = sock.recv(remaining)
@@ -166,7 +167,7 @@ def send_animation_document(
     chunks = split_animation_frames(frames, max_bytes, max_frames)
     header = {key: value for key, value in document.items() if key != "frames"}
     header["first_frame_index"] = int(frames[0]["frame_index"])
-    combined = {
+    combined: dict[str, Any] = {
         "ok": True, "applied": [], "unmatched": [], "low_confidence": [], "requested": 0, "armature": None,
         "animation_frames": 0, "start_frame": None, "end_frame": None, "chunks": len(chunks), "error": None,
     }

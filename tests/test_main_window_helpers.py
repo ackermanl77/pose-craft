@@ -234,8 +234,8 @@ def _yawed_person() -> DetectedPerson:
     from pathlib import Path
 
     sys.path.insert(0, str(Path(__file__).parent))
-    from test_retarget_frames import _articulated_pose, _rigidly_rotated
     from scipy.spatial.transform import Rotation
+    from test_retarget_frames import _articulated_pose, _rigidly_rotated
 
     landmarks = _rigidly_rotated(_articulated_pose(), Rotation.from_euler("y", 60, degrees=True))
     return DetectedPerson(

@@ -269,7 +269,6 @@ def test_rig_pose_basis_aims_every_bone_of_an_a_pose_mixamo_like_rig():
 
 
 def test_rig_pose_basis_equals_the_v1_formula_on_a_posecraft_shaped_rig():
-    import numpy as np
 
     from pose_craft.export.blender_pose import _ENGINE_TO_BLENDER_AXES
     from pose_craft.retarget import skeleton as sk

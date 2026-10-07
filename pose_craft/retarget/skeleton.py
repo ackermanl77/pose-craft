@@ -47,6 +47,7 @@ landmarks nothing changes: the 15 body bones, solved exactly as before.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -84,8 +85,8 @@ class BoneSpec:
     # Rest-pose direction (head -> tail) in the engine frame, T-pose, unit length.
     rest_direction: np.ndarray
     # Functions that derive the bone's head/tail joint positions from a (33, 3) landmark array.
-    head_fn: "callable[[np.ndarray], np.ndarray]"
-    tail_fn: "callable[[np.ndarray], np.ndarray]"
+    head_fn: Callable[[np.ndarray], np.ndarray]
+    tail_fn: Callable[[np.ndarray], np.ndarray]
     # Raw landmark indices this bone's position depends on, for confidence scoring
     # (see bone_confidence) -- listed explicitly rather than derived from head_fn/tail_fn
     # since some of those (e.g. the head bone's extrapolated top-of-skull point) do
@@ -702,10 +703,11 @@ def _solve_world_rotations(
     head_frame = _frame_rotation(UP, LEFT_X, direction("head"), ear_line)
     neck_direction = direction("neck")
     neck = _carried(world["spine"], UP, neck_direction)
-    if head_frame is not None:
+    neck_axis = _unit(neck_direction)
+    if head_frame is not None and neck_axis is not None:
         twist = _signed_angle_about(neck_direction, neck.apply(LEFT_X), head_frame.apply(LEFT_X))
         if twist is not None:
-            neck = Rotation.from_rotvec(_unit(neck_direction) * NECK_YAW_SHARE * twist) * neck
+            neck = Rotation.from_rotvec(neck_axis * NECK_YAW_SHARE * twist) * neck
     world["neck"] = neck
     world["head"] = head_frame if head_frame is not None else _carried(neck, UP, direction("head"))
 
@@ -928,8 +930,8 @@ def rest_head_positions(
         if finger.segment == 1:
             heads[finger.name] = heads[finger.parent] + _finger_base_offset(lengths, finger)
         else:
-            parent = _FINGERS_BY_NAME[finger.parent]
-            heads[finger.name] = heads[parent.name] + parent.rest_direction * bone_length(lengths, parent.name)
+            finger_parent = _FINGERS_BY_NAME[finger.parent]
+            heads[finger.name] = heads[finger_parent.name] + finger_parent.rest_direction * bone_length(lengths, finger_parent.name)
     return heads
 
 

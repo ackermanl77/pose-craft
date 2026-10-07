@@ -73,9 +73,11 @@ class _Rig:
     parent_rest^-1 @ rest @ basis, then each Copy Transforms constraint blends
     the bone toward its target's pose by its influence."""
 
-    def __init__(self, rig, ik_basis=Rotation.from_rotvec([0.4, -0.3, 0.2])):
+    def __init__(self, rig, ik_basis=None):
         self.rig = rig
         self.rest = {n: _rest_with_direction(d, roll) for n, (_p, d, roll, _c, _m) in rig.items()}
+        if ik_basis is None:
+            ik_basis = Rotation.from_rotvec([0.4, -0.3, 0.2])
         self.basis = {"MCH-upper_arm_ik.L": ik_basis}  # some IK solution the FK pose must override
         self.props = {"upper_arm_parent.L": {"IK_FK": 0.0}}  # Rigify's default: IK
 

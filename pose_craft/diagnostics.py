@@ -15,8 +15,8 @@ import logging.handlers
 import os
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 LOG_FILE_NAME = "posecraft.log"
 _MAX_LOG_BYTES = 1_000_000

@@ -458,7 +458,7 @@ class EditedPerson:
     hand_presence: dict  # "L"/"R" -> score
 
 
-def edited_person(person: DetectedPerson, edits: "PersonEdits | None", aspect: float = 1.0) -> EditedPerson:
+def edited_person(person: DetectedPerson, edits: PersonEdits | None, aspect: float = 1.0) -> EditedPerson:
     """Applies a person's edits: each moved joint in landmark order (a parent
     joint before its child, so a moved elbow then wrist keeps the forearm's
     length from the moved elbow), then the depth flips (hands included)."""
@@ -493,10 +493,10 @@ class PersonEdits:
     def override_rotations(self) -> dict[str, Rotation]:
         return {name: bone_axes_rotation(name, angles) for name, angles in self.overrides}
 
-    def with_flip_toggled(self, bone: str) -> "PersonEdits":
+    def with_flip_toggled(self, bone: str) -> PersonEdits:
         return dataclasses.replace(self, flipped=self.flipped ^ {bone})
 
-    def with_override(self, bone: str, angles: tuple[float, float, float] | None) -> "PersonEdits":
+    def with_override(self, bone: str, angles: tuple[float, float, float] | None) -> PersonEdits:
         entries = {name: value for name, value in self.overrides if name != bone}
         if angles is not None and any(abs(a) > 1e-9 for a in angles):
             entries[bone] = tuple(float(a) for a in angles)
@@ -505,7 +505,7 @@ class PersonEdits:
     def override_for(self, bone: str) -> tuple[float, float, float]:
         return dict(self.overrides).get(bone, (0.0, 0.0, 0.0))
 
-    def with_joint_moved(self, joint: int, xy: tuple[float, float] | None) -> "PersonEdits":
+    def with_joint_moved(self, joint: int, xy: tuple[float, float] | None) -> PersonEdits:
         entries = {index: value for index, value in self.moved if index != joint}
         if xy is not None:
             entries[int(joint)] = (float(xy[0]), float(xy[1]))
@@ -518,7 +518,7 @@ class PersonEdits:
 class _EditCommand(QUndoCommand):
     """One manual correction as an undo step: swaps a person's PersonEdits."""
 
-    def __init__(self, window: "MainWindow", person_key: int, before: PersonEdits, after: PersonEdits, text: str):
+    def __init__(self, window: MainWindow, person_key: int, before: PersonEdits, after: PersonEdits, text: str):
         super().__init__(text)
         # person_key: the person's index in a photo, their track ID in a video.
         self._window, self._index, self._before, self._after = window, person_key, before, after

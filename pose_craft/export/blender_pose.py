@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -98,7 +99,7 @@ def build_pose_document(
     world_rotations = world_rotations_from_local(bone_rotations)
     bones = {}
     for name, rotation in bone_rotations.items():
-        entry = {"quaternion_wxyz": _wxyz(_rotation_to_blender(rotation))}
+        entry: dict[str, Any] = {"quaternion_wxyz": _wxyz(_rotation_to_blender(rotation))}
         if name in world_rotations:
             entry["world_quaternion_wxyz"] = _wxyz(_rotation_to_blender(world_rotations[name]))
             entry["rest_direction"] = [float(v) for v in _ENGINE_TO_BLENDER_AXES.apply(bone_rest_direction(name))]
@@ -108,7 +109,7 @@ def build_pose_document(
             entry["low_confidence"] = confidence < LOW_CONFIDENCE_THRESHOLD
         bones[name] = entry
 
-    document = {
+    document: dict[str, Any] = {
         "format": FORMAT_NAME,
         "version": FORMAT_VERSION,
         "up_axis": "Z",

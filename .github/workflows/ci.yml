@@ -45,3 +45,54 @@ jobs:
 
       - name: Run tests
         run: python -m pytest -q
+
+  lint:
+    # C3: ruff over everything, mypy over the pure modules (pyproject.toml has both configs).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements-test.txt
+
+      - name: Install test dependencies
+        run: pip install -r requirements-test.txt
+
+      - name: Ruff
+        run: python -m ruff check pose_craft tests scripts
+
+      - name: Mypy
+        run: python -m mypy
+
+  windows:
+    # T6: the shipped platform, with PySide6 so the Qt tests run (offscreen) instead of
+    # skipping, the CPU runtime (the GPU wheels add nothing on a runner without a GPU) and
+    # coverage in the log. No artifact upload: the account's Actions storage is limited.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            requirements-test.txt
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements.txt
+          # onnxruntime-gpu and onnxruntime install the same module; use the CPU build.
+          python -m pip uninstall -y onnxruntime-gpu
+          python -m pip install -r requirements-test.txt
+
+      - name: Run tests with coverage
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q --cov=pose_craft --cov-report=term

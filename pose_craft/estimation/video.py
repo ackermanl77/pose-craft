@@ -33,8 +33,8 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -132,7 +132,7 @@ def foot_locked_root_xz(
     for previous, current in zip(frames_points, frames_points[1:]):
         step = None
         best_height = None
-        for side, (head, tail) in _FOOT_POINTS.items():
+        for head, tail in _FOOT_POINTS.values():
             lowest_prev = min(previous[head][1], previous[tail][1])
             lowest_cur = min(current[head][1], current[tail][1])
             if max(lowest_prev, lowest_cur) > lock_height:
