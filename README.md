@@ -115,8 +115,11 @@ skeleton. From there:
   the selected person's whole track on the rig (add-on 0.7.0+; long clips go
   in chunks under the add-on's 256 KB message cap).
 
-Inside Blender, install `pose_craft/export/blender_addon/import_pose.py` as an
-add-on (Edit > Preferences > Add-ons > Install...), select an armature, and
+Inside Blender, install the add-on zip (the release's `posecraft-blender-addon-<version>.zip`,
+or build it with `python scripts/build_addon_zip.py`): on Blender 4.2+ it is an
+extension -- Edit > Preferences > Get Extensions > Install from Disk, which shows its
+declared network permission (Live Link listens on localhost); on 3.6-4.1 use Edit >
+Preferences > Add-ons > Install... with the same zip. Then select an armature and
 open the "PoseCraft" tab in the 3D viewport sidebar. From there either **Load
 Pose JSON** (pick an exported file) or **Start Live Link** once and then use
 PoseCraft's "Send to Blender" button for every pose after that, no file

@@ -142,3 +142,37 @@ def test_the_addon_in_a_real_blender(tmp_path):
     assert live["keys_after_one_undo"] == 0  # both chunks are one undo step
     assert live["timer_while_running"]
     assert results["unregistered"] == {"classes_gone": True, "port_freed": True, "timer_gone": True}
+
+
+def test_the_zip_installs_as_an_extension_in_a_real_blender(tmp_path):
+    """K6: the release zip validates, installs and enables as a Blender 4.2+ extension."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("build_addon_zip", Path(__file__).parents[1] / "scripts" / "build_addon_zip.py")
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    archive = builder.build(tmp_path)
+    user = tmp_path / "blender-user"
+    env = dict(os.environ, BLENDER_USER_RESOURCES=str(user), BLENDER_USER_CONFIG=str(user / "config"),
+               BLENDER_USER_SCRIPTS=str(user / "scripts"), BLENDER_USER_EXTENSIONS=str(user / "extensions"),
+               BLENDER_USER_DATAFILES=str(user / "datafiles"))
+    version = subprocess.run([BLENDER, "--version"], capture_output=True, text=True, timeout=120).stdout
+    if not version.startswith("Blender ") or tuple(int(p) for p in version.split()[1].split(".")[:2]) < (4, 2):
+        pytest.skip("extensions need Blender 4.2+")
+
+    def blender(*args):
+        return subprocess.run([BLENDER, "--factory-startup", *args], env=env, capture_output=True, text=True, timeout=300)
+
+    validate = blender("--command", "extension", "validate", str(archive))
+    assert validate.returncode == 0, validate.stdout + validate.stderr
+    install = blender("--command", "extension", "install-file", "-r", "user_default", "-e", str(archive))
+    assert install.returncode == 0 and 'Installed "posecraft"' in install.stdout, install.stdout + install.stderr
+    check = tmp_path / "check.py"
+    check.write_text(
+        "import bpy, sys\n"
+        "ok = 'bl_ext.user_default.posecraft' in bpy.context.preferences.addons and hasattr(bpy.ops.posecraft, 'load_pose')\n"
+        "sys.exit(0 if ok else 3)\n",
+        encoding="utf-8",
+    )
+    enabled = subprocess.run([BLENDER, "--background", "--python-exit-code", "1", "--python", str(check)], env=env, capture_output=True, text=True, timeout=300)
+    assert enabled.returncode == 0, enabled.stdout[-3000:] + enabled.stderr[-3000:]

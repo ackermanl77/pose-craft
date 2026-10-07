@@ -100,12 +100,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # One zip for both: an extension on Blender 4.2+ (blender_manifest.toml) and a
+      # legacy add-on on 3.6-4.1 (bl_info).
       - name: Zip the Blender add-on
-        run: |
-          version=$(python3 -c "import ast; src = open('pose_craft/export/blender_addon/import_pose.py').read(); info = next(n.value for n in ast.parse(src).body if isinstance(n, ast.Assign) and getattr(n.targets[0], 'id', '') == 'bl_info'); print('.'.join(map(str, ast.literal_eval(info)['version'])))")
-          mkdir -p staging/posecraft_import_pose
-          cp pose_craft/export/blender_addon/import_pose.py staging/posecraft_import_pose/__init__.py
-          (cd staging && zip -r "../posecraft-blender-addon-$version.zip" posecraft_import_pose)
+        run: python3 scripts/build_addon_zip.py --out .
       - uses: actions/upload-artifact@v4
         with:
           name: PoseCraft-addon

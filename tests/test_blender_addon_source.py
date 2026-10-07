@@ -683,3 +683,23 @@ def test_stopping_live_link_unregisters_its_timer():
     assert server.closed and stalled.closed and loaded["_connections"] == {}
     assert loaded["_server_socket"] is None and loaded["_live_link_status"] == "Stopped"
     loaded["_stop_live_link_server"]()  # stopping twice is harmless
+
+
+def test_the_extension_manifest_matches_bl_info_and_ships_in_the_zip(tmp_path):
+    """K6: one zip installs as a Blender 4.2+ extension and as a 3.6-4.1 legacy add-on."""
+    import importlib.util
+    import tomllib
+    import zipfile
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("build_addon_zip", root / "scripts" / "build_addon_zip.py")
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    manifest = tomllib.loads((root / "pose_craft" / "export" / "blender_addon" / "blender_manifest.toml").read_text(encoding="utf-8"))
+    assert manifest["version"] == builder.addon_version()
+    assert manifest["id"] == "posecraft" and manifest["type"] == "add-on"
+    assert "network" in manifest["permissions"]  # Live Link listens on a socket
+    archive = builder.build(tmp_path)
+    assert archive.name == f"posecraft-blender-addon-{manifest['version']}.zip"
+    assert sorted(zipfile.ZipFile(archive).namelist()) == ["posecraft_import_pose/__init__.py", "posecraft_import_pose/blender_manifest.toml"]

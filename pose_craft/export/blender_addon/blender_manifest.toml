@@ -1,0 +1,22 @@
+# Blender 4.2+ extension manifest (K6). The same zip installs as a legacy add-on on
+# Blender 3.6-4.1, which reads bl_info in import_pose.py instead -- keep the two
+# versions equal (tests/test_blender_addon_source.py checks it). Built into the zip
+# by scripts/build_addon_zip.py.
+schema_version = "1.0.0"
+
+id = "posecraft"
+version = "0.7.1"
+name = "PoseCraft Pose Importer"
+tagline = "Apply PoseCraft pose exports and Live Link poses to an armature"
+maintainer = "PoseCraft"
+type = "add-on"
+
+tags = ["Animation", "Rigging"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+network = "Live Link: receives poses from the PoseCraft app on localhost"
+files = "Import pose JSON files from disk"
