@@ -31,6 +31,7 @@ import functools
 import logging
 import math
 import sys
+import threading
 from pathlib import Path
 
 import cv2
@@ -594,13 +595,34 @@ def no_gpu_reason() -> str:
     return "the GPU runtime could not start"
 
 
+# Detector sessions shared by every BlazePose (P5): the lite/full/heavy variants use
+# the same detector file, so switching the model quality rebuilds only the landmark
+# session. Keyed by (resolved path, GPU requested); each has a lock because a
+# DirectML session must not run two inferences at once.
+_detector_sessions: dict[tuple[str, bool], tuple[object, threading.Lock]] = {}
+_detector_sessions_lock = threading.Lock()
+
+
+def shared_detector_session(detector_path: Path, use_gpu: bool) -> tuple[object, threading.Lock]:
+    """The (session, run lock) for `detector_path`, created on first use."""
+    key = (str(Path(detector_path).resolve()), bool(use_gpu))
+    with _detector_sessions_lock:
+        if key not in _detector_sessions:
+            _detector_sessions[key] = (create_session(detector_path, use_gpu), threading.Lock())
+        return _detector_sessions[key]
+
+
 class BlazePose:
     """Two ONNX Runtime sessions (detector + landmark model) plus MediaPipe's
     pre/post-processing. Construct once and reuse -- session creation (and, on the
     GPU, CUDA initialization) is the expensive part."""
 
+    # Replaced by the shared detector's own lock in __init__ (a default for
+    # instances assembled without it, e.g. around a stand-in session).
+    _detector_lock: threading.Lock = threading.Lock()
+
     def __init__(self, detector_path: Path, landmarks_path: Path, use_gpu: bool = True):
-        self._detector = create_session(detector_path, use_gpu)
+        self._detector, self._detector_lock = shared_detector_session(detector_path, use_gpu)
         self._landmarks = create_session(landmarks_path, use_gpu)
         #: Why a requested GPU isn't used (None when it is, or wasn't requested).
         self.gpu_fallback_reason: str | None = None
@@ -611,7 +633,7 @@ class BlazePose:
             if reason:
                 log.warning("not using the GPU: %s", reason)
                 self.gpu_fallback_reason = reason
-                self._detector = create_session(detector_path, use_gpu=False)
+                self._detector, self._detector_lock = shared_detector_session(detector_path, use_gpu=False)
                 self._landmarks = create_session(landmarks_path, use_gpu=False)
             elif self._detector.get_providers()[0] == CPU_PROVIDER:
                 self.gpu_fallback_reason = no_gpu_reason()
@@ -642,7 +664,8 @@ class BlazePose:
         image's pixel coordinates."""
         h, w = image_rgb.shape[:2]
         tensor, pad = detector_input(image_rgb)
-        raw_boxes, raw_scores = self._detector.run(None, {self._detector_input: tensor})
+        with self._detector_lock:
+            raw_boxes, raw_scores = self._detector.run(None, {self._detector_input: tensor})
         detections = weighted_nms(decode_detections(raw_boxes[0], raw_scores[0, :, 0], min_detection_confidence))
         return [remove_letterbox(det, pad, w, h) for det in detections]
 

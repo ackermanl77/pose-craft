@@ -279,16 +279,42 @@ def ensure_hand_onnx_model(task_path: Path) -> Path:
     return path
 
 
+def shared_detector_path(directory: Path, detector_sha256: str) -> Path:
+    """Where a converted pose detector is cached by content (P5): the lite, full
+    and heavy bundles carry a byte-identical detector, so it's stored once."""
+    from pose_craft.estimation.tflite_to_onnx import CONVERTER_VERSION
+
+    return directory / f"pose_detector.{detector_sha256[:8]}.v{CONVERTER_VERSION}.onnx"
+
+
+def _detector_pointer(paths: dict[str, Path]) -> Path:
+    """A variant's small text file naming its shared detector (next to its landmarks)."""
+    return paths["detector"].with_suffix(".txt")
+
+
 def ensure_onnx_models(model_path: Path) -> dict[str, Path]:
     """Converts `model_path`'s TFLite graphs to ONNX once, reusing the cached
     conversion afterwards (converting takes well under a second, but there's no
-    reason to redo it on every launch)."""
+    reason to redo it on every launch). The detector lands in a content-named
+    shared file (shared_detector_path), so the three variants keep one copy; a
+    per-variant detector left by an older version is folded into it."""
     from pose_craft.estimation.tflite_to_onnx import convert_task_bundle
 
     paths = onnx_model_paths(model_path)
-    if all(path.exists() for path in paths.values()):
-        return paths
-    return convert_task_bundle(model_path, paths)
+    pointer = _detector_pointer(paths)
+    if paths["landmarks"].exists() and pointer.exists():
+        shared = paths["landmarks"].with_name(pointer.read_text(encoding="utf-8").strip())
+        if shared.exists():
+            return {"detector": shared, "landmarks": paths["landmarks"]}
+    if not (paths["landmarks"].exists() and paths["detector"].exists()):
+        convert_task_bundle(model_path, paths)
+    shared = shared_detector_path(paths["detector"].parent, file_sha256(paths["detector"]))
+    if shared.exists():
+        paths["detector"].unlink()
+    else:
+        os.replace(paths["detector"], shared)
+    pointer.write_text(shared.name, encoding="utf-8")
+    return {"detector": shared, "landmarks": paths["landmarks"]}
 
 
 # Pre-converted models (K3): a frozen build bundles the ONNX models made at
