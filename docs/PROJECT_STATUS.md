@@ -229,8 +229,10 @@ so much bigger than the old ~480 MB one; a build from a venv without
 bundled as `datas` so `app.py` can set the window icon at runtime via
 `sys._MEIPASS`). `dist/` and `build/` are gitignored -- distribute the built
 folder directly (zip it, or wrap it in an installer) rather than committing
-it. Not code-signed: expect SmartScreen to flag it as unrecognized on a
-machine other than the one it was built on.
+it. Release builds aren't code-signed yet: expect SmartScreen to flag them as unrecognized on a
+machine other than the one they were built on. `scripts/sign_build.py` signs `dist/PoseCraft/PoseCraft.exe`
+with the certificate in `CODESIGN_THUMBPRINT` (checked with a self-signed test certificate,
+2026-10-07); a trusted certificate is what removes the warning.
 
 `requirements.txt` is now pinned to the exact versions this project was built
 and tested against (was unpinned before); `requirements-test.txt` is a

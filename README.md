@@ -161,6 +161,10 @@ set POSECRAFT_FLAVOR=dml
 pyinstaller PoseCraft.spec
 ```
 
+To Authenticode-sign the result: `set CODESIGN_THUMBPRINT=<SHA-1 thumbprint>` (a
+code-signing certificate in the Windows store), then `python scripts/sign_build.py`
+(signtool from the Windows SDK, timestamped by `CODESIGN_TIMESTAMP_URL`, default DigiCert).
+
 Produces `dist/PoseCraft/PoseCraft.exe` plus its `_internal/` dependency
 folder -- measured on 2026-10-01 (Python 3.14, PyInstaller 6.22.3): DirectML
 508 MB, CPU 472 MB, CUDA 1.73 GB -- ship the whole `dist/PoseCraft/` folder, not just
