@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 import logging
 import threading
 from pathlib import Path
@@ -37,7 +36,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from scipy.spatial.transform import Rotation
 
 from pose_craft.diagnostics import diagnostics_report, format_report, log_file_hint
 from pose_craft.estimation.landmarker import (
@@ -54,29 +52,32 @@ from pose_craft.export.blender_pose import (
     build_animation_document,
     build_pose_document,
     low_confidence_threshold,
-    root_measurements,
     save_pose_file,
     set_low_confidence_threshold,
 )
 from pose_craft.export.bvh_export import floor_root_position, save_bvh_animation, save_bvh_file
 from pose_craft.export.live_link import send_animation_document, send_pose_document
+from pose_craft.gui.batch_dialog import BatchDialog, BatchSettings
 from pose_craft.gui.photo_view import PhotoOverlayPerson, PhotoView, legend_entries, legend_swatch
 from pose_craft.gui.viewport_3d import SkeletonViewport, photo_backdrop_corners
 from pose_craft.imaging import PHOTO_GUIDANCE, assess_photo_quality, imread_unicode
+from pose_craft.posing import (  # noqa: F401 -- EditedPerson, edited_person, default_export_name: also used as mw.*
+    EditedPerson,
+    PersonEdits,
+    default_export_name,
+    document_inputs,
+    edited_person,
+    out_of_frame_bones,
+    root_for,
+)
 from pose_craft.retarget.skeleton import (
     BONE_NAMES,
     DRAGGABLE_JOINTS,
     FLIPPABLE_BONES,
     JOINT_LABELS,
     ORIENTATION_CORRECTIONS,
-    apply_bone_overrides,
-    apply_orientation_correction,
-    bone_axes_rotation,
     bone_confidence,
     bone_lateral_axes,
-    bones_out_of_frame,
-    flip_hand_depth,
-    flip_limb_depth,
     floor_height,
     forward_kinematics,
     image_joint_positions_2d,
@@ -84,9 +85,7 @@ from pose_craft.retarget.skeleton import (
     measured_proportions,
     mirror_hands,
     mirror_landmarks,
-    move_joint,
     rotate_joint_positions,
-    solve_bone_rotations,
 )
 
 log = logging.getLogger(__name__)
@@ -443,99 +442,12 @@ def _preview_positions(
     return {k: v + lift for k, v in solved.items()}, {k: v + lift for k, v in ghost.items()}
 
 
-def default_export_name(source: str | None, person_index: int, suffix: str) -> str:
-    """"<photo stem>_person<N><suffix>", or "pose_person<N>" with no photo."""
-    stem = Path(source).stem if source else "pose"
-    return f"{stem}_person{person_index + 1}{suffix}"
-
-
 def _update_recent_files(recent: list[str], path: str, limit: int = MAX_RECENT_FILES) -> list[str]:
     """`path` moved to the front of the recent-files list (case-insensitively
     unique, as Windows paths are), trimmed to `limit`."""
     key = str(Path(path)).lower()
     kept = [p for p in recent if str(Path(p)).lower() != key]
     return [str(Path(path))] + kept[: limit - 1]
-
-
-@dataclasses.dataclass
-class EditedPerson:
-    """A person after their manual edits (moved joints, then depth flips),
-    before mirroring: what every solve, export and overlay uses."""
-
-    landmarks: np.ndarray
-    image_xy: np.ndarray
-    visibility: np.ndarray
-    hands: dict  # "L"/"R" -> (21, 3) engine-frame hand landmarks (B11)
-    hands_xy: dict  # "L"/"R" -> (21, 2) normalized
-    hand_presence: dict  # "L"/"R" -> score
-    # (33,) per-landmark presence (B10), a dragged joint counted as in frame; None when unknown.
-    landmark_presence: np.ndarray | None = None
-
-    def out_of_frame(self) -> set[str]:
-        """Body bones depending on a landmark outside the photo (B10)."""
-        return bones_out_of_frame(self.landmark_presence)
-
-
-def edited_person(person: DetectedPerson, edits: PersonEdits | None, aspect: float = 1.0) -> EditedPerson:
-    """Applies a person's edits: each moved joint in landmark order (a parent
-    joint before its child, so a moved elbow then wrist keeps the forearm's
-    length from the moved elbow), then the depth flips (hands included)."""
-    landmarks = np.asarray(person.landmarks, dtype=float)
-    image_xy = np.asarray(person.image_landmarks_xy, dtype=float)
-    hands = person.hand_world() if hasattr(person, "hand_world") else {}
-    hands_xy = person.hand_image_xy() if hasattr(person, "hand_image_xy") else {}
-    if edits is not None:
-        for joint, xy in edits.moved:
-            landmarks, image_xy, hands, hands_xy = move_joint(
-                landmarks, image_xy, joint, xy, aspect, person.visibility, hands, hands_xy
-            )
-        for bone in sorted(edits.flipped):
-            hands = flip_hand_depth(landmarks, hands, bone)
-            landmarks = flip_limb_depth(landmarks, bone)
-    presence = person.hand_presence() if hasattr(person, "hand_presence") else {}
-    landmark_presence = getattr(person, "landmark_presence", None)
-    if landmark_presence is not None and edits is not None and edits.moved:
-        landmark_presence = np.array(landmark_presence, dtype=float)
-        for joint, _xy in edits.moved:
-            landmark_presence[joint] = 1.0  # placed by hand inside the photo
-    return EditedPerson(landmarks, image_xy, np.asarray(person.visibility), hands, hands_xy, presence, landmark_presence)
-
-
-@dataclasses.dataclass(frozen=True)
-class PersonEdits:
-    """Manual corrections for one person (F4): limbs whose depth is flipped
-    (raw, unmirrored bone names -- what the user clicked in the photo), and
-    per-bone rotation adjustments in degrees about the bone's own X/Y/Z axes
-    (exported bone names, as in the "Adjust bone" picker), and joints dragged
-    on the photo to a new image position (raw landmark indices; photos only)."""
-
-    flipped: frozenset = frozenset()
-    overrides: tuple = ()  # ((bone name, (x, y, z) degrees), ...), sorted
-    moved: tuple = ()  # ((landmark index, (x, y) normalized), ...), sorted by index
-
-    def override_rotations(self) -> dict[str, Rotation]:
-        return {name: bone_axes_rotation(name, angles) for name, angles in self.overrides}
-
-    def with_flip_toggled(self, bone: str) -> PersonEdits:
-        return dataclasses.replace(self, flipped=self.flipped ^ {bone})
-
-    def with_override(self, bone: str, angles: tuple[float, float, float] | None) -> PersonEdits:
-        entries = {name: value for name, value in self.overrides if name != bone}
-        if angles is not None and any(abs(a) > 1e-9 for a in angles):
-            entries[bone] = tuple(float(a) for a in angles)
-        return dataclasses.replace(self, overrides=tuple(sorted(entries.items())))
-
-    def override_for(self, bone: str) -> tuple[float, float, float]:
-        return dict(self.overrides).get(bone, (0.0, 0.0, 0.0))
-
-    def with_joint_moved(self, joint: int, xy: tuple[float, float] | None) -> PersonEdits:
-        entries = {index: value for index, value in self.moved if index != joint}
-        if xy is not None:
-            entries[int(joint)] = (float(xy[0]), float(xy[1]))
-        return dataclasses.replace(self, moved=tuple(sorted(entries.items())))
-
-    def is_empty(self) -> bool:
-        return not self.flipped and not self.overrides and not self.moved
 
 
 ABOUT_TEXT = (
@@ -1157,6 +1069,7 @@ class MainWindow(QMainWindow):
         self.export_action = self._action(file_menu, "&Export Pose JSON...", self._on_export_pose, "Ctrl+S")
         self.export_bvh_action = self._action(file_menu, "Export &BVH...", self._on_export_bvh, "Ctrl+Shift+S")
         self.export_all_action = self._action(file_menu, "Export &All People...", self._on_export_all)
+        self.batch_action = self._action(file_menu, "Batch &Process Folder...", self._on_batch_folder)
         file_menu.addSeparator()
         self._action(file_menu, "&Quit", self.close, QKeySequence.Quit)
 
@@ -1194,6 +1107,23 @@ class MainWindow(QMainWindow):
         help_menu = bar.addMenu("&Help")
         self.diagnostics_action = self._action(help_menu, "&Diagnostics...", self._on_show_diagnostics)
         self._action(help_menu, "&About PoseCraft", self._on_about)
+
+    # -- batch (B13) ---------------------------------------------------------------------
+
+    def _on_batch_folder(self) -> BatchDialog:
+        """Solve a folder of photos with the current detection settings."""
+        settings = BatchSettings(
+            variant=self.model_variant_combo.currentText(),
+            use_gpu=self.use_gpu_checkbox.isChecked(),
+            max_people=self.max_people_spin.value(),
+            group_photo=self.group_photo_checkbox.isChecked(),
+            hands=self.hands_checkbox.isChecked(),
+            detection_threshold=self.detection_threshold_spin.value(),
+        )
+        dialog = BatchDialog(settings, self._last_dir(), self.mirror_checkbox.isChecked(), self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose)
+        dialog.show()
+        return dialog
 
     # -- help (R4) -----------------------------------------------------------------------
 
@@ -2117,20 +2047,7 @@ class MainWindow(QMainWindow):
         The person's hand landmarks (B11), when the hands were solved, add
         finger bones; they're mirrored and flipped along with the body.
         """
-        edited = edited_person(person, edits, aspect)
-        landmarks, visibility, hands, presence = edited.landmarks, edited.visibility, edited.hands, edited.hand_presence
-        if mirror:
-            landmarks = mirror_landmarks(landmarks)
-            visibility = mirror_landmarks(visibility)
-            hands = mirror_hands(hands)
-            presence = mirror_hands(presence)
-        rotations = solve_bone_rotations(landmarks, visibility=visibility, hands=hands)
-        if edits is not None and edits.overrides:
-            rotations = apply_bone_overrides(rotations, edits.override_rotations())
-        if orientation_correction is not None:
-            rotations = apply_orientation_correction(rotations, orientation_correction)
-        confidence = bone_confidence(visibility, presence)
-        return rotations, confidence
+        return document_inputs(person, mirror, orientation_correction, edits, aspect)
 
     def _current_person_document_inputs(self):
         index = self.person_combo.currentIndex()
@@ -2148,22 +2065,12 @@ class MainWindow(QMainWindow):
         )
 
     def _out_of_frame_for(self, index: int) -> set[str]:
-        """Person `index`'s bones reaching outside the photo (B10), named as exported:
-        the presence rows are swapped with the mirror the way visibility is."""
-        presence = self._edited(index).landmark_presence
-        if presence is None:
-            return set()
-        if self.mirror_checkbox.isChecked():
-            presence = mirror_landmarks(presence)
-        return bones_out_of_frame(presence)
+        """Person `index`'s bones reaching outside the photo (B10), named as exported."""
+        return out_of_frame_bones(self._edited(index), self.mirror_checkbox.isChecked())
 
     def _root_for(self, index: int, rotations: dict) -> tuple[float, float]:
         """(hip_height, leg_length) in meters for person `index`'s export (B6)."""
-        edited = self._edited(index)
-        landmarks, hands = edited.landmarks, edited.hands
-        if self.mirror_checkbox.isChecked():
-            landmarks, hands = mirror_landmarks(landmarks), mirror_hands(hands)
-        return root_measurements(rotations, landmarks, hands)
+        return root_for(self._edited(index), self.mirror_checkbox.isChecked(), rotations)
 
     def _export_path(self, title: str, name: str, file_filter: str) -> str:
         path, _ = QFileDialog.getSaveFileName(self, title, str(Path(self._last_dir()) / name), file_filter)

@@ -40,9 +40,15 @@ ignore = ["B905"]
 [tool.mypy]
 # Started with the pure modules (retargeting math and exporters); the GUI and the model
 # converter come later.
-files = ["pose_craft/retarget", "pose_craft/export"]
+files = ["pose_craft/retarget", "pose_craft/export", "pose_craft/posing.py", "pose_craft/batch.py", "pose_craft/cli.py"]
 exclude = ["pose_craft/export/blender_addon/"]
 python_version = "3.12"
 ignore_missing_imports = true
 warn_unused_ignores = true
 check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# Imported by the checked modules but not yet brought into scope: used for types,
+# their own errors not reported (widen `files` to take one on).
+module = ["pose_craft.estimation.*", "pose_craft.gui.*"]
+follow_imports = "silent"

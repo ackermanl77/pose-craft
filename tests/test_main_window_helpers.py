@@ -249,9 +249,10 @@ def test_preview_draws_forward_kinematics_of_the_exported_rotations(qapp, monkey
     a T-pose even though the landmarks are articulated and turned."""
     from scipy.spatial.transform import Rotation
 
-    from pose_craft.gui import main_window as mw
+    from pose_craft import posing
 
-    monkeypatch.setattr(mw, "solve_bone_rotations", lambda *a, **k: {n: Rotation.identity() for n in sk.BONE_NAMES})
+    # The export's solve (posing.document_inputs, shared with the batch) -- what the preview draws.
+    monkeypatch.setattr(posing, "solve_bone_rotations", lambda *a, **k: {n: Rotation.identity() for n in sk.BONE_NAMES})
     window = MainWindow()
     drawn = {}
     monkeypatch.setattr(window.viewport, "show_skeleton", lambda positions, **kwargs: drawn.update(positions=positions, **kwargs))

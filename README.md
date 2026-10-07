@@ -110,6 +110,12 @@ skeleton. From there:
   you choose, named after the photo, asking before overwriting; the
   mirror checkbox, if used, applies to everyone in a batch export the same way
   it applies to a single person; the BVH stands on the floor), or
+- **File > Batch Process Folder...** -- every photo in a folder, solved
+  with the current detection settings, one `<photo>_person<N>.json` (or
+  `.bvh`) per person, with a progress bar and Cancel. Without the GUI:
+  `python -m pose_craft.cli --input photos --output poses [--format bvh]
+  [--mirror] [--model lite|full|heavy] [--cpu] [--hands] [--group-photo]
+  [--detection-threshold 0.3]` (from a source install), or
 - **Send to Blender (Live Link)** -- needs Blender running with the add-on's
   Live Link started first (see below). The host/port fields next to the
   button default to `127.0.0.1:8642` and only need changing if that port is
