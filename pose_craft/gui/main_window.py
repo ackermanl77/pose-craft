@@ -53,8 +53,10 @@ from pose_craft.export.blender_pose import (
     LOW_CONFIDENCE_THRESHOLD,
     build_animation_document,
     build_pose_document,
+    low_confidence_threshold,
     root_measurements,
     save_pose_file,
+    set_low_confidence_threshold,
 )
 from pose_craft.export.bvh_export import floor_root_position, save_bvh_animation, save_bvh_file
 from pose_craft.export.live_link import send_animation_document, send_pose_document
@@ -72,6 +74,7 @@ from pose_craft.retarget.skeleton import (
     bone_axes_rotation,
     bone_confidence,
     bone_lateral_axes,
+    bones_out_of_frame,
     flip_hand_depth,
     flip_limb_depth,
     floor_height,
@@ -133,9 +136,11 @@ class SolveWorker(QThread):
         use_gpu: bool = True,
         group_photo: bool = False,
         hands: bool = False,
+        min_detection_confidence: float = 0.5,
         parent=None,
     ):
         super().__init__(parent)
+        self._min_detection_confidence = min_detection_confidence
         self._image_bgr = image_bgr
         self._estimator = estimator
         self._max_people = max_people
@@ -169,6 +174,7 @@ class SolveWorker(QThread):
             estimator.max_people = self._max_people
             estimator.group_photo = self._group_photo
             estimator.hands = self._hands
+            estimator.min_detection_confidence = self._min_detection_confidence
             if self._hands:
                 # B11: loads (on first use, downloads) the hand landmark model.
                 estimator.enable_hands(
@@ -228,9 +234,10 @@ class VideoSolveWorker(QThread):
 
     def __init__(
         self, path: str, estimator: PoseEstimator | None, model_variant: str, use_gpu: bool, max_people: int = 1,
-        parent=None,
+        parent=None, min_detection_confidence: float = 0.5,
     ):
         super().__init__(parent)
+        self._min_detection_confidence = min_detection_confidence
         self._max_people = max_people
         self._path = path
         self._estimator = estimator
@@ -251,6 +258,7 @@ class VideoSolveWorker(QThread):
                 estimator = PoseEstimator.for_variant(
                     self._model_variant, use_gpu=self._use_gpu, should_cancel=self._cancel.is_set
                 )
+            estimator.min_detection_confidence = self._min_detection_confidence
             result = solve_video(
                 self._path,
                 estimator,
@@ -355,7 +363,7 @@ def _low_confidence_bone_count(confidence: dict[str, float]) -> int:
     method) so the post-solve status message logic can be exercised directly without a
     real solve or Qt widgets.
     """
-    return sum(1 for score in confidence.values() if score < LOW_CONFIDENCE_THRESHOLD)
+    return sum(1 for score in confidence.values() if score < low_confidence_threshold())
 
 
 def _low_confidence_status_suffix(confidence: dict[str, float]) -> str:
@@ -460,6 +468,12 @@ class EditedPerson:
     hands: dict  # "L"/"R" -> (21, 3) engine-frame hand landmarks (B11)
     hands_xy: dict  # "L"/"R" -> (21, 2) normalized
     hand_presence: dict  # "L"/"R" -> score
+    # (33,) per-landmark presence (B10), a dragged joint counted as in frame; None when unknown.
+    landmark_presence: np.ndarray | None = None
+
+    def out_of_frame(self) -> set[str]:
+        """Body bones depending on a landmark outside the photo (B10)."""
+        return bones_out_of_frame(self.landmark_presence)
 
 
 def edited_person(person: DetectedPerson, edits: PersonEdits | None, aspect: float = 1.0) -> EditedPerson:
@@ -479,7 +493,12 @@ def edited_person(person: DetectedPerson, edits: PersonEdits | None, aspect: flo
             hands = flip_hand_depth(landmarks, hands, bone)
             landmarks = flip_limb_depth(landmarks, bone)
     presence = person.hand_presence() if hasattr(person, "hand_presence") else {}
-    return EditedPerson(landmarks, image_xy, np.asarray(person.visibility), hands, hands_xy, presence)
+    landmark_presence = getattr(person, "landmark_presence", None)
+    if landmark_presence is not None and edits is not None and edits.moved:
+        landmark_presence = np.array(landmark_presence, dtype=float)
+        for joint, _xy in edits.moved:
+            landmark_presence[joint] = 1.0  # placed by hand inside the photo
+    return EditedPerson(landmarks, image_xy, np.asarray(person.visibility), hands, hands_xy, presence, landmark_presence)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -696,12 +715,17 @@ class MainWindow(QMainWindow):
             layout.addWidget(swatch, row, 2 * column)
             layout.addWidget(QLabel(text), row, 2 * column + 1)
         layout.setColumnStretch(4, 1)
-        legend.setToolTip(
-            f"Low-confidence bones (visibility under {LOW_CONFIDENCE_THRESHOLD:.0%}) are dashed: the landmarks "
-            "behind them were likely hidden or out of frame, so check them before exporting. "
-            "Right-click a limb to flip its depth."
-        )
+        legend.setToolTip(self._legend_tooltip())
+        self.legend = legend
         return legend
+
+    @staticmethod
+    def _legend_tooltip() -> str:
+        return (
+            f"Low-confidence bones (visibility under {low_confidence_threshold():.0%}) are dashed: the landmarks "
+            "behind them were likely hidden, so check them before exporting. Dotted bones reach outside the "
+            "photo (a cut-off limb): their pose is a guess. Right-click a limb to flip its depth."
+        )
 
     def _build_detect_group(self) -> QGroupBox:
         group = QGroupBox("1. Load && Detect")
@@ -792,6 +816,7 @@ class MainWindow(QMainWindow):
             "Off: the 15-bone body pose exactly as before."
         )
         layout.addWidget(self.hands_checkbox)
+        layout.addWidget(self._build_advanced_detect())
 
         self.solve_btn = QPushButton("Solve Pose")
         self.solve_btn.setAccessibleName("Solve pose")
@@ -801,6 +826,64 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.solve_btn)
 
         return group
+
+    def _build_advanced_detect(self) -> QWidget:
+        """B10: the detection and low-confidence thresholds, behind an "Advanced"
+        toggle (collapsed by default; both remembered)."""
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.advanced_toggle = QToolButton()
+        self.advanced_toggle.setText("Advanced")
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.advanced_toggle.setArrowType(Qt.RightArrow)
+        self.advanced_toggle.setAutoRaise(True)
+        outer.addWidget(self.advanced_toggle)
+        panel = QWidget()
+        grid = QGridLayout(panel)
+        grid.setContentsMargins(12, 0, 0, 0)
+        self.detection_threshold_spin = QDoubleSpinBox()
+        self.detection_threshold_spin.setRange(0.1, 0.9)
+        self.detection_threshold_spin.setSingleStep(0.05)
+        self.detection_threshold_spin.setValue(0.5)
+        self.detection_threshold_spin.setAccessibleName("Detection threshold")
+        self.detection_threshold_spin.setToolTip(
+            "How sure the person detector must be. Lower it (e.g. 0.3) when a person in a hard photo -- "
+            "small, dark, an unusual pose -- isn't found; raise it to drop doubtful detections. "
+            "Applies to the next solve."
+        )
+        grid.addWidget(QLabel("Detection threshold"), 0, 0)
+        grid.addWidget(self.detection_threshold_spin, 0, 1)
+        self.low_confidence_spin = QDoubleSpinBox()
+        self.low_confidence_spin.setRange(0.1, 0.9)
+        self.low_confidence_spin.setSingleStep(0.05)
+        self.low_confidence_spin.setValue(low_confidence_threshold())
+        self.low_confidence_spin.setAccessibleName("Low-confidence threshold")
+        self.low_confidence_spin.setToolTip(
+            "Bones whose landmarks' visibility is below this are flagged low-confidence (dashed here, "
+            "low_confidence in exports). Raise it to be warned about more bones."
+        )
+        self.low_confidence_spin.valueChanged.connect(self._on_low_confidence_changed)
+        grid.addWidget(QLabel("Low confidence below"), 1, 0)
+        grid.addWidget(self.low_confidence_spin, 1, 1)
+        panel.setVisible(False)
+        outer.addWidget(panel)
+
+        def toggle(checked: bool) -> None:
+            panel.setVisible(checked)
+            self.advanced_toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+
+        self.advanced_toggle.toggled.connect(toggle)
+        self.advanced_panel = panel
+        return container
+
+    def _on_low_confidence_changed(self, value: float) -> None:
+        set_low_confidence_threshold(value)
+        if getattr(self, "legend", None) is not None:
+            self.legend.setToolTip(self._legend_tooltip())
+        if self._people:
+            self._update_preview_for_selected_person()
 
     def _build_person_group(self) -> QGroupBox:
         group = QGroupBox("2. Select Person")
@@ -1155,6 +1238,8 @@ class MainWindow(QMainWindow):
         self.max_people_spin.setValue(int(s.value("detect/max_people", 4)))
         self.group_photo_checkbox.setChecked(str(s.value("detect/group_photo", "false")).lower() == "true")
         self.hands_checkbox.setChecked(str(s.value("detect/hands", "false")).lower() == "true")
+        self.detection_threshold_spin.setValue(float(s.value("detect/detection_threshold", 0.5)))
+        self.low_confidence_spin.setValue(float(s.value("detect/low_confidence_threshold", LOW_CONFIDENCE_THRESHOLD)))
         self.video_rotation_smoothing_spin.setValue(int(s.value("video/rotation_smoothing", DEFAULT_VIDEO_ROTATION_SMOOTHING)))
         self.backdrop_action.setChecked(str(s.value("view/backdrop", "false")).lower() == "true")
         self.auto_send_checkbox.setChecked(str(s.value("live_link/auto_send", "false")).lower() == "true")
@@ -1176,6 +1261,8 @@ class MainWindow(QMainWindow):
         s.setValue("detect/max_people", self.max_people_spin.value())
         s.setValue("detect/group_photo", "true" if self.group_photo_checkbox.isChecked() else "false")
         s.setValue("detect/hands", "true" if self.hands_checkbox.isChecked() else "false")
+        s.setValue("detect/detection_threshold", self.detection_threshold_spin.value())
+        s.setValue("detect/low_confidence_threshold", self.low_confidence_spin.value())
         s.setValue("video/rotation_smoothing", self.video_rotation_smoothing_spin.value())
         s.setValue("view/backdrop", "true" if self.backdrop_action.isChecked() else "false")
         s.setValue("live_link/auto_send", "true" if self.auto_send_checkbox.isChecked() else "false")
@@ -1447,6 +1534,7 @@ class MainWindow(QMainWindow):
             self.use_gpu_checkbox.isChecked(),
             self.group_photo_checkbox.isChecked(),
             self.hands_checkbox.isChecked(),
+            self.detection_threshold_spin.value(),
         )
         self._worker.finished_ok.connect(self._on_solve_finished)
         self._worker.failed.connect(self._on_solve_failed)
@@ -1586,7 +1674,7 @@ class MainWindow(QMainWindow):
         self._set_busy(True, f"Tracking {Path(path).name}...")
         self._video_worker = VideoSolveWorker(
             path, estimator, self.model_variant_combo.currentText(), self.use_gpu_checkbox.isChecked(),
-            self.max_people_spin.value(),
+            self.max_people_spin.value(), min_detection_confidence=self.detection_threshold_spin.value(),
         )
         self._video_worker.finished_ok.connect(self._on_video_finished)
         self._video_worker.failed.connect(self._on_video_failed)
@@ -1881,6 +1969,7 @@ class MainWindow(QMainWindow):
                     joints_2d=image_joint_positions_2d(person.image_xy, person.hands_xy),
                     confidence=bone_confidence(person.visibility, person.hand_presence),
                     selected=(i == selected_index),
+                    out_of_frame=frozenset(person.out_of_frame()),
                     label=f"Person {self._edit_key(i) + 1}",  # a video's track ID, as in the Person list
                 )
             )
@@ -1895,7 +1984,7 @@ class MainWindow(QMainWindow):
         self._queue_auto_send()
 
     def _overlay_description(self, selected_index: int, confidence: dict[str, float]) -> str:
-        low = [name for name, score in confidence.items() if score < LOW_CONFIDENCE_THRESHOLD]
+        low = [name for name, score in confidence.items() if score < low_confidence_threshold()]
         text = f"{len(self._people)} people detected; Person {selected_index + 1} selected"
         if low:
             text += f"; {len(low)} low-confidence bones: {', '.join(low)}"
@@ -2058,6 +2147,16 @@ class MainWindow(QMainWindow):
             self._photo_aspect(),
         )
 
+    def _out_of_frame_for(self, index: int) -> set[str]:
+        """Person `index`'s bones reaching outside the photo (B10), named as exported:
+        the presence rows are swapped with the mirror the way visibility is."""
+        presence = self._edited(index).landmark_presence
+        if presence is None:
+            return set()
+        if self.mirror_checkbox.isChecked():
+            presence = mirror_landmarks(presence)
+        return bones_out_of_frame(presence)
+
     def _root_for(self, index: int, rotations: dict) -> tuple[float, float]:
         """(hip_height, leg_length) in meters for person `index`'s export (B6)."""
         edited = self._edited(index)
@@ -2089,7 +2188,7 @@ class MainWindow(QMainWindow):
         try:
             save_pose_file(
                 rotations, path, source_note="Exported from PoseCraft", bone_confidence=confidence,
-                hip_height=hip_height, leg_length=leg_length,
+                hip_height=hip_height, leg_length=leg_length, out_of_frame=self._out_of_frame_for(index),
             )
         except OSError as exc:
             self._report_export_error("Export Pose JSON", path, exc)
@@ -2125,7 +2224,7 @@ class MainWindow(QMainWindow):
             try:
                 save_pose_file(
                     rotations, path, source_note="Exported from PoseCraft (batch)", bone_confidence=confidence,
-                    hip_height=hip_height, leg_length=leg_length,
+                    hip_height=hip_height, leg_length=leg_length, out_of_frame=self._out_of_frame_for(index),
                 )
             except OSError as exc:
                 self._report_export_error("Export All People", str(path), exc)
@@ -2187,6 +2286,7 @@ class MainWindow(QMainWindow):
         return build_pose_document(
             rotations, source_note="Sent live from PoseCraft", bone_confidence=confidence,
             hip_height=hip_height, leg_length=leg_length,
+            out_of_frame=self._out_of_frame_for(self.person_combo.currentIndex()),
         )
 
     def _current_animation_live_link_document(self, track: int) -> dict | None:

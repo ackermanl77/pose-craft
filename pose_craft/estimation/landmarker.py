@@ -217,6 +217,8 @@ class DetectedPerson:
     visibility: np.ndarray  # (33,) BlazePose's per-landmark visibility score, 0..1
     # "L"/"R" -> HandLandmarks, only with the "Hands and fingers" option (B11).
     hands: dict = dataclasses.field(default_factory=dict)
+    # (33,) per-landmark presence, 0..1: inside the frame (B10). None when unknown.
+    landmark_presence: np.ndarray | None = None
 
     def hand_world(self) -> dict[str, np.ndarray]:
         return {side: hand.world for side, hand in self.hands.items()}
@@ -455,6 +457,12 @@ class PoseEstimator:
     # B11, per call like group_photo: also run the hand landmark model on each
     # person's hands (needs enable_hands() first, which loads the model).
     hands: bool = False
+    # B10, per call too: a person is reported when the detector scores them at
+    # least min_detection_confidence and the landmark model's presence clears
+    # min_presence_confidence. Lower them for hard photos (small, dark, unusual
+    # poses); higher values drop doubtful detections.
+    min_detection_confidence: float = 0.5
+    min_presence_confidence: float = 0.5
 
     def __init__(
         self,
@@ -575,7 +583,7 @@ class PoseEstimator:
         see onnx_pose.BlazePose.track. Returns a PoseResult or None."""
         if self._pose is None:
             raise RuntimeError("PoseEstimator is closed")
-        return self._pose.track(image_rgb, previous, 0.5, 0.5)
+        return self._pose.track(image_rgb, previous, self.min_detection_confidence, self.min_presence_confidence)
 
     def detect(self, image_bgr: np.ndarray) -> list[DetectedPerson]:
         if self._pose is None:
@@ -584,8 +592,8 @@ class PoseEstimator:
         results = self._pose.detect(
             image_rgb,
             max_people=self.max_people,
-            min_detection_confidence=0.5,
-            min_presence_confidence=0.5,
+            min_detection_confidence=self.min_detection_confidence,
+            min_presence_confidence=self.min_presence_confidence,
             tiled=True if self.group_photo else None,
         )
         find_hands = self.hands and self._hand_model is not None
@@ -595,6 +603,7 @@ class PoseEstimator:
                 landmarks=_world_to_engine(result.world),
                 image_landmarks_xy=result.image_xy,
                 visibility=result.visibility,
+                landmark_presence=result.landmark_presence,
             )
             if find_hands:
                 self._find_hands(image_rgb, person, result)

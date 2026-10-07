@@ -332,6 +332,9 @@ class PoseResult:
     # The model's two ROI helper landmarks (hip center, body-scale point), image
     # coordinates: where to look for this person in the next video frame.
     aux_xy: np.ndarray | None = None
+    # (33,) the landmark tensor's 5th column: how likely each landmark is inside
+    # the frame (B10) -- visibility is "not occluded", this is "not cut off".
+    landmark_presence: np.ndarray | None = None
 
     def next_roi(self, image_w: int, image_h: int) -> NormRect | None:
         """MediaPipe VIDEO mode's PoseLandmarksToRoi: the next frame's crop for
@@ -702,6 +705,7 @@ class BlazePose:
         xy = raw[:, :2] / LANDMARK_INPUT_SIZE
         xy = refine_from_heatmap(xy, outputs["Identity_3"][0])
         visibility = 1.0 / (1.0 + np.exp(-raw[:, 3]))
+        landmark_presence = 1.0 / (1.0 + np.exp(-raw[:, 4]))
         world = rotate_world(outputs["Identity_4"].reshape(NUM_LANDMARKS, 3), roi.rotation)
         body = slice(0, NUM_BODY_LANDMARKS)
         aux = slice(NUM_BODY_LANDMARKS, NUM_BODY_LANDMARKS + 2)
@@ -711,6 +715,7 @@ class BlazePose:
             world=world[body].astype(np.float64),
             presence=presence,
             aux_xy=project_to_image(xy[aux], roi).astype(np.float64),
+            landmark_presence=landmark_presence[body].astype(np.float64),
         )
 
     def track(

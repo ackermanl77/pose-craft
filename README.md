@@ -79,7 +79,8 @@ python -m pose_craft.app
 Load a photo (PNG/JPEG/BMP/WebP/TIFF -- or drag it onto the window; a banner
 warns if its resolution is likely to give a worse result -- see the tips under
 the Load Photo button), optionally raise "Max people to detect" above its
-default of 4 and tick "Group photo" for a wide group shot, then click **Solve
+default of 4 and tick "Group photo" for a wide group shot (if someone in a hard
+photo isn't found, lower **Advanced > Detection threshold**), then click **Solve
 Pose** (F5). A source install downloads MediaPipe's pinned pose model to
 `~/.cache/pose_craft/models` on first run (SHA-256-checked, then converted to
 ONNX next to it -- needs network access once, with a progress bar and

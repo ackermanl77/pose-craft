@@ -56,6 +56,21 @@ ANIMATION_FORMAT_VERSION = 1
 # likely occluded/hidden in the source photo and may need manual correction,
 # the same category of case PoseForge's own docs call out.
 LOW_CONFIDENCE_THRESHOLD = 0.5
+_low_confidence_threshold = LOW_CONFIDENCE_THRESHOLD
+
+
+def low_confidence_threshold() -> float:
+    """The visibility below which a bone counts as low-confidence -- in the export,
+    the photo overlay, the 3D view and the person list alike. Defaults to
+    LOW_CONFIDENCE_THRESHOLD; the GUI's Advanced settings change it (B10)."""
+    return _low_confidence_threshold
+
+
+def set_low_confidence_threshold(value: float) -> None:
+    global _low_confidence_threshold
+    if not 0.0 <= float(value) <= 1.0:
+        raise ValueError(f"the low-confidence threshold must be within 0-1, got {value}")
+    _low_confidence_threshold = float(value)
 
 # Engine (Y-up, +X = subject's left, +Z = the way the subject faces, i.e. toward
 # the camera) -> Blender's rig convention (Z-up, .L bones on +X, the character
@@ -85,8 +100,13 @@ def build_pose_document(
     bone_confidence: dict[str, float] | None = None,
     hip_height: float | None = None,
     leg_length: float | None = None,
+    out_of_frame: set[str] | None = None,
 ) -> dict:
     """bone_rotations: bone name -> local (parent-relative) Rotation, engine frame.
+
+    out_of_frame: bones depending on a landmark outside the photo (see
+    retarget.skeleton.bones_out_of_frame), written as "out_of_frame": true (B10)
+    -- a guess for a cut-off limb, distinct from "low_confidence" (hidden).
 
     hip_height / leg_length: optional, written as the "root" entry (see the
     module docstring); see root_measurements() for computing them.
@@ -106,7 +126,9 @@ def build_pose_document(
         if bone_confidence is not None and name in bone_confidence:
             confidence = bone_confidence[name]
             entry["confidence"] = confidence
-            entry["low_confidence"] = confidence < LOW_CONFIDENCE_THRESHOLD
+            entry["low_confidence"] = confidence < low_confidence_threshold()
+        if out_of_frame and name in out_of_frame:
+            entry["out_of_frame"] = True
         bones[name] = entry
 
     document: dict[str, Any] = {
@@ -171,6 +193,7 @@ def save_pose_file(
     bone_confidence: dict[str, float] | None = None,
     hip_height: float | None = None,
     leg_length: float | None = None,
+    out_of_frame: set[str] | None = None,
 ) -> None:
     document = build_pose_document(
         bone_rotations,
@@ -178,6 +201,7 @@ def save_pose_file(
         bone_confidence=bone_confidence,
         hip_height=hip_height,
         leg_length=leg_length,
+        out_of_frame=out_of_frame,
     )
     Path(path).write_text(json.dumps(document, indent=2), encoding="utf-8")
 

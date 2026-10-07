@@ -28,7 +28,7 @@ from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QLabel
 
-from pose_craft.export.blender_pose import LOW_CONFIDENCE_THRESHOLD
+from pose_craft.export.blender_pose import low_confidence_threshold
 from pose_craft.retarget.skeleton import ALL_BONE_NAMES, FINGER_BONE_NAMES
 
 SELECTED_BONE_COLOR = QColor(77, 204, 255)  # matches viewport_3d.BONE_COLOR
@@ -61,16 +61,19 @@ class PhotoOverlayPerson:
     confidence: dict[str, float]
     selected: bool
     label: str = ""  # how the hover tooltip names this person ("Person 2"); empty: by position
+    out_of_frame: frozenset = frozenset()  # bones reaching outside the photo (B10)
 
 
-def bone_pen_style(selected: bool, confidence: float) -> tuple[QColor, float, Qt.PenStyle]:
+def bone_pen_style(selected: bool, confidence: float, out_of_frame: bool = False) -> tuple[QColor, float, Qt.PenStyle]:
     """(colour, width, line style) for one bone of the overlay: the selected
     person's bones in the bone colour, solid, or -- below
     LOW_CONFIDENCE_THRESHOLD -- in the warning colour and dashed; everyone
     else thin and dim."""
     if not selected:
         return UNSELECTED_COLOR, 1.5, Qt.SolidLine
-    if confidence < LOW_CONFIDENCE_THRESHOLD:
+    if out_of_frame:  # B10: cut off by the frame -- a guess, not just hidden
+        return SELECTED_LOW_CONFIDENCE_COLOR, 3.0, Qt.DotLine
+    if confidence < low_confidence_threshold():
         return SELECTED_LOW_CONFIDENCE_COLOR, 3.0, Qt.DashLine
     return SELECTED_BONE_COLOR, 3.0, Qt.SolidLine
 
@@ -81,6 +84,7 @@ def legend_entries() -> list[tuple[QColor, Qt.PenStyle, str]]:
     return [
         (SELECTED_BONE_COLOR, Qt.SolidLine, "Bone"),
         (SELECTED_LOW_CONFIDENCE_COLOR, Qt.DashLine, "Low confidence"),
+        (SELECTED_LOW_CONFIDENCE_COLOR, Qt.DotLine, "Out of frame"),
         (UNSELECTED_COLOR, Qt.SolidLine, "Other people"),
     ]
 
@@ -415,7 +419,7 @@ class PhotoView(QLabel):
                 continue
             head = to_widget_point(person.joints_2d[f"{name}.head"])
             tail = to_widget_point(person.joints_2d[f"{name}.tail"])
-            color, pen_width, style = bone_pen_style(person.selected, person.confidence.get(name, 1.0))
+            color, pen_width, style = bone_pen_style(person.selected, person.confidence.get(name, 1.0), name in person.out_of_frame)
             if person_index == self._hover_person and not person.selected:
                 color, pen_width = HOVER_PERSON_COLOR, max(2.5, pen_width)
             if person_index == self._hover_person and name == self._hover_bone:

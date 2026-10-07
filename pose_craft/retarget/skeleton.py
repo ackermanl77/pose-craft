@@ -393,6 +393,22 @@ def bone_confidence(visibility: np.ndarray, hand_presence: dict[str, float] | No
     return scores
 
 
+# A landmark whose presence (B10) is below this is treated as outside the frame.
+OUT_OF_FRAME_PRESENCE = 0.5
+
+
+def bones_out_of_frame(landmark_presence: np.ndarray | None, threshold: float = OUT_OF_FRAME_PRESENCE) -> set[str]:
+    """Body bones depending on a landmark MediaPipe places outside the frame (its
+    per-landmark presence below `threshold`) -- e.g. the feet of a person cut off
+    at the knees. Kept apart from bone_confidence's "low visibility", which
+    also covers joints inside the frame that are merely hidden."""
+    if landmark_presence is None:
+        return set()
+    if landmark_presence.shape != (NUM_LANDMARKS,):
+        raise ValueError(f"expected ({NUM_LANDMARKS},) presence, got {landmark_presence.shape}")
+    return {bone.name for bone in BONES if min(landmark_presence[i] for i in bone.visibility_landmarks) < threshold}
+
+
 def _swing_rotation(rest_direction: np.ndarray, current_direction: np.ndarray) -> Rotation:
     """Shortest-arc rotation that takes `rest_direction` onto `current_direction` (both unit vectors)."""
     rest = rest_direction / np.linalg.norm(rest_direction)

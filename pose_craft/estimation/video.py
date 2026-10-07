@@ -458,6 +458,7 @@ def smooth_people(
                 landmarks=world_filter(person.landmarks, t),
                 image_landmarks_xy=image_filter(person.image_landmarks_xy, t),
                 visibility=person.visibility,
+                landmark_presence=person.landmark_presence,
             )
         )
     return smoothed
@@ -608,6 +609,7 @@ def solve_video(
                         landmarks=_world_to_engine(result.world),
                         image_landmarks_xy=result.image_xy,
                         visibility=result.visibility,
+                        landmark_presence=result.landmark_presence,
                     )
                     for track_id, result in results.items()
                 }

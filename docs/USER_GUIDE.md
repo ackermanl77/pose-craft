@@ -508,6 +508,14 @@ information:
   flagged `low_confidence` in the exported JSON, drawn dashed in orange-red in the
   app's photo overlay and 3D preview, and called out by name when applied in Blender (both
   via **Load Pose JSON** and **Live Link**).
+- **Out of frame**: a bone reaching a body part MediaPipe places outside the
+  photo (feet cut off at the bottom edge, say) is drawn dotted and flagged
+  `"out_of_frame": true` in the JSON -- its pose is a guess, not merely
+  hidden. Dragging that joint into place on the photo clears the flag.
+- **Advanced** (under Hands and fingers, collapsed by default): **Detection
+  threshold** (0.5) -- lower it (to 0.3, say) when a person in a hard photo
+  isn't found, raise it to drop doubtful detections; **Low confidence below**
+  (0.5) -- the visibility under which bones are flagged. Both are remembered.
 - **Unmatched**: a PoseCraft bone name that couldn't be resolved to any bone
   on your armature, neither by your manual Bone Mapping nor by the automatic
   guess. Reported by name in Blender; fix it by adding a row for it in Bone

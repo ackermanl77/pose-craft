@@ -58,7 +58,8 @@ export/blender_pose.py -- axis-converts Y-up -> Blender Z-up, writes JSON (forma
      local + world rotation + rest direction per bone, optional "root"
      hip height / leg length); export/bvh_export.py -- single-frame or
      animated BVH, the root standing on the floor
-  -- low-confidence bones flagged "low_confidence": true
+  -- low-confidence bones flagged "low_confidence": true, bones reaching
+     outside the photo "out_of_frame": true (per-landmark presence, B10)
         |
         +---------------------------------------------+
         v  (file)                                      v  (live)

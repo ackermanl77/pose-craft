@@ -23,7 +23,7 @@ from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QVector4D
 from PySide6.QtWidgets import QLabel
 
-from pose_craft.export.blender_pose import LOW_CONFIDENCE_THRESHOLD
+from pose_craft.export.blender_pose import low_confidence_threshold
 from pose_craft.retarget.skeleton import ALL_BONE_NAMES, BONES, bone_local_euler_deg, image_to_world_scale
 
 # A hover within this many pixels of a bone's drawn segment labels it.
@@ -95,7 +95,7 @@ def _drawn_bones(joint_positions: dict[str, np.ndarray]) -> list[str]:
 
 
 def _is_low_confidence(confidence: dict[str, float] | None, bone_name: str) -> bool:
-    return confidence is not None and confidence.get(bone_name, 1.0) < LOW_CONFIDENCE_THRESHOLD
+    return confidence is not None and confidence.get(bone_name, 1.0) < low_confidence_threshold()
 
 
 def _bone_line_colors(confidence: dict[str, float] | None) -> np.ndarray | tuple[float, float, float, float]:
