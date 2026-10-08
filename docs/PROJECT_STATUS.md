@@ -268,7 +268,7 @@ $env:QT_QPA_PLATFORM = "offscreen"
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-**Current count (2026-10-07, after the lower-priority round): 423 passed, 8
+**Current count (2026-10-07, after the installer): 428 passed, 8
 skipped** in about 30 s; `ruff check` and `mypy` clean. The eight skips are the
 LiteRT reference test, the real-photo golden test (no photos committed), the
 four opt-in GPU parity tests (`POSECRAFT_GPU_TESTS=1`) and the two opt-in
@@ -1173,9 +1173,10 @@ Ranked roughly by how much they affect whether an exported pose is usable:
   works (checked with a self-signed test certificate), but until it runs with a
   real certificate SmartScreen flags the app as unrecognized on other machines.
 - **The release workflow has never run** (`.github/workflows/release.yml`;
-  no tag has been pushed), and no local build has bundled the hand model yet
-  (the 2026-10-01 builds predate it): run the workflow once (a manual
-  `workflow_dispatch`) and launch each zip before trusting it. No
+  no tag has been pushed): run it once (a manual `workflow_dispatch`) and launch
+  each zip before trusting it. The local DirectML build of 2026-10-07 bundles all
+  five models, the hand model included (checked with the release workflow's
+  bundled-model smoke test). No
   headless-Blender job runs in CI (no Blender on the runners); the opt-in
   `tests/test_real_blender.py` is the local equivalent (T4).
 - **Fingers are unverified on real photos (B11).** The hand pass follows

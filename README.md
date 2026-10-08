@@ -189,7 +189,7 @@ $env:QT_QPA_PLATFORM = "offscreen"
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-Last run 2026-10-07: **423 passed, 8 skipped** (the skips: the LiteRT
+Last run 2026-10-07: **428 passed, 8 skipped** (the skips: the LiteRT
 reference test, the real-photo golden test, four opt-in GPU parity tests, the
 opt-in real-Blender test and the opt-in real-Blender extension install) -- re-run it rather than trusting this number.
 
