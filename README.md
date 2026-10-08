@@ -171,7 +171,8 @@ folder -- measured on 2026-10-01 (Python 3.14, PyInstaller 6.22.3): DirectML
 the `.exe`. With `build/models` present the converter (onnx/tflite) is left
 out of the build. `.github/workflows/release.yml` does all of this for the
 DirectML and CPU flavours on a `v*` tag (or a manual run), zips them with the
-Blender add-on and writes `SHA256SUMS` -- it hasn't been run yet. See `docs/PROJECT_STATUS.md`'s "Release" section for why onedir
+Blender add-on and writes `SHA256SUMS` -- it hasn't been run yet (waiting
+for GitHub's artifact storage quota to reset). See `docs/PROJECT_STATUS.md`'s "Release" section for why onedir
 was chosen over `--onefile`. Re-run `python scripts/generate_icon.py` first if
 you've changed `assets/icon.png`/`assets/icon.ico`.
 
@@ -182,9 +183,9 @@ $env:QT_QPA_PLATFORM = "offscreen"
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-Last run 2026-10-03: **402 passed, 7 skipped** (the skips: the LiteRT
-reference test, the real-photo golden test, four opt-in GPU parity tests and
-the opt-in real-Blender test) -- re-run it rather than trusting this number.
+Last run 2026-10-07: **423 passed, 8 skipped** (the skips: the LiteRT
+reference test, the real-photo golden test, four opt-in GPU parity tests, the
+opt-in real-Blender test and the opt-in real-Blender extension install) -- re-run it rather than trusting this number.
 
 Needs `requirements-test.txt` (numpy/scipy/opencv-python-headless/pytest plus
 CPU onnxruntime/onnx/tflite, not the Qt stack or the GPU runtime) -- covers the

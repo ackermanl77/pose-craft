@@ -256,11 +256,13 @@ $env:QT_QPA_PLATFORM = "offscreen"
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-**Current count (2026-10-03, after the real-Blender check): 402 passed, 7
-skipped** in about 18 s. The seven skips are the LiteRT reference test, the
-real-photo golden test (no photos committed), the four opt-in GPU parity
-tests (`POSECRAFT_GPU_TESTS=1`) and the opt-in real-Blender test
-(`POSECRAFT_BLENDER`). Earlier counts: 298/6 after the P2 round
+**Current count (2026-10-07, after the lower-priority round): 423 passed, 8
+skipped** in about 30 s; `ruff check` and `mypy` clean. The eight skips are the
+LiteRT reference test, the real-photo golden test (no photos committed), the
+four opt-in GPU parity tests (`POSECRAFT_GPU_TESTS=1`) and the two opt-in
+real-Blender tests (`POSECRAFT_BLENDER`: the Live Link/rig check and the
+extension install). Earlier counts: 402/7 after the real-Blender check
+(2026-10-03), 298/6 after the P2 round
 (2026-09-30), 357/6 after the "important items" round (2026-10-02), 401/6
 after the video/Live Link round (2026-10-03).
 
@@ -403,6 +405,32 @@ checked" above as weaker evidence than an automated test -- it was true at the
 time each check ran, not guaranteed to stay true as the code changes.
 
 ## Recently Fixed
+
+- **Lower-priority round (2026-10-07): B10, B13, P5, R4, C3, T6, K6, signing.**
+  - **B10** the landmark tensor's presence column rides on
+    `PoseResult`/`DetectedPerson`; bones reaching a landmark outside the photo
+    are drawn dotted and flagged `out_of_frame` in JSON/Live Link, apart from
+    `low_confidence` (checked on a real head-and-shoulders portrait). An
+    Advanced toggle sets the detection and low-confidence thresholds, both
+    remembered.
+  - **B13** folder batch processing: `pose_craft/batch.py`, `python -m
+    pose_craft.cli --input DIR --output DIR [--format json|bvh] [--mirror]
+    [--model] [--cpu] [--hands] [--group-photo] [--detection-threshold]`, and
+    File > Batch Process Folder with progress and Cancel. The export logic
+    moved to the Qt-free `pose_craft/posing.py`, so both match Export All People.
+  - **P5** the runtime cache stores the byte-identical detector once by content
+    hash; BlazePose shares one detector session per file and device.
+  - **R4** Help > Diagnostics (versions, ONNX Runtime providers, DirectX 12
+    GPUs, the model's device and fallback reason, the log file; Copy) and
+    Help > About; the GPU-fallback reason stays in the status bar's tooltip.
+  - **C3/T6** `pyproject.toml` (pytest/ruff/mypy config), ruff and mypy in a CI
+    lint job, and a `windows-latest` job running the whole suite offscreen with
+    PySide6 and coverage.
+  - **K6** `blender_manifest.toml` ships in the add-on zip built by
+    `scripts/build_addon_zip.py`: one zip for Blender 4.2+ extensions and
+    3.6-4.1 legacy installs (installed and enabled in a real Blender 5.2).
+  - **Signing** `scripts/sign_build.py` Authenticode-signs
+    `dist/PoseCraft/PoseCraft.exe` (see "Release").
 
 - **Real-Blender check (2026-10-03): B5, B12, T4.** The add-on ran headless
   in Blender 5.2.2 against a PoseCraft-shaped rig, a Mixamo-style rig, a
@@ -1129,8 +1157,9 @@ Ranked roughly by how much they affect whether an exported pose is usable:
   became 36 keyed frames in the real-Blender check, while the reply's
   `animation_frames` still counts 45. The timing is right; set the scene to
   the clip's frame rate to keep every frame.
-- **No code signing** on the built `.exe` -- expect SmartScreen to flag it as
-  unrecognized on a machine other than the one it was built on.
+- **No trusted code signing** on the built `.exe` -- `scripts/sign_build.py`
+  works (checked with a self-signed test certificate), but until it runs with a
+  real certificate SmartScreen flags the app as unrecognized on other machines.
 - **The release workflow has never run** (`.github/workflows/release.yml`;
   no tag has been pushed), and no local build has bundled the hand model yet
   (the 2026-10-01 builds predate it): run the workflow once (a manual
