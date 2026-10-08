@@ -165,13 +165,19 @@ To Authenticode-sign the result: `set CODESIGN_THUMBPRINT=<SHA-1 thumbprint>` (a
 code-signing certificate in the Windows store), then `python scripts/sign_build.py`
 (signtool from the Windows SDK, timestamped by `CODESIGN_TIMESTAMP_URL`, default DigiCert).
 
+A per-user installer (no admin rights; `%LOCALAPPDATA%\Programs\PoseCraft`, Start-menu
+shortcut, optional desktop shortcut, uninstaller that offers to delete your settings and logs):
+`python scripts/build_installer.py [--flavor dml|cpu|cuda] [--sign]` with Inno Setup 6
+installed writes `dist/installer/PoseCraft-<version>-<flavor>-setup.exe`; `--sign` signs the
+exe, the installer and the uninstaller with the `CODESIGN_THUMBPRINT` certificate.
+
 Produces `dist/PoseCraft/PoseCraft.exe` plus its `_internal/` dependency
 folder -- measured on 2026-10-01 (Python 3.14, PyInstaller 6.22.3): DirectML
 508 MB, CPU 472 MB, CUDA 1.73 GB -- ship the whole `dist/PoseCraft/` folder, not just
 the `.exe`. With `build/models` present the converter (onnx/tflite) is left
 out of the build. `.github/workflows/release.yml` does all of this for the
-DirectML and CPU flavours on a `v*` tag (or a manual run), zips them with the
-Blender add-on and writes `SHA256SUMS` -- it hasn't been run yet (waiting
+DirectML and CPU flavours on a `v*` tag (or a manual run), zips them and builds
+their installers, adds the Blender add-on and writes `SHA256SUMS` -- it hasn't been run yet (waiting
 for GitHub's artifact storage quota to reset). See `docs/PROJECT_STATUS.md`'s "Release" section for why onedir
 was chosen over `--onefile`. Re-run `python scripts/generate_icon.py` first if
 you've changed `assets/icon.png`/`assets/icon.ico`.

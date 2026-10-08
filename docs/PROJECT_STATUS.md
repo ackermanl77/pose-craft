@@ -228,8 +228,20 @@ so much bigger than the old ~480 MB one; a build from a venv without
 `requirements-gpu.txt` leaves them out and runs CPU-only -- plus `assets/icon.png`+`assets/icon.ico`
 bundled as `datas` so `app.py` can set the window icon at runtime via
 `sys._MEIPASS`). `dist/` and `build/` are gitignored -- distribute the built
-folder directly (zip it, or wrap it in an installer) rather than committing
-it. Release builds aren't code-signed yet: expect SmartScreen to flag them as unrecognized on a
+folder directly (zip it, or install it with the installer below) rather than committing
+it.
+
+**Installer** (`installer/PoseCraft.iss`, built by `scripts/build_installer.py
+[--flavor dml|cpu|cuda] [--sign]` with Inno Setup 6): per user, no admin rights,
+`%LOCALAPPDATA%\Programs\PoseCraft`, a Start-menu shortcut and an optional desktop one; an
+upgrade closes a running PoseCraft and replaces `_internal\` wholesale; the uninstaller offers to
+delete the settings (`%APPDATA%\PoseCraft`) and logs (`%LOCALAPPDATA%\PoseCraft`), and a
+`/SUPPRESSMSGBOXES` silent uninstall keeps them. `--sign` signs the exe, the installer and its
+uninstaller. Checked on 2026-10-07 with the DirectML build: compiled (162 MB), silently installed
+(832 files, uninstall entry, Start-menu shortcut), the installed app started, and a silent
+uninstall removed the folder, shortcut and entry. Installing into a folder whose path is already
+~150 characters long fails on numpy's deepest file (Windows' 260-character path limit); the
+default location is far below it. Release builds aren't code-signed yet: expect SmartScreen to flag them as unrecognized on a
 machine other than the one they were built on. `scripts/sign_build.py` signs `dist/PoseCraft/PoseCraft.exe`
 with the certificate in `CODESIGN_THUMBPRINT` (checked with a self-signed test certificate,
 2026-10-07); a trusted certificate is what removes the warning.
@@ -243,8 +255,8 @@ CPU onnxruntime, onnx and tflite) for CI.
 throwaway venv and confirming the same pass/skip counts CI would see. There is
 also `.github/workflows/release.yml` (a `v*` tag or a manual run): it builds
 the DirectML and CPU flavours on `windows-latest` (tests, pre-converted
-models, PyInstaller, a bundled-model check), zips each, zips the Blender
-add-on, writes `SHA256SUMS` and publishes a GitHub Release for a tag. It has
+models, PyInstaller, a bundled-model check), zips each and builds its installer,
+zips the Blender add-on, writes `SHA256SUMS` and publishes a GitHub Release for a tag. It has
 not been run yet. `requirements.txt` now uses `opencv-python-headless` (the
 app never used OpenCV's GUI or contrib modules; the headless wheel still has
 the FFmpeg video reader the video path needs).

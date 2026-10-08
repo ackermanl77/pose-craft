@@ -90,10 +90,22 @@ jobs:
           $version = python -c "import pose_craft; print(pose_craft.__version__)"
           Compress-Archive -Path dist/PoseCraft -DestinationPath "PoseCraft-$version-${{ matrix.flavor }}-win64.zip"
 
+      # The per-user installer (installer/PoseCraft.iss) next to the zip.
+      - name: Installer
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue) -and -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --no-progress -y
+          }
+          python scripts/build_installer.py --flavor ${{ matrix.flavor }}
+          Move-Item dist/installer/PoseCraft-*-setup.exe .
+
       - uses: actions/upload-artifact@v4
         with:
           name: PoseCraft-${{ matrix.flavor }}
-          path: PoseCraft-*-win64.zip
+          path: |
+            PoseCraft-*-win64.zip
+            PoseCraft-*-setup.exe
           if-no-files-found: error
 
   addon:
@@ -121,7 +133,7 @@ jobs:
 
       - name: Checksums
         working-directory: artifacts
-        run: sha256sum *.zip > SHA256SUMS && cat SHA256SUMS
+        run: sha256sum *.zip *.exe > SHA256SUMS && cat SHA256SUMS
 
       - uses: actions/upload-artifact@v4
         with:
@@ -134,7 +146,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" *.zip SHA256SUMS \
+          gh release create "${{ github.ref_name }}" *.zip *.exe SHA256SUMS \
             --repo "${{ github.repository }}" \
             --title "PoseCraft ${{ github.ref_name }}" \
             --generate-notes
