@@ -12,7 +12,8 @@ the Live Link.
 - MVP stage: the full pipeline (photo or video -> pose estimation
   (MediaPipe's BlazePose models, plus the optional hand model, on ONNX
   Runtime -- DirectML or CUDA on a GPU, else the CPU) -> bone retargeting ->
-  JSON/BVH export or the live Blender link -> Blender add-on 0.7.1) is
+  JSON/BVH export or the live Blender link -> Blender add-on 0.8.0, or a DAZ
+  Studio pose preset for Genesis 9) is
   implemented, and all three build flavours build and launch. The add-on has
   been run headless in a real Blender 5.2.2 (PoseCraft-shaped, Mixamo-style
   and generated Rigify rigs, the BVH importer, a real Live Link server); its
@@ -105,6 +106,9 @@ bone, joint or person under the mouse (highlighted, named in a tooltip). In the 
 rotation and confidence; **View > Photo Backdrop** puts the photo behind the
 skeleton. From there:
 
+- **Export DAZ Pose (Genesis 9)...** -- a DAZ Studio `.duf` pose preset for
+  Genesis 9, computed from the figure installed in your DAZ content library
+  (see the user guide), or
 - **Export Pose JSON** / **Export BVH** / **Export All People...** /
   **Export All People (BVH)...** (one file per detected person, to a folder
   you choose, named after the photo, asking before overwriting; the
@@ -112,8 +116,8 @@ skeleton. From there:
   it applies to a single person; the BVH stands on the floor), or
 - **File > Batch Process Folder...** -- every photo in a folder, solved
   with the current detection settings, one `<photo>_person<N>.json` (or
-  `.bvh`) per person, with a progress bar and Cancel. Without the GUI:
-  `python -m pose_craft.cli --input photos --output poses [--format bvh]
+  `.bvh`, `.duf`) per person, with a progress bar and Cancel. Without the GUI:
+  `python -m pose_craft.cli --input photos --output poses [--format bvh|duf]
   [--mirror] [--model lite|full|heavy] [--cpu] [--hands] [--group-photo]
   [--detection-threshold 0.3]` (from a source install), or
 - **Send to Blender (Live Link)** -- needs Blender running with the add-on's
@@ -122,8 +126,9 @@ skeleton. From there:
   already in use. **Auto-send on change** (off by default, remembered)
   re-sends the shown pose a short debounce after each change and pauses itself
   if Blender can't be reached. For a video, **Send Animation to Blender** keys
-  the selected person's whole track on the rig (add-on 0.7.0+; long clips go
-  in chunks under the add-on's 256 KB message cap).
+  the selected person's whole track on the rig, resampled to the scene's frame
+  rate and moving with the person's steps (add-on 0.8.0; long clips go in
+  chunks under the add-on's 256 KB message cap).
 
 Inside Blender, install the add-on zip (the release's `posecraft-blender-addon-<version>.zip`,
 or build it with `python scripts/build_addon_zip.py`): on Blender 4.2+ it is an

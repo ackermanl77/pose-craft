@@ -1,0 +1,27 @@
+// Load Genesis 9, apply a pose preset, dump every bone's world rotation and channel values.
+// Args (App.scriptArgs): [0] pose .duf, [1] output .json, [2] figure .duf
+var args = App.scriptArgs;
+function q(rot) { return [rot.w, rot.x, rot.y, rot.z]; }
+App.getContentMgr().openFile(args[2], true);
+var fig = null;
+for (var i = 0; i < Scene.getNumNodes(); i++) {
+    var n = Scene.getNode(i);
+    if (n.inherits("DzSkeleton")) { fig = n; break; }
+}
+Scene.setPrimarySelection(fig);
+App.getContentMgr().openFile(args[0], true);
+var bones = fig.getAllBones();
+var result = {};
+for (var b = 0; b < bones.length; b++) {
+    var bone = bones[b];
+    result[bone.getName()] = {
+        ws_rot: q(bone.getWSRot()),
+        channels: [bone.getXRotControl().getValue(), bone.getYRotControl().getValue(), bone.getZRotControl().getValue()]
+    };
+}
+var hip = fig.findBone("hip");
+var out = new DzFile(args[1]);
+out.open(DzFile.WriteOnly);
+out.write(JSON.stringify({ bones: result, hip_y: hip.getYPosControl().getValue() }));
+out.close();
+App.delayedExit();

@@ -16,7 +16,7 @@ from pose_craft.imaging import imread_unicode
 from pose_craft.posing import default_export_name, document_inputs, edited_person, out_of_frame_bones, root_for
 
 PHOTO_SUFFIXES = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
-FORMATS = ("json", "bvh")
+FORMATS = ("json", "bvh", "duf")  # duf: a DAZ Studio pose preset for Genesis 9 (export/daz_pose.py)
 
 
 @dataclasses.dataclass
@@ -65,6 +65,11 @@ def solve_folder(
     its outcome and skipped; `overwrite=False` leaves existing files alone."""
     if fmt not in FORMATS:
         raise ValueError(f"format must be one of {', '.join(FORMATS)}, got {fmt!r}")
+    figure = None
+    if fmt == "duf":
+        from pose_craft.export.daz_pose import load_daz_figure
+
+        figure = load_daz_figure()  # DazFigureNotFound before any photo is solved
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     photos = photos_in(Path(input_dir))
@@ -94,6 +99,11 @@ def solve_folder(
             try:
                 if fmt == "bvh":
                     save_bvh_file(rotations, target, root_position=floor_root_position(rotations))
+                elif fmt == "duf":
+                    from pose_craft.export.daz_pose import save_daz_pose_file
+
+                    hip_height, leg_length = root_for(edited_person(person, None, aspect), mirror, rotations)
+                    save_daz_pose_file(rotations, target, figure, hip_height=hip_height, leg_length=leg_length)
                 else:
                     edited = edited_person(person, None, aspect)
                     hip_height, leg_length = root_for(edited, mirror, rotations)

@@ -264,16 +264,19 @@ The preview, both BVH exports, Live Link and Send Animation all use it; 0%
 keeps every frame exactly as solved.
 
 **Send Animation to Blender** sends the selected person's whole track over
-Live Link: Blender keys every solved frame on the target rig, starting at
-Blender's current frame and spaced at the clip's timing in the scene's frame
-rate (a 30 fps clip in a 24 fps scene keeps its length). Frames where the
-person was lost get no key. Each frame goes through the same bone mapping,
+Live Link: Blender keys the person's track on the target rig, starting at
+Blender's current frame, resampled to the scene's frame rate -- every scene
+frame gets one key, the pose at that moment of the clip, blended from the
+frames around it (a 30 fps clip in a 24 fps scene keeps its length and no
+frame is keyed twice). Frames where the person was lost get no key. With the
+add-on's **Root motion (animations)** option (on by default) the rig also
+travels with the person -- planted feet drive it, scaled to the rig's leg
+length; **Keep feet on the floor** still sets the height. Each frame goes through the same bone mapping,
 rest-pose matching and Rigify handling as a single pose, and the whole
 animation is one undo step in Blender. Long clips are sent in several parts
 (at most 30 frames and about 200 KB each); the status bar says how many
 frames were keyed and on which Blender frames. Needs add-on 0.7.0 or newer --
-an older one replies "update the add-on". Root motion isn't sent: use the
-add-on's **Keep feet on the floor** for height, or the BVH for walking motion.
+an older one replies "update the add-on"; resampling and root motion need 0.8.0.
 
 ## 4. Export
 
@@ -293,6 +296,16 @@ the person, like `IMG_0042_person2.json`.
   choose -- useful for a group photo where you want every person's pose. It
   asks before overwriting files that are already there. Respects the
   Mirror checkbox for everyone, the same as single-person export.
+- **Export DAZ Pose (Genesis 9)...** saves the selected person as a DAZ Studio
+  pose preset (`.duf`) for **Genesis 9**: in DAZ Studio, select a Genesis 9
+  figure and load the file (double-click it in the Content Library, or File >
+  Merge). It sets every bone, like DAZ's own presets, and lowers the hip for a
+  crouch. PoseCraft reads the figure's joints from your DAZ content library
+  (`data/DAZ 3D/Genesis 9/Base/Genesis9.dsf`, found in DAZ Studio's default
+  library folders, or set `POSECRAFT_DAZ_LIBRARY`), so Genesis 9 must be
+  installed. Genesis 9's A-pose arms are handled; DAZ's joint limits still
+  apply, and the status bar names any bone the pose pushes past them (DAZ
+  stops it at the limit). Genesis 8 isn't supported yet. Batch: `--format duf`.
 - **Export BVH...** (**Ctrl+Shift+S**) saves the selected person as a single-frame `.bvh` file
   (Y up, facing +Z), for tools that read BVH rather than PoseCraft's JSON. The
   skeleton stands on the floor (Y = 0), so a crouch comes out lowered.
@@ -406,7 +419,7 @@ screen reader). **File > Open Recent** lists the last eight photos and videos.
    4.2 and later: the **v** menu at the top right > **Install from Disk...**),
    pick `pose_craft/export/blender_addon/import_pose.py` (or the
    `posecraft-blender-addon-<version>.zip` from a release), and enable
-   "PoseCraft Pose Importer". The current add-on is version 0.7.1 (Blender
+   "PoseCraft Pose Importer". The current add-on is version 0.8.0 (Blender
    3.6 or newer; checked in Blender 5.2.2). After updating PoseCraft, install
    the matching add-on too -- **Send Animation to Blender** needs 0.7.0 or
    newer.
@@ -548,18 +561,16 @@ Worth knowing before you rely on an exported pose:
 - **Video identities can still swap** when two similarly dressed people
   cross closely or one is hidden for more than about a second (appearance only
   helps re-identify someone after they were lost, not while two people
-  overlap); the root moves horizontally only through planted feet, and Send
-  Animation sends rotations only.
+  overlap); the root moves horizontally only through planted feet (a jump or
+  a slide doesn't travel).
 - **The Blender add-on** has been checked in Blender 5.2.2 on a few rigs
   (PoseCraft's own shape, a Mixamo-style rig, a freshly generated Rigify
   Human rig) and with Live Link, but not against every possible rig or
   Blender version -- if something looks off, the Bone Mapping panel is
   exactly the tool for fixing bone-name mismatches by hand.
-- **Sending a 30 fps clip into a 24 fps scene** keys a few clip frames onto
-  the same Blender frame (the later one wins); the timing stays right. Set
-  the scene to the clip's frame rate to keep every frame.
-- **DAZ Studio isn't a supported export target** -- PoseCraft only exports to
-  Blender.
+- **DAZ Studio export is Genesis 9 only** and needs Genesis 9 installed in
+  your DAZ content library; DAZ drives the twist bones itself, and a pose past
+  Genesis 9's joint limits stops at the limit.
 - The packaged `.exe` isn't code-signed, so expect a Windows SmartScreen
   warning on a machine other than the one it was built on.
 

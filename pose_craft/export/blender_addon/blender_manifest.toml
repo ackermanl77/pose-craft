@@ -5,7 +5,7 @@
 schema_version = "1.0.0"
 
 id = "posecraft"
-version = "0.7.1"
+version = "0.8.0"
 name = "PoseCraft Pose Importer"
 tagline = "Apply PoseCraft pose exports and Live Link poses to an armature"
 maintainer = "PoseCraft"

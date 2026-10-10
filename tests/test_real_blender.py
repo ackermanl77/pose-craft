@@ -78,6 +78,11 @@ def _write_inputs(work: Path) -> dict:
     indices = list(range(20)) + list(range(22, 47))
     frames = [(i + 5, {n: Rotation.from_rotvec(r.as_rotvec() * i / 46) for n, r in body.items()}) for i in indices]
     (work / "anim.json").write_text(json.dumps(blender_pose.build_animation_document(frames, 30.0)))
+    # 45 consecutive 30 fps frames walking 2 cm per frame along the subject's facing direction
+    # (engine -z), for a 24 fps scene with root motion on (add-on 0.8.0).
+    walk = [(i, body) for i in range(45)]
+    roots = [(0.0, 90.0, -2.0 * i) for i in range(45)]
+    (work / "anim24.json").write_text(json.dumps(blender_pose.build_animation_document(walk, 30.0, root_positions_cm=roots)))
     return {"root_height_m": root[1] / 100.0, "anim_frames": len(frames)}
 
 
@@ -141,6 +146,12 @@ def test_the_addon_in_a_real_blender(tmp_path):
     assert live["anim_err"] < TOLERANCE_DEG
     assert live["keys_after_one_undo"] == 0  # both chunks are one undo step
     assert live["timer_while_running"]
+    resampled = results["resampled"]
+    assert resampled["reply"]["ok"] and resampled["reply"]["animation_frames"] == 36
+    assert resampled["key_frames"] == [1.0, 36.0, 36]  # 45 frames at 30 fps = 36 scene frames, each keyed once
+    # Root motion: clip time at frame 36 = 35/24 s = 43.75 clip frames = 87.5 cm, on a rig of the same
+    # proportions (scale 1:100) -> 0.875 m along Blender +Y.
+    assert resampled["travel"] == pytest.approx([0.0, 0.875, 0.0], abs=2e-3)
     assert results["unregistered"] == {"classes_gone": True, "port_freed": True, "timer_gone": True}
 
 

@@ -71,7 +71,7 @@ pose_craft_pose .json file            export/live_link.py: length-prefixed
         |                              a "pose_craft_animation" document, v1, in
         |                              chunks of <= 30 frames / 200 KB)
         v                                              |
-export/blender_addon/import_pose.py (installed inside Blender; add-on 0.7.1,
+export/blender_addon/import_pose.py (installed inside Blender; add-on 0.8.0,
   bl_info minimum Blender 3.6, verified in Blender 5.2.2)
   -- Load Pose JSON operator, or a Live Link server (bpy.app.timers-polled,
      fully non-blocking: accept and incremental reads with a 2 s per-message
@@ -417,6 +417,32 @@ checked" above as weaker evidence than an automated test -- it was true at the
 time each check ran, not guaranteed to stay true as the code changes.
 
 ## Recently Fixed
+
+- **2026-10-09: animation resampling, root motion, DAZ Studio export.**
+  - **Frame-rate resampling (add-on 0.8.0).** `resample_animation()` keys every
+    Blender frame the clip covers once, with the pose at that moment blended
+    (slerp, `interpolate_pose_documents()`) from the solved frames around it;
+    the add-on keeps the previous chunk's last frame so the blend crosses chunk
+    boundaries. A 30 fps clip in a 24 fps scene: 45 clip frames -> 36 keys, none
+    twice (checked in Blender 5.2.2), and the reply's `animation_frames` now
+    counts keyed frames.
+  - **Root motion.** `build_animation_document(root_positions_cm=...)` adds each
+    frame's horizontal travel (Blender axes, from the foot-locked root) and
+    `root_leg_length`; the add-on's "Root motion (animations)" option (default
+    on) moves the root bone by it, scaled to the rig's thigh + shin length, and
+    keys its location. Checked in Blender: a 2 cm/frame walk moved the rig 0.875 m
+    by frame 36, as computed.
+  - **DAZ Studio export (`export/daz_pose.py`).** A Genesis 9 pose preset
+    (`.duf`), from the figure read out of the user's DAZ content library (no DAZ
+    data in the repository): GUI File > Export DAZ Pose, batch/CLI `--format
+    duf`. The joint convention was measured in DAZ Studio 6.25 run headless: a
+    bone's rotation is O * E * O^-1 (O its orientation as extrinsic XYZ, E the
+    channels extrinsic in its rotation order), rest world rotations are the
+    identity, and DAZ Script's quaternions read back conjugated. Limbs are aimed
+    across Genesis 9's A-pose; channels are solved parents first within the joint
+    limits so a child makes up for a locked parent axis (the forearm's Z). The
+    opt-in `tests/test_real_daz.py` (POSECRAFT_DAZ) applies a preset in DAZ and
+    finds every posed bone within 0.01 degrees, the hip height within 1 mm.
 
 - **Lower-priority round (2026-10-07): B10, B13, P5, R4, C3, T6, K6, signing.**
   - **B10** the landmark tensor's presence column rides on
@@ -1163,12 +1189,6 @@ Ranked roughly by how much they affect whether an exported pose is usable:
   unmatched-bone warning after a first import on any other rig, and use
   Bone Mapping to fix a mismatch. A v1 add-on rejects v2 files ("update the
   add-on"), by design.
-- **An animation into a scene with a lower frame rate keys some frames
-  twice.** A 30 fps clip in a 24 fps scene maps several clip frames onto
-  the same Blender frame (rounding), and the later one wins: 45 clip frames
-  became 36 keyed frames in the real-Blender check, while the reply's
-  `animation_frames` still counts 45. The timing is right; set the scene to
-  the clip's frame rate to keep every frame.
 - **No trusted code signing** on the built `.exe` -- `scripts/sign_build.py`
   works (checked with a self-signed test certificate), but until it runs with a
   real certificate SmartScreen flags the app as unrecognized on other machines.
@@ -1189,20 +1209,16 @@ Ranked roughly by how much they affect whether an exported pose is usable:
   histogram, so two similarly dressed people crossing closely can still
   swap IDs (appearance isn't used while two tracks overlap), and someone gone
   for over 30 frames comes back as a new person. The root's horizontal motion
-  comes only from planted feet (a jump or a slide has none), and Send
-  Animation to Blender sends rotations only (no root motion). Tested on
+  comes only from planted feet (a jump or a slide has none), and that is
+  also all Send Animation's root motion carries (no vertical travel: "Keep
+  feet on the floor" sets the height). Tested on
   scripted scenes, not real footage.
-- **No DAZ Studio export target -- deliberately not started, not just missing.**
-  PoseCraft only exports to Blender; the original PoseForge this project is
-  inspired by targets DAZ Studio directly. Investigated adding a `.duf` export
-  alongside the Blender one: DAZ's DSON format is JSON-based (not a proprietary
-  binary format), so it's not structurally out of reach, but it's a
-  meaningfully bigger scope than either export/blender_pose.py's flat
-  quaternion-per-bone JSON: DSON models a full asset graph (channels, ERC
-  links, morphs), and Genesis 8 vs Genesis 8.1 vs Genesis 9 use different bone
-  names, which is exactly the problem a paid third-party DAZ asset ("Bone
-  Minion") exists solely to solve within DAZ's own ecosystem, and the same
-  reason PoseForge itself has a "pick your generation" control rather than one
-  fixed bone mapping. Revisit this as a real feature addition (with its own
-  bone-name table per Genesis generation and its own test coverage), not as an
-  extension of the existing Blender exporter.
+- **The DAZ Studio export is Genesis 9 only.** It needs Genesis 9 installed
+  (its joints are read from the user's own `Genesis9.dsf`); Genesis 8/8.1 would
+  need their own bone map and rest handling (Bend/Twist pairs), not just a
+  table. The torso is one PoseCraft bone, so Genesis 9's pelvis, spine1-4,
+  collars and neck2 stay at rest (the hip carries the torso's rotation); twist
+  bones and metatarsals are left to DAZ's own formulas. A pose past Genesis 9's
+  joint limits is clamped by DAZ (the export names those bones). Verified in
+  DAZ Studio 6.25 headless on one stock Genesis 9 -- not with morphed
+  characters (whose joints move) or by eye in the viewport.

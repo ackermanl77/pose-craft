@@ -93,11 +93,17 @@ ordinary pose document per solved video frame plus the clip's fps. Every
 frame goes through the same retarget path as a single pose (bone mapping,
 Match rig rest pose, Rigify controls, Keep feet on the floor) and is keyed
 into the armature's action, whatever "Insert keyframes" says; the first
-frame lands on Blender's current frame and the rest are spaced at the clip's
-fps converted to the scene's fps, so a 30 fps clip in a 24 fps scene keeps
-its timing. Frames the tracker lost get no key (Blender interpolates over
-the gap), quaternion keys are kept in one hemisphere so they don't spin the
-long way, and the current frame is restored afterwards. Long clips arrive in
+frame lands on Blender's current frame. The clip is resampled to the scene's
+frame rate (add-on 0.8.0): every Blender frame the clip covers gets one key,
+the pose at that exact moment of the clip, blended (slerp) from the two
+solved frames around it -- so a 30 fps clip in a 24 fps scene keeps its
+timing without keying any frame twice, and a 24 fps clip in a 60 fps scene
+gets a key on every frame. A frame inside a stretch the tracker lost gets
+no key (Blender interpolates over the gap), quaternion keys are kept in one
+hemisphere so they don't spin the long way, and the current frame is
+restored afterwards. With "Root motion" on, the app's per-frame root travel
+(from planted feet) moves the rig's root bone, scaled from the subject's leg
+length to the rig's; "Keep feet on the floor" still sets the height. Long clips arrive in
 several requests ("chunks", each under MAX_LIVE_LINK_PAYLOAD_BYTES and at
 most a few dozen frames, so no single timer tick blocks Blender for long);
 the whole animation is one undo step, pushed after the last chunk.
@@ -129,7 +135,7 @@ from mathutils import Quaternion, Vector
 bl_info = {
     "name": "PoseCraft Pose Importer",
     "author": "PoseCraft",
-    "version": (0, 7, 1),
+    "version": (0, 8, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > PoseCraft",
     "description": "Applies a PoseCraft .json pose export (file or Live Link) to an armature's pose bones",
@@ -826,7 +832,9 @@ def parse_animation_document(document) -> dict:
     "first_frame_index", "start_frame", "chunk_index", "chunk_count"}.
 
     frames: the clip's solved frames, frame_index strictly increasing (gaps are
-    frames the tracker lost). first_frame_index: the clip frame that lands on
+    frames the tracker lost). root_offsets / root_leg_length: the optional
+    root motion (each frame's travel from the clip's first frame, in Blender
+    axes, and the leg length it was measured with). first_frame_index: the clip frame that lands on
     start_frame -- the first frame of the WHOLE animation, so every chunk is
     spaced from the same anchor. start_frame: None on the first chunk (the
     add-on uses Blender's current frame and replies with it); later chunks
@@ -846,6 +854,7 @@ def parse_animation_document(document) -> dict:
     if not isinstance(frames, list) or not frames:
         raise ValueError("Malformed animation: 'frames' must be a non-empty list")
     parsed = []
+    root_offsets = {}
     for position, entry in enumerate(frames):
         if not isinstance(entry, dict):
             raise ValueError(f"Malformed animation: frame {position} must be an object")
@@ -859,6 +868,16 @@ def parse_animation_document(document) -> dict:
         except ValueError as exc:
             raise ValueError(f"Animation frame {frame_index}: {exc}") from None
         parsed.append((frame_index, entry["pose"]))
+        offset = entry.get("root_offset")
+        if offset is not None:
+            if (not isinstance(offset, (list, tuple)) or len(offset) != 3
+                    or not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in offset)):
+                raise ValueError(f"Malformed animation: frame {frame_index}'s 'root_offset' must be 3 finite numbers")
+            root_offsets[frame_index] = [float(v) for v in offset]
+    leg_length = document.get("root_leg_length")
+    if leg_length is not None and (isinstance(leg_length, bool) or not isinstance(leg_length, (int, float))
+                                   or not math.isfinite(leg_length) or leg_length <= 0):
+        raise ValueError("Malformed animation: 'root_leg_length' must be a positive number")
     first = document.get("first_frame_index", parsed[0][0])
     if not _plain_int(first) or first > parsed[0][0]:
         raise ValueError("Malformed animation: 'first_frame_index' must be an integer no later than the first frame")
@@ -878,6 +897,8 @@ def parse_animation_document(document) -> dict:
         "start_frame": start_frame,
         "chunk_index": index,
         "chunk_count": count,
+        "root_offsets": root_offsets,  # clip frame index -> armature-space travel (root motion)
+        "root_leg_length": float(leg_length) if leg_length is not None else None,
     }
 
 
@@ -887,6 +908,89 @@ def animation_frame_numbers(frame_indices, first_frame_index: int, start_frame: 
     (rounded to whole frames). Pure (no bpy)."""
     scale = float(scene_fps) / float(clip_fps)
     return [int(start_frame + math.floor((index - first_frame_index) * scale + 0.5)) for index in frame_indices]
+
+
+def slerp_wxyz(a, b, t: float) -> list:
+    """Spherical interpolation between quaternions a and b (w, x, y, z) at t
+    in [0, 1], the short way round, normalized. Pure (no bpy)."""
+    a = tuple(float(v) for v in a)
+    b = keep_quaternion_hemisphere(a, b)
+    dot = max(-1.0, min(1.0, sum(x * y for x, y in zip(a, b))))
+    if dot > 0.9995:  # nearly the same rotation: a plain blend is exact enough and stable
+        q = tuple(x + t * (y - x) for x, y in zip(a, b))
+    else:
+        theta = math.acos(dot)
+        sin_theta = math.sin(theta)
+        weight_a, weight_b = math.sin((1.0 - t) * theta) / sin_theta, math.sin(t * theta) / sin_theta
+        q = tuple(weight_a * x + weight_b * y for x, y in zip(a, b))
+    norm = math.sqrt(sum(v * v for v in q)) or 1.0
+    return [v / norm for v in q]
+
+
+def interpolate_pose_documents(a: dict, b: dict, t: float) -> dict:
+    """The pose a fraction t of the way from pose document a to b: each bone's
+    local and world rotation slerped, "low_confidence" kept if either has it.
+    Everything else (rest directions, a bone only one of them has) comes from
+    the nearer pose. Pure (no bpy)."""
+    if t <= 0.0:
+        return a
+    if t >= 1.0:
+        return b
+    nearer = a if t < 0.5 else b
+    bones = {}
+    for name, entry in nearer["bones"].items():
+        bone_a, bone_b = a["bones"].get(name), b["bones"].get(name)
+        if bone_a is None or bone_b is None:
+            bones[name] = entry
+            continue
+        merged = dict(entry)
+        merged["quaternion_wxyz"] = slerp_wxyz(bone_a["quaternion_wxyz"], bone_b["quaternion_wxyz"], t)
+        if "world_quaternion_wxyz" in bone_a and "world_quaternion_wxyz" in bone_b:
+            merged["world_quaternion_wxyz"] = slerp_wxyz(bone_a["world_quaternion_wxyz"], bone_b["world_quaternion_wxyz"], t)
+        if bone_a.get("low_confidence") or bone_b.get("low_confidence"):
+            merged["low_confidence"] = True
+        bones[name] = merged
+    return dict(nearer, bones=bones)
+
+
+def resample_animation(samples, first_frame_index: int, start_frame: int, clip_fps: float, scene_fps: float,
+                       include_first: bool = True) -> list:
+    """The Blender keys for solved clip samples [(clip_frame_index, pose,
+    root_offset or None)], indices increasing: one (blender_frame, pose,
+    root_offset) per whole Blender frame from the first sample's time to the
+    last one's (first_frame_index lands on start_frame; time scales by
+    scene_fps / clip_fps), the pose blended between the two samples around
+    that time. A frame inside a gap (its two samples more than one clip frame
+    apart: frames the tracker lost) gets no key unless a sample lands on it.
+    include_first=False starts strictly after the first sample's time -- that
+    sample is the previous chunk's last one, already keyed up to there.
+    Pure (no bpy)."""
+    if not samples:
+        return []
+    scale = float(scene_fps) / float(clip_fps)
+    times = [start_frame + (index - first_frame_index) * scale for index, _pose, _offset in samples]
+    eps = 1e-6
+    first = math.ceil(times[0] - eps) if include_first else math.floor(times[0] + eps) + 1
+    last = math.floor(times[-1] + eps)
+    keys = []
+    j = 0
+    for frame in range(first, last + 1):
+        while j + 1 < len(times) and times[j + 1] <= frame + eps:
+            j += 1
+        index_a, pose_a, offset_a = samples[j]
+        if abs(times[j] - frame) <= eps:
+            keys.append((frame, pose_a, offset_a))
+            continue
+        if j + 1 >= len(samples) or samples[j + 1][0] - index_a > 1:
+            continue  # beyond the last sample, or inside a tracking gap
+        index_b, pose_b, offset_b = samples[j + 1]
+        t = (frame - times[j]) / (times[j + 1] - times[j])
+        if offset_a is not None and offset_b is not None:
+            offset = [x + t * (y - x) for x, y in zip(offset_a, offset_b)]
+        else:
+            offset = offset_a if t < 0.5 else offset_b
+        keys.append((frame, interpolate_pose_documents(pose_a, pose_b, t), offset))
+    return keys
 
 
 def keep_quaternion_hemisphere(previous, current) -> tuple:
@@ -1010,7 +1114,8 @@ def apply_pose_document(
 
 
 def _keyframe_applied(
-    armature_obj: bpy.types.Object, bone_names: list[str], scene, frame=None, advance: bool = True
+    armature_obj: bpy.types.Object, bone_names: list[str], scene, frame=None, advance: bool = True,
+    root_location: bool = False,
 ) -> None:
     """B18: keys each applied bone's rotation (and the root's location, which
     floor contact may have moved) at the current frame (or `frame`), then
@@ -1022,7 +1127,7 @@ def _keyframe_applied(
     for name in bone_names:
         pose_bone = pose_bones[name]
         pose_bone.keyframe_insert(rotation_data_path(pose_bone.rotation_mode), frame=frame, group=name)
-    if bone_names and scene.posecraft_floor_contact:
+    if bone_names and (scene.posecraft_floor_contact or root_location):
         parents = {bone.name: (bone.parent.name if bone.parent else None) for bone in armature_obj.data.bones}
         root = top_ancestor(bone_names[0], parents)
         pose_bones[root].keyframe_insert("location", frame=frame, group=root)
@@ -1212,32 +1317,86 @@ def _scene_fps(scene) -> float:
     return float(render.fps) / float(render.fps_base or 1.0)
 
 
+# The animation being received in chunks: its identity, the previous chunk's
+# last solved frame (the next chunk blends from it) and the root motion's
+# starting point. Reset by every first chunk.
+_animation_chunk_state = {}
+
+
+def _rig_leg_length(armature_obj, constraints=None):
+    """The rig's thigh + shin length (armature units) through the same bone
+    resolution a pose uses, or None when the rig has no matching legs."""
+    lengths = []
+    for exported_name in ("thigh.L", "shin.L"):
+        chain = _resolve_bone_chain(armature_obj, exported_name, constraints)
+        if chain is None:
+            return None
+        lengths.append(sum(armature_obj.data.bones[name].length for name in chain))
+    return sum(lengths) or None
+
+
+def _apply_root_motion(armature_obj, bone_names, offset, leg_length, state, floor_contact: bool) -> bool:
+    """Moves the rig's root bone to the animation's starting location plus
+    `offset` (the subject's travel in Blender axes) scaled by rig leg length /
+    `leg_length`, then (with floor contact) sets its height as for a single
+    pose. Returns whether the root moved."""
+    if not bone_names:
+        return False
+    if "rig_leg_length" not in state:
+        state["rig_leg_length"] = _rig_leg_length(armature_obj)
+    rig_leg = state["rig_leg_length"]
+    if not rig_leg:
+        return False
+    parents = {bone.name: (bone.parent.name if bone.parent else None) for bone in armature_obj.data.bones}
+    root = armature_obj.pose.bones[top_ancestor(bone_names[0], parents)]
+    if "base_location" not in state:
+        state["base_location"] = root.location.copy()
+    travel = Vector(offset) * (rig_leg / leg_length)
+    root.location = state["base_location"] + armature_translation_to_location(root.bone.matrix_local.to_quaternion(), travel)
+    if floor_contact:
+        _keep_feet_on_floor(armature_obj, bone_names)
+    return True
+
+
 def _apply_animation_document(armature_obj, document: dict, scene) -> dict:
-    """Keys one animation request (or chunk) on `armature_obj`: each frame is
-    posed through apply_pose_document -- the same retarget path as a single
-    pose -- at its own Blender frame (animation_frame_numbers) and keyed
-    there. Everything is validated first (parse_animation_document), and the
-    scene's current frame is restored afterwards. Returns the reply's
-    animation fields plus the union of applied/unmatched/low-confidence
-    bones. (No bpy annotations: tests/test_blender_animation.py runs it
-    against a simulated scene.)"""
+    """Keys one animation request (or chunk) on `armature_obj`: the clip is
+    resampled to the scene's frame rate (resample_animation, blending from the
+    previous chunk's last frame), each key's pose goes through
+    apply_pose_document -- the same retarget path as a single pose -- at its
+    own Blender frame, plus the root motion when it's on. Everything is
+    validated first (parse_animation_document), and the scene's current frame
+    is restored afterwards. Returns the reply's animation fields plus the
+    union of applied/unmatched/low-confidence bones. (No bpy annotations:
+    tests/test_blender_animation.py runs it against a simulated scene.)"""
+    global _animation_chunk_state
     animation = parse_animation_document(document)
     original_frame = scene.frame_current
     start_frame = original_frame if animation["start_frame"] is None else animation["start_frame"]
-    frames = animation["frames"]
-    numbers = animation_frame_numbers(
-        [index for index, _pose in frames], animation["first_frame_index"], start_frame,
-        animation["fps"], _scene_fps(scene),
+    identity = (animation["first_frame_index"], start_frame, animation["fps"], getattr(armature_obj, "name", None))
+    if animation["chunk_index"] == 0 or _animation_chunk_state.get("identity") != identity:
+        _animation_chunk_state = {"identity": identity}
+    state = _animation_chunk_state
+    samples = [(index, pose, animation["root_offsets"].get(index)) for index, pose in animation["frames"]]
+    tail = state.get("tail") if animation["chunk_index"] > 0 else None
+    keys = resample_animation(
+        ([tail] if tail else []) + samples, animation["first_frame_index"], start_frame,
+        animation["fps"], _scene_fps(scene), include_first=tail is None,
     )
+    state["tail"] = samples[-1]
+    root_motion = bool(getattr(scene, "posecraft_root_motion", False)) and animation["root_leg_length"] is not None
     applied_all, unmatched_all, low_all, requested = [], [], [], 0
     try:
-        for (_index, pose), frame in zip(frames, numbers):
+        for frame, pose, offset in keys:
             scene.frame_set(frame)  # evaluate the rig (and any keys already there) at this frame
+            move_root = root_motion and offset is not None
             applied, unmatched, low_confidence = apply_pose_document(
-                armature_obj, pose, scene.posecraft_match_rig_rest, scene.posecraft_floor_contact,
+                armature_obj, pose, scene.posecraft_match_rig_rest, scene.posecraft_floor_contact and not move_root,
                 scene.posecraft_pose_controls,
             )
-            _keyframe_applied(armature_obj, applied, scene, frame=frame, advance=False)
+            moved = move_root and _apply_root_motion(
+                armature_obj, applied, offset, animation["root_leg_length"], state, scene.posecraft_floor_contact
+            )
+            _keyframe_applied(armature_obj, applied, scene, frame=frame, advance=False, root_location=moved)
             for target, names in ((applied_all, applied), (unmatched_all, unmatched), (low_all, low_confidence)):
                 target.extend(name for name in names if name not in target)
             requested = max(requested, len(pose["bones"]))
@@ -1249,9 +1408,9 @@ def _apply_animation_document(armature_obj, document: dict, scene) -> dict:
         "low_confidence": low_all,
         "requested": requested,
         "animation": {
-            "animation_frames": len(frames),
+            "animation_frames": len(keys),  # Blender frames keyed by this request
             "start_frame": start_frame,
-            "end_frame": numbers[-1],
+            "end_frame": keys[-1][0] if keys else None,
             "chunk_index": animation["chunk_index"],
             "chunk_count": animation["chunk_count"],
         },
@@ -1484,6 +1643,7 @@ class POSECRAFT_PT_panel(bpy.types.Panel):
         layout.prop(scene, "posecraft_match_rig_rest")
         layout.prop(scene, "posecraft_pose_controls")
         layout.prop(scene, "posecraft_floor_contact")
+        layout.prop(scene, "posecraft_root_motion")
         row = layout.row(align=True)
         row.prop(scene, "posecraft_insert_keyframes")
         row.prop(scene, "posecraft_frame_step")
@@ -1541,6 +1701,14 @@ def register():
         ),
         default=True,
     )
+    bpy.types.Scene.posecraft_root_motion = bpy.props.BoolProperty(
+        name="Root motion (animations)",
+        description=(
+            "When keying a Live Link animation, move the rig's root with the subject's travel (from planted "
+            "feet), scaled to the rig's leg length. Off: the rig animates in place"
+        ),
+        default=True,
+    )
     bpy.types.Scene.posecraft_floor_contact = bpy.props.BoolProperty(
         name="Keep feet on the floor",
         description=(
@@ -1579,6 +1747,7 @@ def unregister():
     del bpy.types.Scene.posecraft_frame_step
     del bpy.types.Scene.posecraft_insert_keyframes
     del bpy.types.Scene.posecraft_floor_contact
+    del bpy.types.Scene.posecraft_root_motion
     del bpy.types.Scene.posecraft_pose_controls
     del bpy.types.Scene.posecraft_match_rig_rest
     del bpy.types.Scene.posecraft_live_link_port

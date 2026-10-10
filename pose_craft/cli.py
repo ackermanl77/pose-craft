@@ -22,7 +22,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m pose_craft.cli", description="Solve every photo in a folder into Blender poses.")
     parser.add_argument("--input", type=Path, required=True, help="folder of photos (not searched recursively)")
     parser.add_argument("--output", type=Path, required=True, help="folder for the pose files (created if missing)")
-    parser.add_argument("--format", choices=FORMATS, default="json", help="pose JSON for the Blender add-on (default) or BVH")
+    parser.add_argument(
+        "--format", choices=FORMATS, default="json",
+        help="pose JSON for the Blender add-on (default), BVH, or duf: a DAZ Studio pose preset for Genesis 9 "
+        "(needs Genesis 9 in the DAZ content library)",
+    )
     parser.add_argument("--mirror", action="store_true", help="swap left and right, as the GUI's Mirror option")
     parser.add_argument("--model", choices=list(MODEL_URLS), default="full", help="pose model quality (default: full)")
     parser.add_argument("--cpu", action="store_true", help="don't use the GPU")

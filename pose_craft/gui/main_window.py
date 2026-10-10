@@ -972,6 +972,13 @@ class MainWindow(QMainWindow):
         self.export_bvh_btn.setEnabled(False)
         layout.addWidget(self.export_bvh_btn)
 
+        self.export_daz_btn = QPushButton("Export DAZ Pose (Genesis 9)...")
+        self.export_daz_btn.setAccessibleName("Export DAZ Studio pose preset for Genesis 9")
+        self.export_daz_btn.setToolTip("A .duf pose preset: in DAZ Studio, select a Genesis 9 figure and load it")
+        self.export_daz_btn.clicked.connect(self._on_export_daz)
+        self.export_daz_btn.setEnabled(False)
+        layout.addWidget(self.export_daz_btn)
+
         self.export_all_bvh_btn = QPushButton("Export All People (BVH)...")
         self.export_all_bvh_btn.setAccessibleName("Export all people as BVH")
         self.export_all_bvh_btn.setToolTip("One BVH per detected person (<photo>_person<N>.bvh), to a folder you choose.")
@@ -1068,6 +1075,7 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         self.export_action = self._action(file_menu, "&Export Pose JSON...", self._on_export_pose, "Ctrl+S")
         self.export_bvh_action = self._action(file_menu, "Export &BVH...", self._on_export_bvh, "Ctrl+Shift+S")
+        self.export_daz_action = self._action(file_menu, "Export &DAZ Pose (Genesis 9)...", self._on_export_daz)
         self.export_all_action = self._action(file_menu, "Export &All People...", self._on_export_all)
         self.batch_action = self._action(file_menu, "Batch &Process Folder...", self._on_batch_folder)
         file_menu.addSeparator()
@@ -1257,10 +1265,11 @@ class MainWindow(QMainWindow):
     def _set_result_actions_enabled(self, has_person: bool) -> None:
         """Everything that needs a solved, selected person (and Export All, which
         needs any people)."""
-        for widget in (self.export_btn, self.export_bvh_btn, self.export_all_bvh_btn, self.send_to_blender_btn, self.reset_bone_btn,
+        for widget in (self.export_btn, self.export_bvh_btn, self.export_daz_btn, self.export_all_bvh_btn,
+                       self.send_to_blender_btn, self.reset_bone_btn,
                        self.reset_edits_btn, self.adjust_bone_combo, *self.adjust_spins):
             widget.setEnabled(has_person)
-        for action in (self.export_action, self.export_bvh_action, self.send_action,
+        for action in (self.export_action, self.export_bvh_action, self.export_daz_action, self.send_action,
                        self.next_person_action, self.previous_person_action):
             action.setEnabled(has_person)
         has_people = bool(self._people) and self._video is None
@@ -2159,6 +2168,43 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(f"Exported BVH to {path}")
 
+    def _on_export_daz(self) -> None:
+        from pose_craft.export.daz_pose import (
+            DazFigureNotFound,
+            channels_past_limits,
+            load_daz_figure,
+            save_daz_pose_file,
+        )
+
+        inputs = self._current_person_document_inputs()
+        if inputs is None:
+            return
+        rotations, _confidence = inputs
+        index = self.person_combo.currentIndex()
+        try:
+            figure = load_daz_figure()
+        except (DazFigureNotFound, ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Export DAZ Pose", str(exc))
+            return
+        path = self._export_path(
+            "Export DAZ Pose (Genesis 9)", default_export_name(self._source_path, index, ".duf"),
+            "DAZ Studio pose preset (*.duf)",
+        )
+        if not path:
+            return
+        hip_height, leg_length = self._root_for(index, rotations)
+        try:
+            save_daz_pose_file(rotations, path, figure, hip_height=hip_height, leg_length=leg_length)
+        except OSError as exc:
+            self._report_export_error("Export DAZ Pose", path, exc)
+            return
+        past = channels_past_limits(rotations, figure)
+        note = ""
+        if past:
+            bones = sorted({bone for bone, _axis, _value, _limit in past})
+            note = f" -- beyond Genesis 9's joint limits (DAZ will clamp): {', '.join(bones)}"
+        self.statusBar().showMessage(f"Exported DAZ pose to {path}{note}")
+
     def _on_export_all_bvh(self) -> None:
         if not self._people or self._video is not None:
             return
@@ -2199,12 +2245,13 @@ class MainWindow(QMainWindow):
     def _current_animation_live_link_document(self, track: int) -> dict | None:
         if self._video is None:
             return None
-        frame_indices, rotations_by_frame, _roots = self._video_track_frames(track)
+        frame_indices, rotations_by_frame, roots = self._video_track_frames(track)
         if not rotations_by_frame:
             return None
         return build_animation_document(
             list(zip(frame_indices, rotations_by_frame)), self._video.fps,
             source=f"{Path(self._video.path).name}, Person {track + 1}",
+            root_positions_cm=roots if len(roots) == len(rotations_by_frame) else None,
         )
 
     def _start_live_link_send(self, document: dict, automatic: bool = False) -> None:

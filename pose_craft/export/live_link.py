@@ -194,7 +194,8 @@ def send_animation_document(
         combined["animation_frames"] += int(reply.get("animation_frames") or 0)
         if combined["start_frame"] is None:
             combined["start_frame"] = reply.get("start_frame")
-        combined["end_frame"] = reply.get("end_frame")
+        if reply.get("end_frame") is not None:  # a short chunk can fall between two scene frames
+            combined["end_frame"] = reply.get("end_frame")
         if on_chunk is not None:
             on_chunk(index + 1, len(chunks))
     return combined

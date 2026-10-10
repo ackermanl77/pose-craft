@@ -27,7 +27,8 @@ from test_blender_addon_source import _extract_top_level_constant, _load_pure_fu
 
 _PARSE = (
     "validate_pose_document", "_validate_quaternion", "_validate_vector", "is_animation_document", "_plain_int",
-    "parse_animation_document", "animation_frame_numbers",
+    "parse_animation_document", "animation_frame_numbers", "resample_animation", "interpolate_pose_documents",
+    "slerp_wxyz", "keep_quaternion_hemisphere",
 )
 
 
@@ -125,7 +126,7 @@ def _addon(scene, armature=None):
     """The add-on's Live Link apply path with bpy and the rig solve stood in:
     apply_pose_document records the frame each pose was applied at."""
     loaded = _load_pure_functions(
-        *_PARSE, "keep_quaternion_hemisphere", "_scene_fps", "_apply_animation_document", "_apply_live_link_document",
+        *_PARSE, "_scene_fps", "_apply_animation_document", "_apply_live_link_document",
         "live_link_request_error", "pick_live_link_target", "build_live_link_reply", "_summarize",
     )
     log = {"applied_at": [], "keyed": [], "undo": []}
@@ -135,7 +136,7 @@ def _addon(scene, armature=None):
         names = [n for n in document["bones"] if n != "foot.R"]
         return names, ["foot.R"] if "foot.R" in document["bones"] else [], []
 
-    def keyframe_applied(obj, names, sc, frame=None, advance=True):
+    def keyframe_applied(obj, names, sc, frame=None, advance=True, root_location=False):
         log["keyed"].append((frame, advance, len(names)))
 
     armature = armature or types.SimpleNamespace(type="ARMATURE", name="Rig")
@@ -181,7 +182,9 @@ def test_chunks_share_one_anchor_and_one_undo_step():
                   start_frame=reply["start_frame"], live_link_protocol=3)
     second["fps"] = 30.0
     reply = addon["_apply_live_link_document"](second)
-    assert log["applied_at"][-2:] == [25, 26]  # 30 clip frames at 30 fps = 24 scene frames after frame 1
+    # 30 fps into 24: clip frames 0-1 cover scene frames 1-1.8 (one key), 30-31 cover 25-25.8; the
+    # stretch between them is a tracking gap (frames 2-29 were never sent), so it gets no keys.
+    assert log["applied_at"] == [1, 25]
     assert reply["chunk_index"] == 1 and log["undo"] == ["PoseCraft animation"]
     assert scene.frame_current == 50
 
@@ -307,3 +310,90 @@ def test_an_addon_that_answers_like_a_single_pose_is_reported_as_too_old():
             live_link.send_animation_document(_animation([0]), port=server.getsockname()[1], timeout=5.0)
     finally:
         server.close()
+
+
+# --- add-on 0.8.0: resampling to the scene's frame rate, root motion --------------------------------
+
+
+def test_a_30_fps_clip_in_a_24_fps_scene_keys_every_frame_once():
+    resample = _load_pure_functions(*_PARSE)["resample_animation"]
+    poses = {i: blender_pose.build_pose_document(_rotations(i)) for i in range(45)}
+    keys = resample([(i, poses[i], None) for i in range(45)], 0, 1, 30.0, 24.0)
+    frames = [frame for frame, _pose, _offset in keys]
+    assert frames == list(range(1, 37))  # 45 clip frames = 1.5 s = 36 scene frames, none twice
+    assert keys[0][1] is poses[0] and keys[4][1] is poses[5]  # frame 5 = clip time 5/24 s = clip frame 5 exactly
+    # Frame 2 is 1.25 clip frames in: a blend, between clip frames 1 and 2.
+    bone = keys[1][1]["bones"]["spine"]["quaternion_wxyz"]
+    a, b = poses[1]["bones"]["spine"]["quaternion_wxyz"], poses[2]["bones"]["spine"]["quaternion_wxyz"]
+    expected = (Rotation.from_quat([*a[1:], a[0]]), Rotation.from_quat([*b[1:], b[0]]))
+    from scipy.spatial.transform import Slerp
+
+    slerped = Slerp([0, 1], Rotation.concatenate(expected))([0.25]).as_quat()[0]
+    assert np.allclose(np.abs(np.dot([bone[1], bone[2], bone[3], bone[0]], slerped)), 1.0, atol=1e-6)
+
+
+def test_a_slower_clip_gets_a_key_on_every_scene_frame_and_gaps_stay_unkeyed():
+    resample = _load_pure_functions(*_PARSE)["resample_animation"]
+    pose = blender_pose.build_pose_document(_rotations(1))
+    keys = resample([(0, pose, [0, 0, 0]), (1, pose, [10, 0, 0])], 0, 0, 24.0, 60.0)
+    assert [f for f, _p, _o in keys] == [0, 1, 2]  # 1/24 s = 2.5 scene frames
+    assert [o[0] for _f, _p, o in keys] == pytest.approx([0.0, 4.0, 8.0])  # root travel blended too
+    gap = resample([(0, pose, None), (3, pose, None)], 0, 0, 30.0, 30.0)
+    assert [f for f, _p, _o in gap] == [0, 3]  # frames 1-2 were lost: no keys there
+    later = resample([(0, pose, None), (1, pose, None)], 0, 10, 30.0, 30.0, include_first=False)
+    assert [f for f, _p, _o in later] == [11]  # the previous chunk already keyed frame 10
+
+
+def test_slerp_and_pose_blending():
+    loaded = _load_pure_functions(*_PARSE)
+    half = loaded["slerp_wxyz"]((1, 0, 0, 0), (0, 0, 0, 1), 0.5)
+    assert half == pytest.approx([2 ** -0.5, 0, 0, 2 ** -0.5])
+    assert loaded["slerp_wxyz"]((1, 0, 0, 0), (-1, 0, 0, 0), 0.5) == pytest.approx([1, 0, 0, 0])  # same rotation
+    a = blender_pose.build_pose_document(_rotations(1))
+    b = json.loads(json.dumps(blender_pose.build_pose_document(_rotations(2))))
+    b["bones"]["head"]["low_confidence"] = True
+    blended = loaded["interpolate_pose_documents"](a, b, 0.3)
+    assert blended["bones"]["head"].get("low_confidence") is True
+    assert loaded["interpolate_pose_documents"](a, b, 0.0) is a
+
+
+def test_root_travel_rides_in_the_animation_document():
+    frames = [(i, _rotations(i)) for i in range(3)]
+    roots = [(0.0, 90.0, 0.0), (5.0, 80.0, -2.0), (10.0, 95.0, -4.0)]
+    document = blender_pose.build_animation_document(frames, 30.0, root_positions_cm=roots)
+    offsets = [f["root_offset"] for f in document["frames"]]
+    assert offsets[0] == pytest.approx([0, 0, 0])
+    assert offsets[2] == pytest.approx([10.0, 4.0, 0.0])  # engine +x right, -z forward -> Blender +x, +y; height dropped
+    assert document["root_leg_length"] == pytest.approx(sk.BONE_LENGTHS_CM["thigh.L"] + sk.BONE_LENGTHS_CM["shin.L"])
+    parsed = _load_pure_functions(*_PARSE)["parse_animation_document"](document)
+    assert parsed["root_offsets"][2] == pytest.approx([10.0, 4.0, 0.0])
+    assert parsed["root_leg_length"] == document["root_leg_length"]
+    bad = json.loads(json.dumps(document))
+    bad["frames"][1]["root_offset"] = [1, "x", 0]
+    with pytest.raises(ValueError, match="root_offset"):
+        _load_pure_functions(*_PARSE)["parse_animation_document"](bad)
+    with pytest.raises(ValueError):
+        blender_pose.build_animation_document(frames, 30.0, root_positions_cm=roots[:2])
+    assert "root_leg_length" not in blender_pose.build_animation_document(frames, 30.0)
+
+
+def test_root_motion_moves_the_root_on_every_key_when_on():
+    scene = _Scene(frame=1, fps=30)
+    scene.posecraft_root_motion = True
+    addon, log = _addon(scene)
+    moves = []
+
+    def apply_root_motion(obj, names, offset, leg_length, state, floor_contact):
+        moves.append((tuple(offset), leg_length))
+        return True
+
+    addon["_apply_root_motion"] = apply_root_motion
+    roots = [(0.0, 90.0, 0.0), (3.0, 90.0, 0.0)]
+    document = blender_pose.build_animation_document([(i, _rotations(i)) for i in range(2)], 30.0, root_positions_cm=roots)
+    document["live_link_protocol"] = 3
+    reply = addon["_apply_live_link_document"](document)
+    assert reply["ok"] and [m[0][0] for m in moves] == pytest.approx([0.0, 3.0])
+    scene.posecraft_root_motion = False
+    moves.clear()
+    addon["_apply_live_link_document"](document)
+    assert moves == []

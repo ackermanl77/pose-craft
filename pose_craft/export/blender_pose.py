@@ -38,6 +38,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from pose_craft.retarget.skeleton import (
+    BONE_LENGTHS_CM,
     bone_rest_direction,
     hip_height_above_floor,
     measured_proportions,
@@ -146,7 +147,11 @@ def build_pose_document(
 
 
 def build_animation_document(
-    frames: list[tuple[int, dict[str, Rotation]]], fps: float, *, source: str = ""
+    frames: list[tuple[int, dict[str, Rotation]]],
+    fps: float,
+    *,
+    source: str = "",
+    root_positions_cm: list | None = None,
 ) -> dict:
     """A tracked person's solved video frames for Live Link's "Send Animation
     to Blender" (add-on 0.7.0+): {"format": ANIMATION_FORMAT_NAME, "version":
@@ -155,11 +160,18 @@ def build_animation_document(
     retargets every frame exactly like a single pose. frames: (clip frame
     index, local rotations), indices increasing -- gaps are frames the
     tracker lost, which the add-on leaves unkeyed. live_link.send_animation_document
-    splits it into chunks under the add-on's payload cap."""
+    splits it into chunks under the add-on's payload cap.
+
+    root_positions_cm: the root position per frame (estimation.video.
+    animation_root_positions, cm on the BVH rest skeleton), for root motion:
+    each frame then carries "root_offset", its horizontal travel from the
+    first frame in Blender axes, and the document "root_leg_length", that
+    skeleton's leg length in the same units -- the add-on scales the travel by
+    its rig's own leg length (add-on 0.8.0+; an older add-on ignores both)."""
     indices = [int(index) for index, _rotations in frames]
     if any(b <= a for a, b in zip(indices, indices[1:])):
         raise ValueError("animation frame indices must increase")
-    return {
+    document: dict[str, Any] = {
         "format": ANIMATION_FORMAT_NAME,
         "version": ANIMATION_FORMAT_VERSION,
         "fps": float(fps),
@@ -169,6 +181,16 @@ def build_animation_document(
             for index, (_frame, rotations) in zip(indices, frames)
         ],
     }
+    if root_positions_cm is not None:
+        if len(root_positions_cm) != len(frames):
+            raise ValueError("root_positions_cm needs one position per frame")
+        first = np.asarray(root_positions_cm[0], dtype=float)
+        for entry, position in zip(document["frames"], root_positions_cm):
+            travel = np.asarray(position, dtype=float) - first
+            travel[1] = 0.0  # horizontal only (engine Y is up): "Keep feet on the floor" sets the height
+            entry["root_offset"] = [float(v) for v in _ENGINE_TO_BLENDER_AXES.apply(travel)]
+        document["root_leg_length"] = float(BONE_LENGTHS_CM["thigh.L"] + BONE_LENGTHS_CM["shin.L"])
+    return document
 
 
 def root_measurements(

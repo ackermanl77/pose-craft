@@ -266,6 +266,28 @@ results["live_link"] = {
     "timer_while_running": bpy.app.timers.is_registered(addon._poll_live_link_server),
 }
 
+# --- 4b. A 30 fps clip into a 24 fps scene, with root motion (add-on 0.8.0) ----------------------
+reset()
+obj = armature("PC", {n: (v["head"], v["tail"], v["parent"]) for n, v in rig_spec.items() if n in body_names})
+scene = bpy.context.scene
+scene.render.fps = 24
+scene.posecraft_target = obj
+scene.posecraft_root_motion = True
+scene.frame_set(1)
+resampled_reply = send(live_link.send_animation_document, doc("anim24.json"))
+obj = bpy.data.objects["PC"]
+_keys, resampled_frames = key_count(obj)
+root_bone = next(pb for pb in obj.pose.bones if pb.parent is None)
+scene.frame_set(1)
+start_head = (obj.matrix_world @ root_bone.head).copy()
+scene.frame_set(36)
+end_head = obj.matrix_world @ root_bone.head
+results["resampled"] = {
+    "reply": resampled_reply.get("reply"), "error": resampled_reply.get("error"),
+    "key_frames": [resampled_frames[0], resampled_frames[-1], len(resampled_frames)] if resampled_frames else None,
+    "travel": [end_head[i] - start_head[i] for i in range(3)],
+}
+
 # --- 1 again: unregister stops the server ------------------------------------------------------
 addon_utils.disable("import_pose", default_set=True)
 probe = socket.socket()
