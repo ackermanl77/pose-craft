@@ -268,12 +268,13 @@ $env:QT_QPA_PLATFORM = "offscreen"
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-**Current count (2026-10-07, after the installer): 428 passed, 8
-skipped** in about 30 s; `ruff check` and `mypy` clean. The eight skips are the
-LiteRT reference test, the real-photo golden test (no photos committed), the
-four opt-in GPU parity tests (`POSECRAFT_GPU_TESTS=1`) and the two opt-in
-real-Blender tests (`POSECRAFT_BLENDER`: the Live Link/rig check and the
-extension install). Earlier counts: 402/7 after the real-Blender check
+**Current count (2026-10-11, with the golden photos): 446 passed, 8
+skipped** in about 21 s; `ruff check` clean. The eight skips are the LiteRT
+reference test, the four opt-in GPU parity tests (`POSECRAFT_GPU_TESTS=1`), the
+two opt-in real-Blender tests (`POSECRAFT_BLENDER`: the Live Link/rig check and
+the extension install) and the opt-in real-DAZ test (`POSECRAFT_DAZ`). The
+real-photo golden test runs whenever the "full" model is cached (five photos,
+see below). Before: 428 passed, 8 skipped (2026-10-07). Earlier counts: 402/7 after the real-Blender check
 (2026-10-03), 298/6 after the P2 round
 (2026-09-30), 357/6 after the "important items" round (2026-10-02), 401/6
 after the video/Live Link round (2026-10-03).
@@ -417,6 +418,12 @@ checked" above as weaker evidence than an automated test -- it was true at the
 time each check ran, not guaranteed to stay true as the code changes.
 
 ## Recently Fixed
+
+- **2026-10-11: real-photo goldens (T2).** Five photos from Wikimedia Commons,
+  public domain or CC0 (license read from the Commons API; `tests/data/golden/SOURCES.md`),
+  resized to 640 px, with goldens from `scripts/generate_goldens.py`; the
+  end-to-end test now runs wherever the "full" model is cached, and a model-free
+  test checks the engine axes against what the photos show (see Known Issues).
 
 - **2026-10-09: animation resampling, root motion, DAZ Studio export.**
   - **Frame-rate resampling (add-on 0.8.0).** `resample_animation()` keys every
@@ -1161,11 +1168,17 @@ Ranked roughly by how much they affect whether an exported pose is usable:
   good. Foot roll comes from the ankle-heel-toe plane, which is only a few cm
   across, so it's noisy; a hidden heel falls back to a fixed 25-degree pitch.
   The single spine bone splits a shoulder-vs-hip twist evenly. None of this
-  has been compared against real photos with known poses yet (see the golden
-  test, which has no photos committed).
-- **The world-landmark axis convention follows MediaPipe's documentation
-  (+y down, smaller z = closer to the camera; see "Recently Fixed"), but the
-  whole export hasn't been checked against a real photo.** Isolated in
+  has been compared against real photos with known poses yet (the golden
+  photos check the axes and guard against regressions, not the joint angles).
+- **The world-landmark axis convention is now checked on real photos
+  (2026-10-11), but no live solve has been compared against a Blender rig by
+  eye.** Five public-domain/CC0 photos in `tests/data/golden` (two runners and
+  a race facing the camera, a yoga pose, two people walking away, raised arms
+  from behind): in every full-body person the head is above the hips above the
+  ankles (Y up), and the left shoulder is on +X with the nose towards +Z when
+  they face the camera, the opposite when they walk away -- the engine's "Y
+  up, faces +Z, left +X" (`test_goldens_put_up_left_and_facing_where_the_photos_show_them`,
+  which needs no model). The convention is isolated in
   `_world_to_engine()` in `estimation/landmarker.py` specifically so it's the
   one place to fix if an exported pose comes out upside-down or mirrored
   against the source photo. No live solve with a real photo has been compared

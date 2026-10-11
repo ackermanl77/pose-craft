@@ -202,9 +202,10 @@ Needs `requirements-test.txt` (numpy/scipy/opencv-python-headless/pytest plus
 CPU onnxruntime/onnx/tflite, not the Qt stack or the GPU runtime) -- covers the
 bone retargeting math, the Blender axis-conversion math, the atomic
 model-download logic, the pose pipeline's pre/post-processing and the model
-converter, unicode-safe image loading, the Live Link wire protocol, and (when golden
-photos and the cached model are present, see `scripts/generate_goldens.py`)
-a real-photo end-to-end golden test. `.github/workflows/ci.yml` runs this
+converter, unicode-safe image loading, the Live Link wire protocol, and a
+real-photo end-to-end golden test on five public-domain/CC0 photos in
+`tests/data/golden` (it needs the cached "full" model; a second test checks
+the up/left/facing axes from the committed goldens without it). `.github/workflows/ci.yml` runs this
 same lightweight suite on every push/PR on Ubuntu, the full suite (Qt included,
 with coverage) on Windows, and the linters: `python -m ruff check pose_craft tests
 scripts` and `python -m mypy` (configured in `pyproject.toml`; mypy covers
