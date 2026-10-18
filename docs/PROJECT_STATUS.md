@@ -419,6 +419,7 @@ time each check ran, not guaranteed to stay true as the code changes.
 
 ## Recently Fixed
 
+- **glTF export (2026-10-18, F11).** `pose_craft/export/gltf_export.py` writes a binary glTF 2.0 with the BVH exporter's own skeleton -- glTF's Y-up, +Z-facing frame is the engine frame, so offsets and local rotations carry over unchanged (cm -> m) -- plus a skin (rest-pose inverse binds), a bone-stick mesh weighted one bone per stick, and LINEAR rotation channels per joint and root translation (quaternions kept in one hemisphere). Fingers when solved. Offered in the pose and video save dialogs (by extension) and as `--format glb`. Checked with the Khronos glTF-Validator 2.0.0-dev.3.10 (0 errors/warnings/infos); `tests/test_gltf_export.py` checks that forward kinematics over the glb's nodes equals `skeleton.forward_kinematics()` at several frames, with and without fingers. Not done: FBX (would go through the Blender add-on).
 - **2026-10-11: real-photo goldens (T2).** Five photos from Wikimedia Commons,
   public domain or CC0 (license read from the Commons API; `tests/data/golden/SOURCES.md`),
   resized to 640 px, with goldens from `scripts/generate_goldens.py`; the

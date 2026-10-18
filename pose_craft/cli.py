@@ -1,6 +1,6 @@
 """Command line (B13): solve a folder of photos without the GUI.
 
-    python -m pose_craft.cli --input photos/ --output poses/ [--format json|bvh]
+    python -m pose_craft.cli --input photos/ --output poses/ [--format json|bvh|duf|glb]
         [--mirror] [--model lite|full|heavy] [--cpu] [--max-people 4]
         [--group-photo] [--hands] [--detection-threshold 0.5] [--no-overwrite]
 

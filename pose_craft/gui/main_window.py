@@ -88,6 +88,19 @@ from pose_craft.retarget.skeleton import (
     rotate_joint_positions,
 )
 
+# BVH or binary glTF (F11), chosen by the file name's extension in the save dialog.
+SKELETON_FILTERS = "BVH (*.bvh);;glTF binary (*.glb)"
+
+
+def save_skeleton_animation(frames, path, *, frame_time, root_positions):
+    if str(path).lower().endswith(".glb"):
+        from pose_craft.export.gltf_export import save_gltf_animation
+
+        save_gltf_animation(frames, path, frame_time=frame_time, root_positions=root_positions)
+    else:
+        save_bvh_animation(frames, path, frame_time=frame_time, root_positions=root_positions)
+
+
 log = logging.getLogger(__name__)
 
 # How long closeEvent waits for a background worker before hiding the window
@@ -1763,11 +1776,11 @@ class MainWindow(QMainWindow):
             return
         stem = Path(self._video.path).stem
         name = f"{stem}.bvh" if len(self._video.track_ids()) == 1 else default_export_name(self._video.path, track, ".bvh")
-        path, _ = QFileDialog.getSaveFileName(self, "Export Animation BVH", str(Path(self._last_dir()) / name), "BVH (*.bvh)")
+        path, _ = QFileDialog.getSaveFileName(self, "Export Animation BVH", str(Path(self._last_dir()) / name), SKELETON_FILTERS)
         if not path:
             return
         try:
-            save_bvh_animation(frames, path, frame_time=1.0 / self._video.fps, root_positions=roots)
+            save_skeleton_animation(frames, path, frame_time=1.0 / self._video.fps, root_positions=roots)
         except OSError as exc:
             self._report_export_error("Export Animation BVH", path, exc)
             return
@@ -2155,14 +2168,19 @@ class MainWindow(QMainWindow):
         rotations, _confidence = inputs
 
         path = self._export_path(
-            "Export BVH", default_export_name(self._source_path, self.person_combo.currentIndex(), ".bvh"), "BVH (*.bvh)"
+            "Export BVH", default_export_name(self._source_path, self.person_combo.currentIndex(), ".bvh"), SKELETON_FILTERS
         )
         if not path:
             return
 
         try:
-            # Standing on the floor (B6): a crouch is exported lowered.
-            save_bvh_file(rotations, path, root_position=floor_root_position(rotations))
+            # Standing on the floor (B6): a crouch is exported lowered. .glb: glTF (F11).
+            if path.lower().endswith(".glb"):
+                from pose_craft.export.gltf_export import save_gltf_pose
+
+                save_gltf_pose(rotations, path, root_position=floor_root_position(rotations))
+            else:
+                save_bvh_file(rotations, path, root_position=floor_root_position(rotations))
         except OSError as exc:
             self._report_export_error("Export BVH", path, exc)
             return

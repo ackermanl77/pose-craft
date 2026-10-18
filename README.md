@@ -113,7 +113,10 @@ skeleton. From there:
   **Export All People (BVH)...** (one file per detected person, to a folder
   you choose, named after the photo, asking before overwriting; the
   mirror checkbox, if used, applies to everyone in a batch export the same way
-  it applies to a single person; the BVH stands on the floor), or
+  it applies to a single person; the BVH stands on the floor). The BVH save
+  dialogs (pose and video animation) also offer **glTF binary (.glb)**: a skinned
+  skeleton with a small bone mesh and the animation, for Unity, Unreal, Godot,
+  three.js and Blender; the CLI and batch take `--format glb`. Or
 - **File > Batch Process Folder...** -- every photo in a folder, solved
   with the current detection settings, one `<photo>_person<N>.json` (or
   `.bvh`, `.duf`) per person, with a progress bar and Cancel. Without the GUI:

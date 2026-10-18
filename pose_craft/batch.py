@@ -16,7 +16,8 @@ from pose_craft.imaging import imread_unicode
 from pose_craft.posing import default_export_name, document_inputs, edited_person, out_of_frame_bones, root_for
 
 PHOTO_SUFFIXES = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
-FORMATS = ("json", "bvh", "duf")  # duf: a DAZ Studio pose preset for Genesis 9 (export/daz_pose.py)
+# duf: a DAZ Studio pose preset for Genesis 9 (export/daz_pose.py); glb: binary glTF (export/gltf_export.py)
+FORMATS = ("json", "bvh", "duf", "glb")
 
 
 @dataclasses.dataclass
@@ -99,6 +100,10 @@ def solve_folder(
             try:
                 if fmt == "bvh":
                     save_bvh_file(rotations, target, root_position=floor_root_position(rotations))
+                elif fmt == "glb":
+                    from pose_craft.export.gltf_export import save_gltf_pose
+
+                    save_gltf_pose(rotations, target, root_position=floor_root_position(rotations))
                 elif fmt == "duf":
                     from pose_craft.export.daz_pose import save_daz_pose_file
 
