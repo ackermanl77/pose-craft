@@ -245,7 +245,7 @@ class VideoSolveWorker(QThread):
     progress = Signal(int, int)  # frames done, total frames (0 if unknown)
 
     def __init__(
-        self, path: str, estimator: PoseEstimator | None, model_variant: str, use_gpu: bool, max_people: int = 1,
+        self, path: str, estimator: PoseEstimator | None, model_variant: str, use_gpu: bool, max_people: int = 1, hands: bool = False,
         parent=None, min_detection_confidence: float = 0.5,
     ):
         super().__init__(parent)
@@ -255,6 +255,7 @@ class VideoSolveWorker(QThread):
         self._estimator = estimator
         self._model_variant = model_variant
         self._use_gpu = use_gpu
+        self._hands = hands
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -271,12 +272,15 @@ class VideoSolveWorker(QThread):
                     self._model_variant, use_gpu=self._use_gpu, should_cancel=self._cancel.is_set
                 )
             estimator.min_detection_confidence = self._min_detection_confidence
+            if self._hands:  # fingers in video (B21): the hand model, downloaded once if needed
+                estimator.enable_hands(should_cancel=self._cancel.is_set)
             result = solve_video(
                 self._path,
                 estimator,
                 max_people=self._max_people,
                 on_progress=lambda done, total: self.progress.emit(done, total),
                 should_cancel=self._cancel.is_set,
+                hands=self._hands,
             )
             self.finished_ok.emit(result, estimator)
         except (DownloadCancelled, InterruptedError):
@@ -1627,6 +1631,7 @@ class MainWindow(QMainWindow):
         self._video_worker = VideoSolveWorker(
             path, estimator, self.model_variant_combo.currentText(), self.use_gpu_checkbox.isChecked(),
             self.max_people_spin.value(), min_detection_confidence=self.detection_threshold_spin.value(),
+            hands=self.hands_checkbox.isChecked(),
         )
         self._video_worker.finished_ok.connect(self._on_video_finished)
         self._video_worker.failed.connect(self._on_video_failed)

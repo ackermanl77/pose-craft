@@ -523,6 +523,16 @@ class PoseEstimator:
             path = resolve_hand_onnx_model(on_progress=on_progress, should_cancel=should_cancel)
             self._hand_model = HandLandmarker(path, use_gpu=self.use_gpu)
 
+    @property
+    def hands_ready(self) -> bool:
+        """True once enable_hands() has loaded the hand model."""
+        return self._hand_model is not None
+
+    def find_hands(self, image_rgb: np.ndarray, person: DetectedPerson, result) -> None:
+        """The hands of one already-solved person (a video frame's, B21); see _find_hands."""
+        if self._hand_model is not None:
+            self._find_hands(image_rgb, person, result)
+
     def _find_hands(self, image_rgb: np.ndarray, person: DetectedPerson, result) -> None:
         """Runs the hand model on both of `person`'s hands, from the pose's
         wrist/index/pinky landmarks (a hand whose landmarks are barely visible

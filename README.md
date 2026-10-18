@@ -96,7 +96,9 @@ out reaching the wrong way in depth can be flipped from the photo's
 right-click menu, and any bone can be rotated by hand in "3. Correct" (all
 with undo). Tick **Hands and fingers** before solving to also estimate the
 fingers (15 bones per hand, Rigify names; off by default -- the first use
-downloads MediaPipe's pinned hand model). **Load Video...** tracks up to "Max
+downloads MediaPipe's pinned hand model), in photos and, since 2026-10-18, in
+videos too (each tracked person's hands, smoothed and held through brief
+dropouts). **Load Video...** tracks up to "Max
 people" people through a clip, each with a stable number (re-identified after
 a short loss by where they were and what they look like), and exports an
 animated BVH per person, optionally with **Rotation smoothing** (zero-phase,

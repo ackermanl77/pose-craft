@@ -238,3 +238,57 @@ def test_a_walk_moves_the_bvh_root_forward():
     forward = [r[2] for r in roots]
     assert forward[-1] > forward[0] + 5.0  # cm
     assert all(b >= a - 1e-9 for a, b in zip(forward, forward[1:]))
+
+
+# --- fingers in video (B21) ----------------------------------------------------------
+
+
+class _FakeHandEstimator(_FakeTrackingEstimator):
+    """Also finds a left hand -- except on frames listed in `missing` -- whose fingertip jitters."""
+
+    def __init__(self, missing=()):
+        super().__init__()
+        self.missing = set(missing)
+        self.frame = -1
+        self.hand_rng = np.random.default_rng(7)
+
+    def track(self, image_rgb, previous):
+        self.frame += 1
+        return super().track(image_rgb, previous)
+
+    def find_hands(self, image_rgb, person, result):
+        from pose_craft.estimation.landmarker import HandLandmarks
+
+        if self.frame in self.missing:
+            return
+        world = np.zeros((21, 3))
+        world[8] = [0.0, 8.0 + self.hand_rng.normal(0, 0.5), 0.0]  # index fingertip, 8 cm up
+        world += person.landmarks[15] - world[0]
+        person.hands["L"] = HandLandmarks(world=world, image_xy=np.full((21, 2), 0.5), presence=0.9)
+
+
+def test_solve_video_finds_smooths_and_anchors_the_hands(tmp_path):
+    clip = tmp_path / "clip.avi"
+    _write_video(clip, frames=20)
+    result = video.solve_video(clip, _FakeHandEstimator(), hands=True)
+    people = [frame.person for frame in result.frames]
+    assert all("L" in p.hands for p in people)
+    for person in people:  # on the SMOOTHED wrist, not the raw one
+        assert np.allclose(person.hands["L"].world[0], person.landmarks[15])
+    tips = np.array([p.hands["L"].world[8, 1] - p.hands["L"].world[0, 1] for p in people])
+    assert tips[5:].std() < 0.5  # the raw jitter is sigma 0.5
+    without = video.solve_video(clip, _FakeHandEstimator())  # hands off (the default)
+    assert all(not frame.person.hands for frame in without.frames)
+
+
+def test_a_brief_hand_dropout_is_held_and_a_long_one_is_not(tmp_path):
+    clip = tmp_path / "clip.avi"
+    _write_video(clip, frames=25)  # _write_video's brightness k * 10 must stay under 256
+    hold = max(1, round(video.HAND_HOLD_SECONDS * 25))
+    short = video.solve_video(clip, _FakeHandEstimator(missing={10, 11}), hands=True)
+    assert all("L" in frame.person.hands for frame in short.frames)  # 2 frames < the hold
+    long_gap = set(range(10, 10 + hold + 4))
+    gone = video.solve_video(clip, _FakeHandEstimator(missing=long_gap), hands=True)
+    present = ["L" in frame.person.hands for frame in gone.frames]
+    assert all(present[10:10 + hold]) and not any(present[10 + hold:10 + hold + 4])
+    assert present[10 + hold + 4]  # back when the model finds it again

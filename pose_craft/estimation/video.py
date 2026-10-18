@@ -438,27 +438,83 @@ class VideoSolve:
         return [frame.people[track_id] for frame in self.frames if track_id in frame.people]
 
 
+# A hand the model missed for a moment (motion blur, a turned palm) keeps its last shape this long,
+# instead of the fingers snapping straight for a frame or two (B21).
+HAND_HOLD_SECONDS = 0.25
+
+
+class _HandSmoother:
+    """One person's hands through a video (B21): each hand's shape relative to its own wrist is
+    One-Euro smoothed and put back on the smoothed body's wrist, so the hand can't drift away from
+    the arm; a hand missing for up to HAND_HOLD_SECONDS keeps its last shape."""
+
+    def __init__(self, min_cutoff: float, beta: float, fps: float):
+        from pose_craft.estimation.landmarker import HandLandmarks
+
+        self._make = HandLandmarks
+        self._filters = {side: (OneEuroFilter(min_cutoff, beta), OneEuroFilter(min_cutoff, beta)) for side in ("L", "R")}
+        self._last: dict = {}
+        self._missing = {"L": 0, "R": 0}
+        self._hold_frames = max(1, int(round(HAND_HOLD_SECONDS * fps)))
+
+    def reset(self) -> None:
+        for shape, image in self._filters.values():
+            shape.reset()
+            image.reset()
+        self._last.clear()
+
+    def __call__(self, person: DetectedPerson, smoothed_landmarks: np.ndarray, t: float) -> dict:
+        from pose_craft.estimation.landmarker import _HAND_POSE_LANDMARKS
+
+        hands = {}
+        for side, (wrist, _index, _pinky) in _HAND_POSE_LANDMARKS.items():
+            hand = person.hands.get(side)
+            shape_filter, image_filter = self._filters[side]
+            if hand is None:
+                self._missing[side] += 1
+                last = self._last.get(side)
+                if last is not None and self._missing[side] <= self._hold_frames:
+                    shape, image_xy, presence = last
+                    hands[side] = self._make(world=shape + smoothed_landmarks[wrist], image_xy=image_xy, presence=presence)
+                else:
+                    shape_filter.reset()
+                    image_filter.reset()
+                    self._last.pop(side, None)
+                continue
+            self._missing[side] = 0
+            shape = shape_filter(np.asarray(hand.world) - np.asarray(hand.world)[0], t)
+            image_xy = image_filter(np.asarray(hand.image_xy), t)
+            self._last[side] = (shape, image_xy, hand.presence)
+            hands[side] = self._make(world=shape + smoothed_landmarks[wrist], image_xy=image_xy, presence=hand.presence)
+        return hands
+
+
 def smooth_people(
     people: list[DetectedPerson | None], fps: float, min_cutoff: float = DEFAULT_MIN_CUTOFF, beta: float = DEFAULT_BETA
 ) -> list[DetectedPerson | None]:
     """One Euro smoothing of each frame's engine-frame landmarks (the 2D image
-    landmarks too, so the overlay matches). A gap (None) restarts the filter."""
+    landmarks too, so the overlay matches), and of the hands when they were
+    solved (_HandSmoother). A gap (None) restarts the filters."""
     world_filter = OneEuroFilter(min_cutoff, beta)
     image_filter = OneEuroFilter(min_cutoff, beta)
+    hand_smoother = _HandSmoother(min_cutoff, beta, fps)
     smoothed: list[DetectedPerson | None] = []
     for index, person in enumerate(people):
         if person is None:
             world_filter.reset()
             image_filter.reset()
+            hand_smoother.reset()
             smoothed.append(None)
             continue
         t = index / fps
+        landmarks = world_filter(person.landmarks, t)
         smoothed.append(
             DetectedPerson(
-                landmarks=world_filter(person.landmarks, t),
+                landmarks=landmarks,
                 image_landmarks_xy=image_filter(person.image_landmarks_xy, t),
                 visibility=person.visibility,
                 landmark_presence=person.landmark_presence,
+                hands=hand_smoother(person, landmarks, t),
             )
         )
     return smoothed
@@ -568,11 +624,14 @@ def solve_video(
     max_frames: int | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    hands: bool = False,
 ) -> VideoSolve:
     """Decodes `path` with OpenCV and tracks up to `max_people` people through
     it -- one (the best detection) with the estimator's own track(), several
     with a MultiPersonTracker (estimator.new_tracker), each with a stable ID
-    -- smoothing each person's landmarks. Raises OSError if the file can't be
+    -- smoothing each person's landmarks. `hands` (B21): also each tracked
+    person's fingers, frame by frame (the estimator's hand model must be
+    loaded: PoseEstimator.enable_hands). Raises OSError if the file can't be
     opened, InterruptedError when should_cancel() turns true."""
     import cv2
 
@@ -603,17 +662,19 @@ def solve_video(
                 results = {} if previous is None else {0: previous}
             else:
                 results = tracker.step(image_rgb)
-            raw.append(
-                {
-                    track_id: DetectedPerson(
-                        landmarks=_world_to_engine(result.world),
-                        image_landmarks_xy=result.image_xy,
-                        visibility=result.visibility,
-                        landmark_presence=result.landmark_presence,
-                    )
-                    for track_id, result in results.items()
-                }
-            )
+            frame_people = {
+                track_id: DetectedPerson(
+                    landmarks=_world_to_engine(result.world),
+                    image_landmarks_xy=result.image_xy,
+                    visibility=result.visibility,
+                    landmark_presence=result.landmark_presence,
+                )
+                for track_id, result in results.items()
+            }
+            if hands:
+                for track_id, result in results.items():
+                    estimator.find_hands(image_rgb, frame_people[track_id], result)
+            raw.append(frame_people)
             if on_progress is not None:
                 on_progress(len(raw), total)
     finally:
