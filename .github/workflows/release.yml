@@ -84,6 +84,15 @@ jobs:
         run: |
           python -c "from pose_craft.estimation.landmarker import bundled_onnx_paths as b; import sys; from pose_craft.estimation.landmarker import bundled_hand_onnx_path as h; missing = [v for v in ('lite', 'full', 'heavy') if b(v) is None] + ([] if h() else ['hand']); sys.exit(f'missing bundled models: {missing}' if missing else 0)"
 
+      - name: Self-test the built app
+        shell: pwsh
+        run: |
+          # A real CPU solve of a bundled photo against its golden output, exports and the
+          # main window offscreen (pose_craft/selftest.py); no GPU on the runner is reported, not a failure.
+          $p = Start-Process dist/PoseCraft/PoseCraft.exe -ArgumentList '--self-test' -Wait -PassThru -NoNewWindow
+          Get-Content (Join-Path $env:TEMP 'PoseCraft-selftest.txt')
+          exit $p.ExitCode
+
       - name: Zip
         shell: pwsh
         run: |

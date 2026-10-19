@@ -6,6 +6,8 @@ import os
 from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 
 datas = [('assets/icon.png', 'assets'), ('assets/icon.ico', 'assets')]
+# --self-test (pose_craft/selftest.py) solves this CC0 photo and compares it with its golden output.
+datas += [('tests/data/golden/yoga_tree.jpg', 'selftest'), ('tests/data/golden/yoga_tree.golden.json', 'selftest')]
 binaries = []
 hiddenimports = []
 excludes = [

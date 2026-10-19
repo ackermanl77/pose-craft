@@ -37,6 +37,12 @@ class _ErrorDialogRelay(QObject):
 
 
 def main() -> int:
+    from pose_craft.selftest import run_self_test, wants_self_test
+
+    if wants_self_test(sys.argv[1:]):
+        # Models, a real CPU/GPU solve against a golden output, exports and the
+        # main window offscreen, then exit -- no visible window (pose_craft/selftest.py).
+        return run_self_test()
     # The windowed build has no console: log to a file and turn any uncaught
     # exception into a dialog pointing at it (see pose_craft/diagnostics.py).
     configure_logging()
