@@ -6,3 +6,5 @@ __pycache__/
 build/
 dist/
 build-venv-*/
+
+graphify-out/
