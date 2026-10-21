@@ -97,7 +97,10 @@ export/blender_addon/import_pose.py (installed inside Blender; add-on 0.8.0,
      each bone keeps its rotation mode
 ```
 
-`pose_craft/gui/main_window.py` is the only orchestrator: it owns the loaded
+`pose_craft/gui/main_window.py` is the only orchestrator (its widget builders, file opening and
+file exports live in three mixins since C4: `window_layout.py`, `window_inputs.py`,
+`window_export.py`; the worker threads, the solve lifecycle and Live Link stay in
+`main_window.py`, where the tests patch `send_pose_document` & co.): it owns the loaded
 photo (or tracked video), runs `PoseEstimator.detect()` on a background `QThread` (`SolveWorker`)
 so the UI doesn't freeze while the pose-landmarker model downloads/runs, and
 re-solves `retarget.skeleton.solve_bone_rotations()` synchronously (cheap, no
@@ -191,9 +194,12 @@ a real Blender) -- see "Verification" below.
 | Live Blender link client (app side) | `pose_craft/export/live_link.py` |
 | Blender-side importer + Live Link server (install manually inside Blender, not via pip) | `pose_craft/export/blender_addon/import_pose.py` |
 | Unicode-safe image loading + pre-solve photo quality checks | `pose_craft/imaging.py` |
-| Main window: controls, workers, undo, settings, menus | `pose_craft/gui/main_window.py` |
+| Main window: state, workers, solve lifecycle, preview, corrections, undo, settings, Live Link | `pose_craft/gui/main_window.py` |
+| Main window mixins (C4): widgets and menus / opening photos and videos, recent files / file exports | `pose_craft/gui/window_layout.py`, `window_inputs.py`, `window_export.py` |
+| Pose library (F15): entries, re-export, mirror, blend; its dialog | `pose_craft/pose_library.py`, `pose_craft/gui/library_dialog.py` |
+| Exe version resource, manifest, icon sizes (K7) | `scripts/windows_resources.py` |
 | Photo widget: overlay, click/hover picking, joint drag | `pose_craft/gui/photo_view.py` |
-| 3D preview: FK skeleton, floor/gizmo, hover label, photo backdrop | `pose_craft/gui/viewport_3d.py` |
+| 3D preview: FK skeleton, floor/gizmo, hover label, photo backdrop, photo-camera view (F16) | `pose_craft/gui/viewport_3d.py` |
 | Log file + uncaught-exception dialogs | `pose_craft/diagnostics.py` |
 | PyInstaller build spec (`POSECRAFT_FLAVOR=dml` default, `cuda`, `cpu`) | `PoseCraft.spec` |
 | CI (compileall + pytest, Ubuntu, Python 3.12, `requirements-test.txt`) | `.github/workflows/ci.yml` |
@@ -268,8 +274,8 @@ $env:QT_QPA_PLATFORM = "offscreen"
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-**Current count (2026-10-11, with the golden photos): 446 passed, 8
-skipped** in about 21 s; `ruff check` clean. The eight skips are the LiteRT
+**Current count (2026-10-21, with the golden photos): 472 passed, 8
+skipped** in about 22 s; `ruff check` and `mypy` clean (446 on 2026-10-11). The eight skips are the LiteRT
 reference test, the four opt-in GPU parity tests (`POSECRAFT_GPU_TESTS=1`), the
 two opt-in real-Blender tests (`POSECRAFT_BLENDER`: the Live Link/rig check and
 the extension install) and the opt-in real-DAZ test (`POSECRAFT_DAZ`). The

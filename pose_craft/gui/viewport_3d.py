@@ -84,6 +84,34 @@ CAMERA_PRESETS: dict[str, tuple[float, float]] = {
 }
 
 
+# F16: the backdrop's default opacity, and the field of view of "View from the
+# photo's camera". The backdrop comes from a weak-perspective fit (an
+# orthographic camera), so that view looks from far away with a narrow field
+# of view, where perspective all but vanishes and the photo lines up with the
+# skeleton the way the fit sees it. The other presets use pyqtgraph's default.
+DEFAULT_BACKDROP_OPACITY = 200 / 255
+PHOTO_CAMERA_FOV = 6.0
+DEFAULT_FOV = 60.0
+_PHOTO_CAMERA_MARGIN = 1.08
+
+
+def photo_camera_view(
+    corners_engine: np.ndarray, view_aspect: float, fov_degrees: float = PHOTO_CAMERA_FOV
+) -> tuple[np.ndarray, float]:
+    """(display-frame centre, distance) that frames the backdrop between
+    `corners_engine` straight on (the "front" direction: the backdrop is a
+    constant-depth plane facing the camera) in a view `view_aspect` (width /
+    height) wide whose *horizontal* field of view is `fov_degrees`
+    (pyqtgraph's convention), the whole photo visible with a small margin."""
+    corners = _engine_to_display(np.asarray(corners_engine, dtype=float))
+    center = corners.mean(axis=0)
+    half_width = 0.5 * float(np.linalg.norm(corners[1] - corners[0])) * _PHOTO_CAMERA_MARGIN
+    half_height = 0.5 * float(np.linalg.norm(corners[3] - corners[0])) * _PHOTO_CAMERA_MARGIN
+    tangent = np.tan(np.radians(fov_degrees) / 2.0)
+    distance = max(half_width / tangent, half_height * max(view_aspect, 1e-6) / tangent)
+    return center, float(distance)
+
+
 def _engine_to_display(points: np.ndarray) -> np.ndarray:
     """(N, 3) engine-frame (Y-up) points -> pyqtgraph's Z-up display frame."""
     return np.asarray(points, dtype=np.float64) @ _ENGINE_TO_DISPLAY.T
@@ -260,6 +288,9 @@ class SkeletonViewport(gl.GLViewWidget):
         self.show_labels = False
         self.hover_enabled = True
         self._backdrop: gl.GLImageItem | None = None
+        self._backdrop_rgba: np.ndarray | None = None
+        self._backdrop_corners: np.ndarray | None = None
+        self.backdrop_opacity = DEFAULT_BACKDROP_OPACITY
         self._joint_positions: dict[str, np.ndarray] = {}
         self._rotations: dict | None = None
         self._confidence: dict[str, float] | None = None
@@ -295,6 +326,8 @@ class SkeletonViewport(gl.GLViewWidget):
         if self._backdrop is not None:
             self.removeItem(self._backdrop)
             self._backdrop = None
+        self._backdrop_rgba = None
+        self._backdrop_corners = None
         if image_rgb is None or corners_engine is None:
             return
         import cv2
@@ -306,10 +339,35 @@ class SkeletonViewport(gl.GLViewWidget):
             h, w = image_rgb.shape[:2]
         rgba = np.empty((w, h, 4), dtype=np.ubyte)
         rgba[..., :3] = np.transpose(image_rgb, (1, 0, 2))
-        rgba[..., 3] = 200
+        rgba[..., 3] = round(255 * self.backdrop_opacity)
+        self._backdrop_rgba = rgba
+        self._backdrop_corners = np.asarray(corners_engine, dtype=float)
         self._backdrop = gl.GLImageItem(rgba, glOptions="translucent")
         self._backdrop.setTransform(backdrop_transform(corners_engine, w, h))
         self.addItem(self._backdrop)
+
+    def has_backdrop(self) -> bool:
+        return self._backdrop is not None
+
+    def set_backdrop_opacity(self, opacity: float) -> None:
+        """F16: 0 (invisible) .. 1 (opaque); kept for the next backdrop too."""
+        self.backdrop_opacity = float(min(1.0, max(0.0, opacity)))
+        if self._backdrop is not None and self._backdrop_rgba is not None:
+            self._backdrop_rgba[..., 3] = round(255 * self.backdrop_opacity)
+            self._backdrop.setData(self._backdrop_rgba)
+
+    def view_from_photo_camera(self) -> bool:
+        """F16: look at the backdrop straight on from (nearly) the camera the
+        pose was fitted with, so the photo and the skeleton overlay. False
+        when there's no backdrop to align to."""
+        if self._backdrop_corners is None:
+            return False
+        center, distance = photo_camera_view(self._backdrop_corners, max(1, self.width()) / max(1, self.height()))
+        elevation, azimuth = CAMERA_PRESETS["front"]
+        self.opts["center"] = Vector(*center)
+        self.opts["fov"] = PHOTO_CAMERA_FOV
+        self.setCameraPosition(distance=distance, elevation=elevation, azimuth=azimuth)
+        return True
 
     # -- hover label (F9) --------------------------------------------------------
 
@@ -381,6 +439,7 @@ class SkeletonViewport(gl.GLViewWidget):
         """Front, side or top view (or the default three-quarter one), framed
         on the current skeleton."""
         elevation, azimuth = CAMERA_PRESETS[name]
+        self.opts["fov"] = DEFAULT_FOV  # back from the photo camera's narrow one
         if self._last_frame is not None:
             center, distance = self._last_frame
             self.opts["center"] = Vector(*center)
@@ -391,6 +450,7 @@ class SkeletonViewport(gl.GLViewWidget):
     def frame_skeleton(self) -> None:
         """Re-centres and re-fits the camera on the skeleton, keeping its angle."""
         if self._last_frame is not None:
+            self.opts["fov"] = DEFAULT_FOV
             center, distance = self._last_frame
             self.opts["center"] = Vector(*center)
             self.setCameraPosition(distance=distance)

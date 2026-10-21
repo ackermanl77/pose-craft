@@ -23,6 +23,7 @@ feature-by-feature version of both.
 - [4. Export](#4-export)
 - [5. Blender Live Link](#5-blender-live-link)
 - [The 3D preview](#the-3d-preview)
+- [The pose library](#the-pose-library)
 - [Menus and keyboard shortcuts](#menus-and-keyboard-shortcuts)
 - [Setting up the Blender add-on](#setting-up-the-blender-add-on)
 - [The PoseCraft panel in Blender](#the-posecraft-panel-in-blender)
@@ -384,6 +385,12 @@ independent of the photo overlay.
   the person in it lines up with the faint raw-landmark dots -- a quick way to
   compare the 3D result with the picture from the front view. It follows the
   mirror checkbox and the body orientation fix.
+- **View > View from Photo Camera** (**5**) turns the backdrop on and looks at
+  it straight on from far away with a narrow field of view -- the way the pose
+  was fitted to the photo -- so the skeleton sits exactly over the person in
+  the picture. Any other view key (1/3/7/0) goes back to the normal lens.
+- **View > Backdrop opacity** (a slider in the View menu, remembered) fades
+  the photo from barely visible to opaque.
 
 It automatically frames itself to the selected person's actual
 size and pose on every solve or selection change, so an unusually large,
@@ -391,6 +398,30 @@ small, or extreme pose still fits in view. You can still orbit/pan/zoom it
 manually with the mouse (standard 3D-viewport drag-to-orbit,
 scroll-to-zoom) -- doing so doesn't get reset by a later solve, only the
 camera's distance and center re-fit automatically.
+
+## The pose library
+
+Poses you like can be kept and reused without the photo:
+
+- **Pose > Add to Pose Library...** (**Ctrl+Shift+L**) saves the selected
+  person as you see them -- your corrections, the Mirror checkbox and the body
+  orientation fix included -- with a thumbnail of the photo and a name.
+- **Pose > Pose Library...** (**Ctrl+Shift+P**) shows the saved poses as
+  thumbnails. Type in the search box (names, tags and photo names) or pick a
+  tag to filter. Select a pose to rename it or give it tags (comma separated,
+  then **Save Name & Tags**).
+- **Export...** writes the pose as Pose JSON, BVH, glTF (`.glb`) or a DAZ
+  Studio Genesis 9 preset (`.duf`) -- exactly what exporting from the photo
+  gave. **Send to Blender** sends it over Live Link like the current pose.
+- **Mirror Copy** adds the left/right mirrored version as a new pose.
+- **Blend Two...** (select two poses with Ctrl+click) mixes them: the slider
+  goes from all of the first pose to all of the second, bone by bone. A blend
+  keeps the tags both poses share. Blends can be exported, sent and blended
+  again, but not mirrored -- mirror the poses before blending them.
+- **Delete** removes the selected poses after asking.
+
+The library is a folder per pose under `%LOCALAPPDATA%\PoseCraft\pose_library`
+(set `POSECRAFT_LIBRARY_DIR` to keep it elsewhere, e.g. in a synced folder).
 
 ## Menus and keyboard shortcuts
 
@@ -407,6 +438,8 @@ camera's distance and center re-fit automatically.
 | 1 / 3 / 7 / 0 | Front / side / top / default 3D view |
 | F / L | Frame the skeleton / toggle bone labels |
 | H / Shift+B | Toggle the 3D hover info / the photo backdrop |
+| 5 | View from the photo's camera (backdrop and skeleton overlaid) |
+| Ctrl+Shift+L / Ctrl+Shift+P | Add the pose to the pose library / open the library |
 
 Most control labels have an underlined letter: Alt plus that letter jumps to
 it. The control with keyboard focus gets a yellow outline, and every control

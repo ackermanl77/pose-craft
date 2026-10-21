@@ -19,3 +19,9 @@ def _isolated_qt_settings(tmp_path_factory):
         return
     QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, str(tmp_path_factory.mktemp("qt-settings")))
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolated_pose_library(tmp_path, monkeypatch):
+    """The pose library (F15) lives in a per-test folder, never the user's."""
+    monkeypatch.setenv("POSECRAFT_LIBRARY_DIR", str(tmp_path / "pose_library"))

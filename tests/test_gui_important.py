@@ -356,3 +356,60 @@ def test_the_backdrop_toggle_adds_and_removes_the_photo_plane(qapp, settings):
         assert window.viewport._backdrop is None
     finally:
         window.close()
+
+
+# --- F16: the photo's own camera and the backdrop's opacity --------------------------------------
+
+
+def _screen_offsets(view, landmarks, xy, corners):
+    """How far (px) each landmark lands from where its pixel of the photo lands on screen."""
+    tl, tr, _br, bl = corners
+    on_photo = np.array([tl + x * (tr - tl) + y * (bl - tl) for x, y in xy])
+    return np.linalg.norm(view.project_to_screen(landmarks) - view.project_to_screen(on_photo), axis=1)
+
+
+def test_viewing_from_the_photo_camera_overlays_photo_and_skeleton(qapp):
+    landmarks = _articulated_pose()
+    aspect = 4 / 3
+    xy = np.column_stack([0.5 + landmarks[:, 0] * 0.6 / aspect, 0.4 - landmarks[:, 1] * 0.6])
+    corners = viewport_3d.photo_backdrop_corners(landmarks, xy, aspect)
+    view = viewport_3d.SkeletonViewport()
+    view.resize(400, 300)
+    try:
+        assert view.view_from_photo_camera() is False  # nothing to align to yet
+        view.set_backdrop(np.zeros((240, 320, 3), np.uint8), corners)
+        rotations = sk.solve_bone_rotations(landmarks)
+        view.show_skeleton(sk.forward_kinematics(rotations, *sk.measured_proportions(landmarks)))
+        view.set_camera_preset("front")
+        front = _screen_offsets(view, landmarks, xy, corners).max()
+        assert view.view_from_photo_camera() is True
+        assert view.opts["fov"] == viewport_3d.PHOTO_CAMERA_FOV
+        aligned = _screen_offsets(view, landmarks, xy, corners).max()
+        assert aligned < 6.0, "every landmark within a few pixels of its spot on the photo"
+        assert aligned < front / 3, "much closer than the perspective front view"
+        photo = view.project_to_screen(corners)
+        assert np.all((photo >= -1) & (photo <= np.array([401, 301]))), "the whole photo is in view"
+        view.set_camera_preset("side")
+        assert view.opts["fov"] == viewport_3d.DEFAULT_FOV
+    finally:
+        view.close()
+
+
+def test_backdrop_opacity_changes_the_plane_and_is_remembered(qapp, settings):
+    window = _window_with_photo(settings, [_person(_articulated_pose())])
+    try:
+        window.backdrop_opacity_slider.setValue(40)
+        window._on_view_from_photo_camera()  # turns the backdrop on and aligns the view
+        assert window.backdrop_action.isChecked() and window.viewport.has_backdrop()
+        assert window.viewport.opts["fov"] == viewport_3d.PHOTO_CAMERA_FOV
+        assert int(window.viewport._backdrop_rgba[0, 0, 3]) == round(255 * 0.4)
+        window.backdrop_opacity_slider.setValue(90)
+        assert int(window.viewport._backdrop_rgba[0, 0, 3]) == round(255 * 0.9)
+        window._save_settings()
+    finally:
+        window.close()
+    again = MainWindow(settings=settings)
+    try:
+        assert again.backdrop_opacity_slider.value() == 90
+    finally:
+        again.close()

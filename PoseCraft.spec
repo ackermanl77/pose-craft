@@ -2,8 +2,18 @@
 import glob
 import importlib.util
 import os
+import sys
 
 from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
+
+# K7: the version resource (publisher MELEJ, pose_craft.__version__) and the manifest (UTF-8
+# active code page, PerMonitorV2), from scripts/windows_resources.py. SPECPATH/workpath are
+# PyInstaller's globals.
+sys.path.insert(0, os.path.join(SPECPATH, 'scripts'))
+import windows_resources  # noqa: E402
+
+VERSION_PATH = windows_resources.write_version_file(workpath)
+MANIFEST_PATH = windows_resources.write_manifest(workpath)
 
 datas = [('assets/icon.png', 'assets'), ('assets/icon.ico', 'assets')]
 # --self-test (pose_craft/selftest.py) solves this CC0 photo and compares it with its golden output.
@@ -131,6 +141,8 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['assets/icon.ico'],
+    version=VERSION_PATH,
+    manifest=MANIFEST_PATH,
 )
 coll = COLLECT(
     exe,
