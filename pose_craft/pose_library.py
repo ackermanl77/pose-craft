@@ -42,6 +42,10 @@ THUMB_SIDE = 256
 EXPORT_FORMATS = (".json", ".bvh", ".glb", ".duf")
 
 
+BLENDER_BUNDLE_FORMAT = "pose_craft_library"
+BLENDER_BUNDLE_NAME = "posecraft_library.json"
+
+
 class LibraryError(ValueError):
     """A missing or unreadable entry, or a request the entry can't satisfy."""
 
@@ -374,6 +378,31 @@ class PoseLibrary:
             bone_confidence=inputs.confidence, hip_height=inputs.hip_height, leg_length=inputs.leg_length,
             out_of_frame=inputs.out_of_frame,
         )
+
+    def export_blender_bundle(self, folder: str | Path, entry_ids=None) -> Path:
+        """F17: writes the entries (default: all) as a library bundle Blender's
+        PoseCraft add-on turns into Pose Library assets -- ``posecraft_library.json``
+        ({"format": "pose_craft_library", "version": 1, "poses": [{"name", "tags",
+        "document" (the Live Link pose document), "thumbnail" (a PNG next to it, or
+        None)}]}) plus the thumbnails. Returns the JSON's path."""
+        folder = Path(folder)
+        folder.mkdir(parents=True, exist_ok=True)
+        ids = list(entry_ids) if entry_ids is not None else [entry.id for entry in self.entries()]
+        if not ids:
+            raise LibraryError("the pose library is empty")
+        poses = []
+        for entry_id in ids:
+            entry = self.get(entry_id)
+            thumbnail = None
+            source = self.thumbnail_path(entry_id)
+            if source.is_file():
+                thumbnail = f"{entry_id}.png"
+                shutil.copyfile(source, folder / thumbnail)
+            poses.append({"name": entry.name, "tags": list(entry.tags), "document": self.live_link_document(entry_id),
+                          "thumbnail": thumbnail})
+        path = folder / BLENDER_BUNDLE_NAME
+        path.write_text(json.dumps({"format": BLENDER_BUNDLE_FORMAT, "version": 1, "poses": poses}), encoding="utf-8")
+        return path
 
     def export(self, entry_id: str, path: str | Path, figure=None) -> Path:
         """Writes the entry as a pose JSON (.json), BVH (.bvh), binary glTF

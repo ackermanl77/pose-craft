@@ -44,9 +44,14 @@ from typing import Any
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 POSE_REQUEST_PROTOCOL = 2
 ANIMATION_REQUEST_PROTOCOL = 3
+# F17 (add-on 0.9.0+): {"format": "pose_craft_library", "path": <bundle JSON>} -- Blender reads the
+# bundle (pose_library.PoseLibrary.export_blender_bundle) from disk and makes Pose Library assets.
+LIBRARY_REQUEST_PROTOCOL = 4
+LIBRARY_FORMAT_NAME = "pose_craft_library"
+LIBRARY_TIMEOUT_SECONDS = 60.0
 # A reply is a few hundred bytes; anything claiming more is not the add-on.
 MAX_REPLY_BYTES = 64 * 1024
 # Under the add-on's MAX_LIVE_LINK_PAYLOAD_BYTES (256 KB) with room for the
@@ -108,6 +113,17 @@ def send_pose_document(
     """
     request = dict(document)
     request["live_link_protocol"] = POSE_REQUEST_PROTOCOL
+    return _exchange(request, host, port, timeout)
+
+
+def send_library_request(
+    bundle_path: str, *, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, timeout: float = LIBRARY_TIMEOUT_SECONDS
+) -> dict | None:
+    """Asks the add-on to turn the library bundle at `bundle_path` into Pose
+    Library assets (F17). Only the path travels: Live Link is local, and a
+    library with thumbnails is far over the add-on's request size limit. The
+    reply's "library" says how many assets were made."""
+    request = {"format": LIBRARY_FORMAT_NAME, "path": str(bundle_path), "live_link_protocol": LIBRARY_REQUEST_PROTOCOL}
     return _exchange(request, host, port, timeout)
 
 

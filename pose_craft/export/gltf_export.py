@@ -31,6 +31,7 @@ from pose_craft.export.bvh_export import (
     _channel_order,
     _offset,
 )
+from pose_craft.export.skeleton_presets import DEFAULT_SKELETON, frames_for, rig_for
 from pose_craft.retarget.skeleton import FINGER_BONES, rest_head_positions
 
 CM = 0.01  # skeleton centimetres -> glTF metres
@@ -89,25 +90,33 @@ def build_gltf_animation(
     frame_time: float = 1.0 / 30.0,
     root_positions: list[tuple[float, float, float]] | None = None,
     name: str = "PoseCraft",
+    skeleton: str = DEFAULT_SKELETON,
 ) -> bytes:
     """A .glb of ``frames`` (bone name -> local Rotation, engine frame; missing bones identity) --
     the same input as ``bvh_export.build_bvh_animation``. One frame makes a static pose (still
-    written as a one-key animation, so importers apply it)."""
+    written as a one-key animation, so importers apply it). ``skeleton``: a preset of
+    skeleton_presets.SKELETON_CHOICES (B22)."""
     if not frames:
         raise ValueError("a glTF animation needs at least one frame")
     if root_positions is not None and len(root_positions) != len(frames):
         raise ValueError(f"{len(root_positions)} root positions for {len(frames)} frames")
     finger_names = {finger.name for finger in FINGER_BONES}
     with_fingers = any(finger_names & set(rotations) for rotations in frames)
-    children_of = _CHILDREN_WITH_FINGERS if with_fingers else _CHILDREN
-    joints = _channel_order(children_of)
-    index = {joint: i for i, joint in enumerate(joints)}
     roots = [tuple(p) for p in (root_positions or [(0.0, 0.0, 0.0)] * len(frames))]
-    heads = rest_head_positions()
+    if skeleton != DEFAULT_SKELETON:
+        rig = rig_for(skeleton, with_fingers)
+        frames, roots = frames_for(skeleton, frames, roots)
+        joints, children_of, root_joint = rig.order(), rig.children, rig.root
+        heads, offset_of, vector_of = rig.rest_heads(), rig.offset.__getitem__, rig.tip.__getitem__
+    else:
+        children_of = _CHILDREN_WITH_FINGERS if with_fingers else _CHILDREN
+        joints, root_joint = _channel_order(children_of), _ROOT_BONE
+        heads, offset_of, vector_of = rest_head_positions(), _offset, _bone_vector
+    index = {joint: i for i, joint in enumerate(joints)}
 
     nodes: list[dict] = []
     for joint in joints:
-        translation = (np.array(roots[0]) if joint == _ROOT_BONE else _offset(joint)) * CM
+        translation = (np.array(roots[0]) if joint == root_joint else offset_of(joint)) * CM
         node = {"name": joint, "translation": [float(v) for v in translation],
                 "rotation": [float(v) for v in frames[0].get(joint, Rotation.identity()).as_quat()]}
         kids = [index[child] for child in children_of[joint]]
@@ -122,7 +131,7 @@ def build_gltf_animation(
     joint_ids: list[np.ndarray] = []
     for joint in joints:
         head = (heads[joint] if joint in heads else np.zeros(3)) * CM
-        corners, faces = _stick(head, _bone_vector(joint) * CM)
+        corners, faces = _stick(head, vector_of(joint) * CM)
         indices.append(faces + len(positions) * 8)
         positions.append(corners)
         joint_ids.append(np.full((8, 4), [index[joint], 0, 0, 0], np.uint16))
@@ -153,7 +162,7 @@ def build_gltf_animation(
         channels.append({"sampler": len(samplers) - 1, "target": {"node": index[joint], "path": "rotation"}})
     root_translations = np.array(roots, np.float32) * np.float32(CM)
     samplers.append({"input": times, "output": binary.add(root_translations, _FLOAT, "VEC3"), "interpolation": "LINEAR"})
-    channels.append({"sampler": len(samplers) - 1, "target": {"node": index[_ROOT_BONE], "path": "translation"}})
+    channels.append({"sampler": len(samplers) - 1, "target": {"node": index[root_joint], "path": "translation"}})
 
     mesh_node = len(nodes)
     nodes.append({"name": f"{name} bones", "mesh": 0, "skin": 0})
@@ -161,13 +170,13 @@ def build_gltf_animation(
     document = {
         "asset": {"version": "2.0", "generator": "PoseCraft"},
         "scene": 0,
-        "scenes": [{"name": name, "nodes": [index[_ROOT_BONE], mesh_node]}],
+        "scenes": [{"name": name, "nodes": [index[root_joint], mesh_node]}],
         "nodes": nodes,
         "meshes": [{"name": f"{name} bones", "primitives": [{
             "attributes": {"POSITION": position_accessor, "JOINTS_0": joints_accessor, "WEIGHTS_0": weights_accessor},
             "indices": index_accessor, "mode": 4,
         }]}],
-        "skins": [{"name": name, "joints": list(range(len(joints))), "skeleton": index[_ROOT_BONE],
+        "skins": [{"name": name, "joints": list(range(len(joints))), "skeleton": index[root_joint],
                    "inverseBindMatrices": inverse_bind_accessor}],
         "animations": [{"name": name, "samplers": samplers, "channels": channels}],
         "buffers": buffers,
@@ -185,14 +194,17 @@ def build_gltf_animation(
             + struct.pack("<I4s", len(binary.data), b"BIN\x00") + bytes(binary.data))
 
 
-def build_gltf_pose(bone_rotations: dict[str, Rotation], *, root_position=(0.0, 0.0, 0.0), name: str = "PoseCraft") -> bytes:
-    return build_gltf_animation([bone_rotations], root_positions=[tuple(root_position)], name=name)
+def build_gltf_pose(bone_rotations: dict[str, Rotation], *, root_position=(0.0, 0.0, 0.0), name: str = "PoseCraft",
+                    skeleton: str = DEFAULT_SKELETON) -> bytes:
+    return build_gltf_animation([bone_rotations], root_positions=[tuple(root_position)], name=name, skeleton=skeleton)
 
 
-def save_gltf_animation(frames, path: str | Path, *, frame_time: float = 1.0 / 30.0, root_positions=None) -> None:
+def save_gltf_animation(frames, path: str | Path, *, frame_time: float = 1.0 / 30.0, root_positions=None,
+                        skeleton: str = DEFAULT_SKELETON) -> None:
     Path(path).write_bytes(build_gltf_animation(frames, frame_time=frame_time, root_positions=root_positions,
-                                                name=Path(path).stem))
+                                                name=Path(path).stem, skeleton=skeleton))
 
 
-def save_gltf_pose(bone_rotations, path: str | Path, *, root_position=(0.0, 0.0, 0.0)) -> None:
-    Path(path).write_bytes(build_gltf_pose(bone_rotations, root_position=root_position, name=Path(path).stem))
+def save_gltf_pose(bone_rotations, path: str | Path, *, root_position=(0.0, 0.0, 0.0), skeleton: str = DEFAULT_SKELETON) -> None:
+    Path(path).write_bytes(build_gltf_pose(bone_rotations, root_position=root_position, name=Path(path).stem,
+                                           skeleton=skeleton))

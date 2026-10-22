@@ -6,6 +6,7 @@ The window passes a `send` callback (its Live Link worker) so a library pose
 goes to Blender exactly like the current pose does."""
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from pose_craft.export.live_link import LIBRARY_FORMAT_NAME
 from pose_craft.pose_library import LibraryError, PoseLibrary, read_thumbnail
 
 ALL_TAGS = "All tags"
@@ -120,6 +122,14 @@ class PoseLibraryDialog(QDialog):
         self.send_btn = QPushButton("Send to &Blender")
         self.send_btn.clicked.connect(self._on_send)
         self.send_btn.setVisible(send is not None)
+        # F17: every pose (or the selected ones) as Pose Library assets in Blender.
+        self.send_library_btn = QPushButton("Send Library to Blender")
+        self.send_library_btn.setToolTip(
+            "Make Blender Pose Library assets (with thumbnails) from the selected poses, or all of them, on the "
+            "Live Link target armature -- then blend and flip them in Blender's Pose Library."
+        )
+        self.send_library_btn.clicked.connect(self._on_send_library)
+        self.send_library_btn.setVisible(send is not None)
         self.mirror_btn = QPushButton("&Mirror Copy")
         self.mirror_btn.clicked.connect(self._on_mirror)
         self.blend_btn = QPushButton("B&lend Two...")
@@ -128,7 +138,8 @@ class PoseLibraryDialog(QDialog):
         self.delete_btn = QPushButton("&Delete")
         self.delete_btn.clicked.connect(self._on_delete)
         actions = QHBoxLayout()
-        for button in (self.export_btn, self.send_btn, self.mirror_btn, self.blend_btn, self.delete_btn):
+        for button in (self.export_btn, self.send_btn, self.send_library_btn, self.mirror_btn, self.blend_btn,
+                       self.delete_btn):
             actions.addWidget(button)
         actions.addStretch(1)
         close = QDialogButtonBox(QDialogButtonBox.Close)
@@ -218,6 +229,18 @@ class PoseLibraryDialog(QDialog):
         (entry_id,) = self.selected_ids()
         if self._send is not None:
             self._send(self.library.live_link_document(entry_id))
+
+    def _on_send_library(self) -> None:
+        if self._send is None:
+            return
+        try:
+            bundle = self.library.export_blender_bundle(
+                Path(tempfile.gettempdir()) / "PoseCraft library for Blender", self.selected_ids() or None
+            )
+        except (LibraryError, OSError) as exc:
+            QMessageBox.warning(self, "Send Library to Blender", str(exc))
+            return
+        self._send({"format": LIBRARY_FORMAT_NAME, "path": str(bundle)})
 
     def _on_mirror(self) -> None:
         (entry_id,) = self.selected_ids()

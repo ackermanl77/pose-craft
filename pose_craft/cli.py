@@ -3,6 +3,7 @@
     python -m pose_craft.cli --input photos/ --output poses/ [--format json|bvh|duf|glb]
         [--mirror] [--model lite|full|heavy] [--cpu] [--max-people 4]
         [--group-photo] [--hands] [--detection-threshold 0.5] [--no-overwrite]
+        [--skeleton posecraft|mixamo|ue5|humanik]
 
 Writes "<photo stem>_person<N>.json" (or .bvh) per detected person -- the same
 files "Export All People" writes -- and prints a line per photo. Exit code 0
@@ -16,6 +17,7 @@ from pathlib import Path
 
 from pose_craft.batch import FORMATS, solve_folder
 from pose_craft.estimation.landmarker import MODEL_URLS, PoseEstimator
+from pose_craft.export.skeleton_presets import DEFAULT_SKELETON, SKELETON_CHOICES
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,6 +37,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hands", action="store_true", help="also solve hands and fingers")
     parser.add_argument("--detection-threshold", type=float, default=0.5, help="person detector threshold, 0.1-0.9 (default: 0.5)")
     parser.add_argument("--no-overwrite", action="store_true", help="keep pose files that already exist")
+    parser.add_argument(
+        "--skeleton", choices=[key for key, _label in SKELETON_CHOICES], default=DEFAULT_SKELETON,
+        help="bone names, hierarchy and rest pose of BVH/glb files: PoseCraft's own (default), Mixamo, "
+        "the UE5 Mannequin or HumanIK",
+    )
     return parser
 
 
@@ -55,6 +62,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"pose model: {args.model} on {estimator.device}")
         result = solve_folder(
             args.input, args.output, estimator, fmt=args.format, mirror=args.mirror, overwrite=not args.no_overwrite,
+            skeleton=args.skeleton,
         )
     for outcome in result.outcomes:
         detail = outcome.error or ", ".join(path.name for path in outcome.written) or "kept existing files"

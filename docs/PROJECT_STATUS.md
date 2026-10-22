@@ -425,6 +425,25 @@ time each check ran, not guaranteed to stay true as the code changes.
 
 ## Recently Fixed
 
+- **2026-10-21 -- skeleton presets (B22), FBX through Blender (F11), library to Blender's Pose
+  Library (F17), animation import (F18), real-Blender CI (T4).**
+  - `export/skeleton_presets.py`: a `Rig` (joints, offsets, tips) the BVH and glTF writers emit;
+    PoseCraft's own rig gives byte-identical files. Mixamo, UE5 Mannequin and HumanIK presets add a
+    hips root carrying the torso rotation, a straight spine chain, clavicles, the UE5 floor root and
+    A-pose rest (upper arm `r·A⁻¹`, below it `A·r·A⁻¹`); `tests/test_skeleton_presets.py` checks
+    every mapped joint lands where PoseCraft's own skeleton puts it.
+  - `export/fbx_export.py`: glTF -> headless Blender (`--factory-startup`, temporary user folders)
+    -> FBX at the animation's fps and frame range; `tests/test_fbx_export.py` re-imports glTF and
+    FBX in Blender 5.2 and compares every bone in every frame (posecraft, mixamo, ue5).
+  - F17: `PoseLibrary.export_blender_bundle()` + Live Link protocol 4 (`send_library_request`,
+    only the path travels) + add-on 0.9.0 `create_library_assets()` via Blender's
+    `pose_library.pose_creation`; checked in Blender 5.2 (`tests/test_real_blender_library.py`).
+  - F18: `import_animation.py` -- any BVH by topology (hand -> elbow -> shoulder, foot -> knee ->
+    hip, head) into BlazePose-style landmarks, a `VideoSolve`; round trips through every preset,
+    including the A-pose UE5 one and a Z-up file facing away (`tests/test_import_animation.py`).
+  - T4: a `blender` CI job downloads Blender 4.2.23 LTS (checksum-pinned) and runs the three
+    real-Blender test files. Not yet run on GitHub.
+
 - **Fingers in video (2026-10-18, B21).** With "Hands and fingers" checked, `solve_video(hands=True)` runs the hand model on every tracked person each frame (`PoseEstimator.find_hands`, the photo path's own wrist/index/pinky-seeded crop), and `smooth_people` smooths each hand's shape relative to its wrist (One Euro, like the body), puts it back on the *smoothed* wrist, and keeps a hand the model missed for up to `HAND_HOLD_SECONDS` (0.25 s). The GUI's video worker enables the hand model first. Exports (BVH, glTF, Blender) get the finger bones through the existing photo path. Tried on 25-40-frame clips made from the committed golden photos: hands on every frame where the photo shows them, anchored to the wrist. Tests in `tests/test_video.py`.
 - **glTF export (2026-10-18, F11).** `pose_craft/export/gltf_export.py` writes a binary glTF 2.0 with the BVH exporter's own skeleton -- glTF's Y-up, +Z-facing frame is the engine frame, so offsets and local rotations carry over unchanged (cm -> m) -- plus a skin (rest-pose inverse binds), a bone-stick mesh weighted one bone per stick, and LINEAR rotation channels per joint and root translation (quaternions kept in one hemisphere). Fingers when solved. Offered in the pose and video save dialogs (by extension) and as `--format glb`. Checked with the Khronos glTF-Validator 2.0.0-dev.3.10 (0 errors/warnings/infos); `tests/test_gltf_export.py` checks that forward kinematics over the glb's nodes equals `skeleton.forward_kinematics()` at several frames, with and without fingers. Not done: FBX (would go through the Blender add-on).
 - **2026-10-11: real-photo goldens (T2).** Five photos from Wikimedia Commons,

@@ -12,6 +12,7 @@ from pathlib import Path
 from pose_craft.estimation.landmarker import PoseEstimator
 from pose_craft.export.blender_pose import save_pose_file
 from pose_craft.export.bvh_export import floor_root_position, save_bvh_file
+from pose_craft.export.skeleton_presets import DEFAULT_SKELETON, check_skeleton
 from pose_craft.imaging import imread_unicode
 from pose_craft.posing import default_export_name, document_inputs, edited_person, out_of_frame_bones, root_for
 
@@ -59,6 +60,7 @@ def solve_folder(
     overwrite: bool = True,
     on_progress: Callable[[int, int, Path], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    skeleton: str = DEFAULT_SKELETON,
 ) -> BatchResult:
     """Solve every photo in `input_dir` with `estimator` (its max_people,
     group_photo, hands and thresholds apply) and write each person's pose into
@@ -66,6 +68,7 @@ def solve_folder(
     its outcome and skipped; `overwrite=False` leaves existing files alone."""
     if fmt not in FORMATS:
         raise ValueError(f"format must be one of {', '.join(FORMATS)}, got {fmt!r}")
+    check_skeleton(skeleton)
     figure = None
     if fmt == "duf":
         from pose_craft.export.daz_pose import load_daz_figure
@@ -99,11 +102,11 @@ def solve_folder(
             rotations, confidence = document_inputs(person, mirror, aspect=aspect)
             try:
                 if fmt == "bvh":
-                    save_bvh_file(rotations, target, root_position=floor_root_position(rotations))
+                    save_bvh_file(rotations, target, root_position=floor_root_position(rotations), skeleton=skeleton)
                 elif fmt == "glb":
                     from pose_craft.export.gltf_export import save_gltf_pose
 
-                    save_gltf_pose(rotations, target, root_position=floor_root_position(rotations))
+                    save_gltf_pose(rotations, target, root_position=floor_root_position(rotations), skeleton=skeleton)
                 elif fmt == "duf":
                     from pose_craft.export.daz_pose import save_daz_pose_file
 

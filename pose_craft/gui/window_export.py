@@ -20,6 +20,7 @@ from pose_craft.export.blender_pose import (
     save_pose_file,
 )
 from pose_craft.export.bvh_export import floor_root_position, save_bvh_animation, save_bvh_file
+from pose_craft.export.skeleton_presets import DEFAULT_SKELETON
 from pose_craft.gui.library_dialog import PoseLibraryDialog
 from pose_craft.pose_library import LibraryError, PoseLibrary
 from pose_craft.posing import (
@@ -33,19 +34,46 @@ from pose_craft.posing import (
 log = logging.getLogger("pose_craft.gui.main_window")
 
 
-# BVH or binary glTF (F11), chosen by the file name's extension in the save dialog.
+# BVH, binary glTF or FBX (F11), chosen by the file name's extension in the save dialog. FBX is
+# offered when Blender is installed (export/fbx_export.py converts the glTF with it).
 SKELETON_FILTERS = "BVH (*.bvh);;glTF binary (*.glb)"
+FBX_FILTER = ";;FBX through Blender (*.fbx)"
 
-def save_skeleton_animation(frames, path, *, frame_time, root_positions):
-    if str(path).lower().endswith(".glb"):
+
+def save_skeleton_animation(frames, path, *, frame_time, root_positions, skeleton=DEFAULT_SKELETON, blender=None):
+    suffix = str(path).lower()
+    if suffix.endswith(".glb"):
         from pose_craft.export.gltf_export import save_gltf_animation
 
-        save_gltf_animation(frames, path, frame_time=frame_time, root_positions=root_positions)
+        save_gltf_animation(frames, path, frame_time=frame_time, root_positions=root_positions, skeleton=skeleton)
+    elif suffix.endswith(".fbx"):
+        from pose_craft.export.fbx_export import save_fbx_animation
+
+        save_fbx_animation(frames, path, blender=blender, frame_time=frame_time, root_positions=root_positions,
+                           skeleton=skeleton)
     else:
-        save_bvh_animation(frames, path, frame_time=frame_time, root_positions=root_positions)
+        save_bvh_animation(frames, path, frame_time=frame_time, root_positions=root_positions, skeleton=skeleton)
 
 
 class ExportMixin:
+    # -- skeleton presets (B22) and FBX through Blender (F11) -------------------------------------
+
+    def _skeleton(self) -> str:
+        return self.skeleton_combo.currentData() or DEFAULT_SKELETON
+
+    def _blender_path(self):
+        from pose_craft.export.fbx_export import find_blender
+
+        return find_blender(str(self._settings.value("blender/path", "") or ""))
+
+    def _skeleton_filters(self) -> str:
+        return SKELETON_FILTERS + (FBX_FILTER if self._blender_path() is not None else "")
+
+    def _save_skeleton_pose(self, rotations, path: str) -> None:
+        """One pose as BVH, glTF or FBX by the extension, on the chosen skeleton, standing on the floor (B6)."""
+        save_skeleton_animation([rotations], path, frame_time=1.0 / 30.0, root_positions=[floor_root_position(rotations)],
+                                skeleton=self._skeleton(), blender=self._blender_path())
+
     # -- pose library (F15) ------------------------------------------------------------------
 
     def _on_add_to_library(self) -> None:
@@ -84,13 +112,18 @@ class ExportMixin:
             return
         stem = Path(self._video.path).stem
         name = f"{stem}.bvh" if len(self._video.track_ids()) == 1 else default_export_name(self._video.path, track, ".bvh")
-        path, _ = QFileDialog.getSaveFileName(self, "Export Animation BVH", str(Path(self._last_dir()) / name), SKELETON_FILTERS)
+        path, _ = QFileDialog.getSaveFileName(self, "Export Animation BVH", str(Path(self._last_dir()) / name),
+                                              self._skeleton_filters())
         if not path:
             return
         try:
-            save_skeleton_animation(frames, path, frame_time=1.0 / self._video.fps, root_positions=roots)
+            save_skeleton_animation(frames, path, frame_time=1.0 / self._video.fps, root_positions=roots,
+                                    skeleton=self._skeleton(), blender=self._blender_path())
         except OSError as exc:
             self._report_export_error("Export Animation BVH", path, exc)
+            return
+        except RuntimeError as exc:  # Blender couldn't convert to FBX
+            QMessageBox.warning(self, "Export FBX", str(exc))
             return
         self.statusBar().showMessage(f"Exported {len(frames)} frames of Person {track + 1} to {path}")
 
@@ -111,7 +144,8 @@ class ExportMixin:
         for track, path in paths.items():
             _indices, frames, roots = self._video_track_frames(track)
             try:
-                save_bvh_animation(frames, path, frame_time=1.0 / self._video.fps, root_positions=roots)
+                save_bvh_animation(frames, path, frame_time=1.0 / self._video.fps, root_positions=roots,
+                                   skeleton=self._skeleton())
             except OSError as exc:
                 self._report_export_error("Export All People", str(path), exc)
                 return
@@ -246,23 +280,22 @@ class ExportMixin:
         rotations, _confidence = inputs
 
         path = self._export_path(
-            "Export BVH", default_export_name(self._source_path, self.person_combo.currentIndex(), ".bvh"), SKELETON_FILTERS
+            "Export BVH", default_export_name(self._source_path, self.person_combo.currentIndex(), ".bvh"),
+            self._skeleton_filters(),
         )
         if not path:
             return
 
         try:
-            # Standing on the floor (B6): a crouch is exported lowered. .glb: glTF (F11).
-            if path.lower().endswith(".glb"):
-                from pose_craft.export.gltf_export import save_gltf_pose
-
-                save_gltf_pose(rotations, path, root_position=floor_root_position(rotations))
-            else:
-                save_bvh_file(rotations, path, root_position=floor_root_position(rotations))
+            # Standing on the floor (B6): a crouch is exported lowered. .glb: glTF, .fbx: FBX (F11).
+            self._save_skeleton_pose(rotations, path)
         except OSError as exc:
             self._report_export_error("Export BVH", path, exc)
             return
-        self.statusBar().showMessage(f"Exported BVH to {path}")
+        except RuntimeError as exc:  # Blender couldn't convert to FBX
+            QMessageBox.warning(self, "Export FBX", str(exc))
+            return
+        self.statusBar().showMessage(f"Exported {Path(path).suffix.lstrip('.').upper()} to {path}")
 
     def _on_export_daz(self) -> None:
         from pose_craft.export.daz_pose import (
@@ -319,7 +352,7 @@ class ExportMixin:
                 self._photo_aspect(),
             )
             try:
-                save_bvh_file(rotations, path, root_position=floor_root_position(rotations))
+                save_bvh_file(rotations, path, root_position=floor_root_position(rotations), skeleton=self._skeleton())
             except OSError as exc:
                 self._report_export_error("Export All People (BVH)", str(path), exc)
                 return

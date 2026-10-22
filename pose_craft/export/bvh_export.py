@@ -47,6 +47,10 @@ fingers" option), each hand JOINT gets its fingers as child JOINTs (thumb.01
 -> .02 -> .03, f_index.01 ..., with End Sites at the tips), placed from
 skeleton.FINGER_BASE_OFFSETS_CM / FINGER_LENGTHS_CM. Without finger bones the
 file is exactly the 15-joint one.
+
+Skeleton presets (B22): ``skeleton="mixamo"``, ``"ue5"`` or ``"humanik"`` writes
+the same pose on that skeleton -- names, hierarchy and rest pose -- built by
+export/skeleton_presets.py; the default "posecraft" is the file described above.
 """
 from __future__ import annotations
 
@@ -71,6 +75,8 @@ from pose_craft.retarget.skeleton import (  # noqa: F401 -- the size constants a
 )
 
 BVH_ROTATION_ORDER = "ZXY"  # intrinsic Z, X, Y -- see module docstring
+# Imported here, after the retarget imports: skeleton_presets builds on the same rest skeleton.
+from pose_craft.export.skeleton_presets import DEFAULT_SKELETON, frames_for, rig_for  # noqa: E402
 
 # See module docstring: this exporter's own BVH frame is defined to be
 # identical to the engine frame, so this conversion is the identity -- but
@@ -125,28 +131,30 @@ def _fmt(value: float) -> str:
     return f"{value:.6f}"
 
 
-def _write_joint(lines: list[str], name: str, indent: int, is_root: bool, children_of=None) -> None:
+def _write_joint(lines: list[str], name: str, indent: int, is_root: bool, children_of=None, rig=None) -> None:
     pad = "  " * indent
     keyword = "ROOT" if is_root else "JOINT"
     lines.append(f"{pad}{keyword} {name}")
     lines.append(f"{pad}{{")
-    offset = _offset(name)
+    offset = rig.offset[name] if rig is not None else _offset(name)
     lines.append(f"{pad}  OFFSET {_fmt(offset[0])} {_fmt(offset[1])} {_fmt(offset[2])}")
     if is_root:
         lines.append(f"{pad}  CHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation")
     else:
         lines.append(f"{pad}  CHANNELS 3 Zrotation Xrotation Yrotation")
 
+    if rig is not None:
+        children_of = rig.children
     children_of = _CHILDREN if children_of is None else children_of
     children = children_of[name]
     if children:
         for child in children:
-            _write_joint(lines, child, indent + 1, is_root=False, children_of=children_of)
+            _write_joint(lines, child, indent + 1, is_root=False, children_of=children_of, rig=rig)
     else:
         # A leaf JOINT (hand/foot/head -- no further bone in our 15-bone set)
         # still needs a terminating End Site so BVH readers know where its own
         # tip is: the bone's own rest vector, relative to the joint's head.
-        tip = _bone_vector(name)
+        tip = rig.tip[name] if rig is not None else _bone_vector(name)
         lines.append(f"{pad}  End Site")
         lines.append(f"{pad}  {{")
         lines.append(f"{pad}    OFFSET {_fmt(tip[0])} {_fmt(tip[1])} {_fmt(tip[2])}")
@@ -200,24 +208,32 @@ def build_bvh_animation(
     *,
     frame_time: float = 1.0 / 30.0,
     root_positions: list[tuple[float, float, float]] | None = None,
+    skeleton: str = DEFAULT_SKELETON,
 ) -> str:
     """A multi-frame BVH: the same HIERARCHY as build_bvh_document, and one
     MOTION line per entry of `frames` (each a bone name -> local Rotation dict,
     missing bones identity). root_positions: one per frame (default: all at
     the origin). Finger joints are written when any frame has finger bones
-    (frames without them keep their fingers straight)."""
+    (frames without them keep their fingers straight). `skeleton`: a preset
+    of skeleton_presets.SKELETON_CHOICES (B22)."""
     if not frames:
         raise ValueError("a BVH needs at least one frame")
     if root_positions is not None and len(root_positions) != len(frames):
         raise ValueError(f"{len(root_positions)} root positions for {len(frames)} frames")
     finger_names = {finger.name for finger in FINGER_BONES}
     with_fingers = any(finger_names & set(rotations) for rotations in frames)
-    children_of = _CHILDREN_WITH_FINGERS if with_fingers else _CHILDREN
-    hierarchy_lines: list[str] = ["HIERARCHY"]
-    _write_joint(hierarchy_lines, _ROOT_BONE, indent=0, is_root=True, children_of=children_of)
-
-    order = _channel_order(children_of)
     positions = root_positions if root_positions is not None else [(0.0, 0.0, 0.0)] * len(frames)
+    if skeleton != DEFAULT_SKELETON:
+        rig = rig_for(skeleton, with_fingers)
+        frames, positions = frames_for(skeleton, frames, positions)
+        hierarchy_lines = ["HIERARCHY"]
+        _write_joint(hierarchy_lines, rig.root, indent=0, is_root=True, rig=rig)
+        order = rig.order()
+    else:
+        children_of = _CHILDREN_WITH_FINGERS if with_fingers else _CHILDREN
+        hierarchy_lines = ["HIERARCHY"]
+        _write_joint(hierarchy_lines, _ROOT_BONE, indent=0, is_root=True, children_of=children_of)
+        order = _channel_order(children_of)
     lines = hierarchy_lines + [
         "MOTION",
         f"Frames: {len(frames)}",
@@ -232,6 +248,7 @@ def build_bvh_document(
     *,
     frame_time: float = 1.0 / 30.0,
     root_position: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    skeleton: str = DEFAULT_SKELETON,
 ) -> str:
     """bone_rotations: bone name -> local (parent-relative) Rotation, engine
     frame -- the same dict solve_bone_rotations() returns and
@@ -245,7 +262,7 @@ def build_bvh_document(
     HIERARCHY block declares. Pass root_position=floor_root_position(...) to
     stand the pose on the floor (the app does).
     """
-    return build_bvh_animation([bone_rotations], frame_time=frame_time, root_positions=[root_position])
+    return build_bvh_animation([bone_rotations], frame_time=frame_time, root_positions=[root_position], skeleton=skeleton)
 
 
 def save_bvh_file(
@@ -254,9 +271,10 @@ def save_bvh_file(
     *,
     frame_time: float = 1.0 / 30.0,
     root_position: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    skeleton: str = DEFAULT_SKELETON,
 ) -> None:
     Path(path).write_text(
-        build_bvh_document(bone_rotations, frame_time=frame_time, root_position=root_position),
+        build_bvh_document(bone_rotations, frame_time=frame_time, root_position=root_position, skeleton=skeleton),
         encoding="utf-8",
     )
 
@@ -267,7 +285,9 @@ def save_bvh_animation(
     *,
     frame_time: float = 1.0 / 30.0,
     root_positions: list[tuple[float, float, float]] | None = None,
+    skeleton: str = DEFAULT_SKELETON,
 ) -> None:
     Path(path).write_text(
-        build_bvh_animation(frames, frame_time=frame_time, root_positions=root_positions), encoding="utf-8"
+        build_bvh_animation(frames, frame_time=frame_time, root_positions=root_positions, skeleton=skeleton),
+        encoding="utf-8",
     )

@@ -124,8 +124,10 @@ See docs/PROJECT_STATUS.md.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
+import os
 import socket
 import time
 
@@ -135,7 +137,7 @@ from mathutils import Quaternion, Vector
 bl_info = {
     "name": "PoseCraft Pose Importer",
     "author": "PoseCraft",
-    "version": (0, 8, 0),
+    "version": (0, 9, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > PoseCraft",
     "description": "Applies a PoseCraft .json pose export (file or Live Link) to an armature's pose bones",
@@ -255,7 +257,10 @@ DEFAULT_LIVE_LINK_PORT = 8642
 # carries the lowest protocol that understands it -- single poses still say 2,
 # so they keep working with a 0.4-0.6 add-on, while an animation says 3 and an
 # older add-on refuses it with "update the add-on" instead of misreading it.
-LIVE_LINK_PROTOCOL_VERSION = 3
+LIVE_LINK_PROTOCOL_VERSION = 4
+# Version 4 (F17): {"format": "pose_craft_library", "path": <bundle JSON>} -- the app's
+# pose library, made into Pose Library assets (create_library_assets).
+LIBRARY_FORMAT_NAME = "pose_craft_library"
 _POLL_INTERVAL_SECONDS = 0.1
 # A 15-bone document is about 4 KB; guards against a bogus or hostile length
 # header making the server buffer an unbounded read. Animations are not an
@@ -629,7 +634,7 @@ class LiveLinkReader:
 
 
 def build_live_link_reply(
-    applied=(), requested=0, unmatched=(), low_confidence=(), armature=None, error=None, animation=None
+    applied=(), requested=0, unmatched=(), low_confidence=(), armature=None, error=None, animation=None, library=None
 ) -> dict:
     """The reply the Live Link server sends back after each pose (protocol 2),
     read by the app's send_pose_document(). For an animation chunk (protocol
@@ -649,7 +654,97 @@ def build_live_link_reply(
     }
     if animation:
         reply.update(animation)
+    if library is not None:
+        reply["library"] = library
     return reply
+
+
+def read_library_bundle(path: str) -> list:
+    """The poses of a PoseCraft library bundle (pose_library.export_blender_bundle):
+    [(name, tags, pose document, thumbnail path or None)]. Raises ValueError for
+    anything that isn't one. Pure (no bpy)."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            bundle = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Could not read the PoseCraft library: {exc}") from None
+    if not isinstance(bundle, dict) or bundle.get("format") != LIBRARY_FORMAT_NAME or not isinstance(bundle.get("poses"), list):
+        raise ValueError("Not a PoseCraft library bundle")
+    folder = os.path.dirname(os.path.abspath(path))
+    poses = []
+    for item in bundle["poses"]:
+        if not isinstance(item, dict) or not isinstance(item.get("document"), dict):
+            raise ValueError("Malformed pose in the PoseCraft library")
+        name = str(item.get("name") or "PoseCraft pose")[:60]
+        tags = [str(tag) for tag in item.get("tags") or [] if isinstance(tag, str)]
+        thumbnail = item.get("thumbnail")
+        thumbnail_path = None
+        if isinstance(thumbnail, str) and os.path.basename(thumbnail) == thumbnail:
+            candidate = os.path.join(folder, thumbnail)
+            thumbnail_path = candidate if os.path.isfile(candidate) else None
+        poses.append((name, tags, item["document"], thumbnail_path))
+    return poses
+
+
+def _make_pose_asset(armature_obj, name: str, bone_names, frame):
+    """One Pose Library asset (an Action marked as asset) from the armature's
+    current pose of `bone_names`, through Blender's own pose_library code."""
+    from pose_library import pose_creation
+
+    fields = {f.name for f in dataclasses.fields(pose_creation.PoseCreationParams)}
+    values = {
+        "armature_ob": armature_obj, "src_action": None, "src_action_slot": None,
+        "src_frame_nr": frame, "bone_names": frozenset(bone_names), "new_asset_name": name,
+    }
+    params = pose_creation.PoseCreationParams(**{key: value for key, value in values.items() if key in fields})
+    return pose_creation.create_pose_asset(params)
+
+
+def create_library_assets(armature_obj, bundle_path: str, scene) -> dict:
+    """F17: every pose of the bundle applied to `armature_obj` and stored as a
+    Pose Library asset (with the app's thumbnail as its preview and its tags as
+    asset tags); the armature's pose is put back afterwards. Returns
+    {"created": n, "failed": [names], "assets": [names]}."""
+    poses = read_library_bundle(bundle_path)
+    pose_bones = armature_obj.pose.bones
+    saved = {pb.name: (pb.rotation_mode, tuple(pb.rotation_quaternion), tuple(pb.rotation_euler), tuple(pb.location))
+             for pb in pose_bones}
+    created, failed = [], []
+    try:
+        for name, tags, document, thumbnail in poses:
+            for pb in pose_bones:
+                pb.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+                pb.rotation_euler = (0.0, 0.0, 0.0)
+                pb.location = (0.0, 0.0, 0.0)
+            try:
+                applied, _unmatched, _low = apply_pose_document(
+                    armature_obj, document, scene.posecraft_match_rig_rest, scene.posecraft_floor_contact,
+                    scene.posecraft_pose_controls,
+                )
+                bpy.context.view_layer.update()
+                action = _make_pose_asset(armature_obj, name, applied, scene.frame_current) if applied else None
+            except (ValueError, RuntimeError, ImportError) as exc:
+                print(f"PoseCraft: pose asset '{name}' failed: {exc}")
+                action = None
+            if action is None:
+                failed.append(name)
+                continue
+            for tag in ["PoseCraft", *tags]:
+                if tag not in {t.name for t in action.asset_data.tags}:
+                    action.asset_data.tags.new(tag)
+            action.asset_data.description = "Made by PoseCraft"
+            if thumbnail:
+                try:
+                    with bpy.context.temp_override(id=action):
+                        bpy.ops.ed.lib_id_load_custom_preview(filepath=thumbnail)
+                except (RuntimeError, AttributeError, TypeError):
+                    pass  # keeps the generated preview
+            created.append(action.name)
+    finally:
+        for pb in pose_bones:
+            mode, quaternion, euler, location = saved[pb.name]
+            pb.rotation_quaternion, pb.rotation_euler, pb.location = quaternion, euler, location
+    return {"created": len(created), "failed": failed, "assets": created}
 
 
 def encode_live_link_message(message: dict) -> bytes:
@@ -1194,6 +1289,36 @@ class POSECRAFT_OT_load_pose(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
 
+class POSECRAFT_OT_import_library(bpy.types.Operator):
+    bl_idname = "posecraft.import_library"
+    bl_label = "Import PoseCraft Library as Pose Assets"
+    bl_description = ("Make a Pose Library asset (with its thumbnail) from every pose of a PoseCraft library "
+                      "bundle (posecraft_library.json), on the active armature")
+    bl_options = {"REGISTER", "UNDO"}
+
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filter_glob: bpy.props.StringProperty(default="*.json", options={"HIDDEN"})
+
+    def execute(self, context):
+        armature_obj = context.active_object
+        if armature_obj is None or armature_obj.type != "ARMATURE":
+            self.report({"ERROR"}, "Select an armature first")
+            return {"CANCELLED"}
+        try:
+            result = create_library_assets(armature_obj, self.filepath, context.scene)
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        level = "WARNING" if result["failed"] else "INFO"
+        self.report({level}, f"Made {result['created']} pose asset(s)"
+                    + (f"; failed: {', '.join(result['failed'])}" if result["failed"] else ""))
+        return {"FINISHED"}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+
 class POSECRAFT_BoneMapping(bpy.types.PropertyGroup):
     """One row of the manual bone-mapping list: a fixed PoseCraft bone name
     (see POSECRAFT_BONE_NAMES) paired with the target bone the user picked on
@@ -1431,6 +1556,19 @@ def _apply_live_link_document(document) -> dict:
     if armature_obj is None:
         _live_link_status = "Received a pose but no target armature is set or selected"
         return build_live_link_reply(error="No target armature in Blender: pick one in the PoseCraft panel")
+    if isinstance(document, dict) and document.get("format") == LIBRARY_FORMAT_NAME:
+        try:
+            result = create_library_assets(armature_obj, str(document.get("path") or ""), scene)
+        except ValueError as exc:
+            _live_link_status = str(exc)
+            return build_live_link_reply(error=str(exc))
+        _live_link_status = f"Made {result['created']} Pose Library asset(s) on {armature_obj.name}"
+        try:
+            bpy.ops.ed.undo_push(message="PoseCraft library")
+        except RuntimeError:
+            pass
+        return build_live_link_reply(result["assets"], result["created"] + len(result["failed"]),
+                                     armature=armature_obj.name, library=result)
     if is_animation_document(document):
         result = _apply_animation_document(armature_obj, document, scene)
         info = result["animation"]
@@ -1617,6 +1755,7 @@ class POSECRAFT_PT_panel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         layout.operator(POSECRAFT_OT_load_pose.bl_idname, icon="ARMATURE_DATA")
+        layout.operator(POSECRAFT_OT_import_library.bl_idname, icon="ASSET_MANAGER")
 
         active = context.active_object
         if active is None or active.type != "ARMATURE":
@@ -1664,6 +1803,7 @@ class POSECRAFT_PT_panel(bpy.types.Panel):
 
 CLASSES = (
     POSECRAFT_OT_load_pose,
+    POSECRAFT_OT_import_library,
     POSECRAFT_BoneMapping,
     POSECRAFT_UL_bone_mapping,
     POSECRAFT_OT_init_bone_mapping,

@@ -41,6 +41,7 @@ class BatchSettings:
     group_photo: bool = False
     hands: bool = False
     detection_threshold: float = 0.5
+    skeleton: str = "posecraft"  # B22: the Export group's skeleton, for BVH/GLB
 
 
 class BatchWorker(QThread):
@@ -72,7 +73,7 @@ class BatchWorker(QThread):
                 result = solve_folder(
                     self._input_dir, self._output_dir, estimator, fmt=self._fmt, mirror=self._mirror,
                     on_progress=lambda number, total, photo: self.progress.emit(number, total, photo.name),
-                    should_cancel=self._cancel.is_set,
+                    should_cancel=self._cancel.is_set, skeleton=settings.skeleton,
                 )
             self.finished_ok.emit(result)
         except Exception as exc:  # noqa: BLE001 -- surfaced in the dialog

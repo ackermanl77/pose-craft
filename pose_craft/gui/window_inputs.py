@@ -127,6 +127,31 @@ class InputsMixin:
         qimage = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
         self.photo_view.set_source_pixmap(QPixmap.fromImage(qimage))
 
+    def _on_import_animation(self) -> None:
+        """F18: a BVH from another tool (ComfyUI's SAM 3D Body, a mocap library, Mixamo...)
+        as a tracked person, ready to correct, retarget and send like a tracked video."""
+        if self._worker_running():
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Import Animation", self._last_dir(), "BVH animation (*.bvh)")
+        if path:
+            self.import_animation(path)
+
+    def import_animation(self, path: str) -> bool:
+        from pose_craft.import_animation import ImportError_, import_bvh
+
+        try:
+            result = import_bvh(path)
+        except ImportError_ as exc:
+            QMessageBox.warning(self, "Import Animation", f"Could not import {Path(path).name}:\n{exc}")
+            return False
+        self._settings.setValue("last_dir", str(Path(path).parent))
+        self._install_video(result)
+        self.statusBar().showMessage(
+            f"Imported {len(result.frames)} frames at {result.fps:g} fps from {Path(path).name} -- "
+            "correct, export (any skeleton) or send it to Blender like a tracked video"
+        )
+        return True
+
     def _on_load_video(self) -> None:
         if self._worker_running():
             return

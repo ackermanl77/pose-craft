@@ -39,6 +39,7 @@ from pose_craft.export.blender_pose import (
     low_confidence_threshold,
     set_low_confidence_threshold,
 )
+from pose_craft.export.skeleton_presets import SKELETON_CHOICES
 from pose_craft.gui.photo_view import PhotoView, legend_entries, legend_swatch
 from pose_craft.gui.viewport_3d import DEFAULT_BACKDROP_OPACITY, SkeletonViewport
 from pose_craft.imaging import PHOTO_GUIDANCE
@@ -503,6 +504,20 @@ class LayoutMixin:
         self.export_all_btn.setEnabled(False)
         layout.addWidget(self.export_all_btn)
 
+        # B22: the skeleton BVH/glTF/FBX files are written on.
+        skeleton_row = QHBoxLayout()
+        skeleton_row.addWidget(QLabel("Skeleton:"))
+        self.skeleton_combo = QComboBox()
+        for key, label in SKELETON_CHOICES:
+            self.skeleton_combo.addItem(label, key)
+        self.skeleton_combo.setAccessibleName("Skeleton for BVH, glTF and FBX files")
+        self.skeleton_combo.setToolTip(
+            "Bone names, hierarchy and rest pose of BVH, glTF and FBX exports: PoseCraft's own (Rigify names), "
+            "Mixamo, the Unreal Engine 5 Mannequin (A-pose rest) or HumanIK (MotionBuilder, Maya)."
+        )
+        skeleton_row.addWidget(self.skeleton_combo, 1)
+        layout.addLayout(skeleton_row)
+
         self.export_bvh_btn = QPushButton("Export BVH...")
         self.export_bvh_btn.setAccessibleName("Export BVH")
         self.export_bvh_btn.clicked.connect(self._on_export_bvh)
@@ -608,6 +623,7 @@ class LayoutMixin:
         file_menu = bar.addMenu("&File")
         self.open_action = self._action(file_menu, "&Open Photo...", self._on_load_photo, QKeySequence.Open)
         self.open_video_action = self._action(file_menu, "Open &Video...", self._on_load_video, "Ctrl+Shift+O")
+        self.import_animation_action = self._action(file_menu, "&Import Animation (BVH)...", self._on_import_animation)
         self.recent_menu = file_menu.addMenu("Open &Recent")
         file_menu.addSeparator()
         self.export_action = self._action(file_menu, "&Export Pose JSON...", self._on_export_pose, "Ctrl+S")

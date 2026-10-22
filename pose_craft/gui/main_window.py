@@ -288,6 +288,8 @@ class SendToBlenderWorker(QThread):
             if self._document.get("format") == ANIMATION_FORMAT_NAME:
                 # Chunked under the add-on's payload cap (live_link.send_animation_document).
                 reply = send_animation_document(self._document, host=self._host, port=self._port)
+            elif self._document.get("format") == live_link.LIBRARY_FORMAT_NAME:
+                reply = live_link.send_library_request(self._document["path"], host=self._host, port=self._port)
             else:
                 reply = send_pose_document(self._document, host=self._host, port=self._port)
             self.finished_ok.emit(reply)
@@ -388,6 +390,13 @@ def _live_link_reply_message(reply: dict | None) -> tuple[str, bool]:
         return f"Blender didn't apply the pose: {reply.get('error') or 'unknown error'}", False
     applied = reply.get("applied") or []
     requested = reply.get("requested", len(applied))
+    if isinstance(reply.get("library"), dict):
+        # F17: the library became Pose Library assets.
+        library = reply["library"]
+        message = f"Added {library.get('created', 0)} pose asset(s) to '{reply.get('armature', '?')}' in Blender's Pose Library"
+        if library.get("failed"):
+            message += f" ({len(library['failed'])} couldn't be made: {', '.join(library['failed'])})"
+        return message, True
     frame_count = int(reply.get("animation_frames") or 0)
     if frame_count > 0:
         message = (
@@ -510,6 +519,7 @@ class MainWindow(LayoutMixin, InputsMixin, ExportMixin, QMainWindow):
             group_photo=self.group_photo_checkbox.isChecked(),
             hands=self.hands_checkbox.isChecked(),
             detection_threshold=self.detection_threshold_spin.value(),
+            skeleton=self.skeleton_combo.currentData() or "posecraft",
         )
         dialog = BatchDialog(settings, self._last_dir(), self.mirror_checkbox.isChecked(), self)
         dialog.setAttribute(Qt.WA_DeleteOnClose)
@@ -566,6 +576,8 @@ class MainWindow(LayoutMixin, InputsMixin, ExportMixin, QMainWindow):
         self.backdrop_opacity_slider.setValue(int(s.value("view/backdrop_opacity", round(100 * DEFAULT_BACKDROP_OPACITY))))
         self.auto_send_checkbox.setChecked(str(s.value("live_link/auto_send", "false")).lower() == "true")
         self.auto_send_debounce_spin.setValue(int(s.value("live_link/auto_send_debounce_ms", DEFAULT_AUTO_SEND_DEBOUNCE_MS)))
+        skeleton_index = self.skeleton_combo.findData(str(s.value("export/skeleton", "posecraft")))
+        self.skeleton_combo.setCurrentIndex(max(0, skeleton_index))
         geometry = s.value("window/geometry")
         if geometry is not None:
             self.restoreGeometry(geometry)
@@ -590,6 +602,7 @@ class MainWindow(LayoutMixin, InputsMixin, ExportMixin, QMainWindow):
         s.setValue("view/backdrop_opacity", self.backdrop_opacity_slider.value())
         s.setValue("live_link/auto_send", "true" if self.auto_send_checkbox.isChecked() else "false")
         s.setValue("live_link/auto_send_debounce_ms", self.auto_send_debounce_spin.value())
+        s.setValue("export/skeleton", self.skeleton_combo.currentData())
         s.setValue("window/geometry", self.saveGeometry())
         s.setValue("window/splitter", self.splitter.saveState())
         s.sync()
@@ -924,22 +937,26 @@ class MainWindow(LayoutMixin, InputsMixin, ExportMixin, QMainWindow):
             return
         self._set_busy(False)
         self._estimator = estimator
+        self._install_video(result)
+        solved = len(result.solved_frames())
+        tracks = len(result.track_ids())
+        self.statusBar().showMessage(
+            f"Tracked {tracks} {'person' if tracks == 1 else 'people'} in {solved} of {len(result.frames)} frames "
+            f"at {result.fps:.0f} fps on {estimator.device}"
+        )
+
+    def _install_video(self, result) -> None:
+        """Shows a VideoSolve -- tracked (B12) or imported from a BVH (F18) -- in the window."""
         self._image_bgr = None
         self._source_path = result.path
         self._clear_results()
         self._video = result
-        solved = len(result.solved_frames())
         self.video_group.setVisible(True)
         self.frame_slider.blockSignals(True)
         self.frame_slider.setRange(0, max(0, len(result.frames) - 1))
         self.frame_slider.setValue(0)
         self.frame_slider.blockSignals(False)
         self._on_frame_changed(0)
-        tracks = len(result.track_ids())
-        self.statusBar().showMessage(
-            f"Tracked {tracks} {'person' if tracks == 1 else 'people'} in {solved} of {len(result.frames)} frames "
-            f"at {result.fps:.0f} fps on {estimator.device}"
-        )
 
     def _on_video_failed(self, message: str) -> None:
         self._set_busy(False)
@@ -979,6 +996,9 @@ class MainWindow(LayoutMixin, InputsMixin, ExportMixin, QMainWindow):
 
     def _read_video_frame(self, index: int) -> np.ndarray | None:
         import cv2
+
+        if self._video.path.lower().endswith(".bvh"):
+            return None  # an imported animation (F18) has no pictures
 
         capture = cv2.VideoCapture(self._video.path)
         try:
@@ -1323,6 +1343,8 @@ class MainWindow(LayoutMixin, InputsMixin, ExportMixin, QMainWindow):
         self.send_to_blender_btn.setEnabled(False)
         self.send_animation_btn.setEnabled(False)
         what = f"{len(document.get('frames') or [])}-frame animation" if animation else "pose"
+        if document.get("format") == live_link.LIBRARY_FORMAT_NAME:
+            what = "the pose library"
         self.statusBar().showMessage(
             f"{'Auto-sending' if automatic else 'Sending'} {what} to Blender at {host}:{port}..."
         )

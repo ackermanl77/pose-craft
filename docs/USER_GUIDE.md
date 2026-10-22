@@ -319,6 +319,29 @@ finger bones per hand in the JSON (same format, same keys per bone) and the
 BVH (finger joints under each hand joint). Without them, both files are
 exactly the 15-bone body pose.
 
+### Skeletons and FBX
+
+The **Skeleton** list in the Export group chooses the bone names, hierarchy and rest pose of
+BVH, glTF and FBX files: PoseCraft's own (Rigify names), **Mixamo** (`mixamorig:Hips`,
+`Spine`/`Spine1`/`Spine2`, shoulders), the **Unreal Engine 5 Mannequin** (`root`, `pelvis`,
+`spine_01`-`05`, clavicles, a 45° A-pose rest) or **HumanIK** (MotionBuilder, Maya). The pose is
+the same on every skeleton -- only the rig it is written on changes -- so Unity and Unreal can
+import it without going through Blender. The choice is remembered, and the batch (and the
+command line's `--skeleton`) uses it too.
+
+When Blender is installed, the save dialogs also offer **FBX through Blender**: PoseCraft writes
+the glTF and a hidden Blender converts it with its own FBX exporter (a few seconds). Blender is
+found under Program Files, or set `POSECRAFT_BLENDER` to its `blender.exe`.
+
+### Importing an animation from another tool
+
+**File > Import Animation (BVH)** opens a BVH from ComfyUI's SAM 3D Body, a mocap library,
+Mixamo, Rokoko or PoseCraft itself as a tracked person: scrub it, fix it, smooth it, export it on
+another skeleton or send it to Blender like a tracked video. Any skeleton works as long as its
+hands, feet and head are named (hand/wrist, foot/ankle, head, with a left/right side); the
+file's own up axis and rest pose are worked out from the hips and head. Root motion is
+re-estimated from the feet, as for a video.
+
 ## 5. Blender Live Link
 
 An alternative to file export: send a solved pose straight into a running
@@ -422,6 +445,12 @@ Poses you like can be kept and reused without the photo:
 
 The library is a folder per pose under `%LOCALAPPDATA%\PoseCraft\pose_library`
 (set `POSECRAFT_LIBRARY_DIR` to keep it elsewhere, e.g. in a synced folder).
+
+**Send Library to Blender** (in the pose library) makes a Blender **Pose Library** asset from
+each selected pose -- or all of them -- on the Live Link target armature, with the pose's
+thumbnail as its preview and its tags as asset tags; blend and flip them from Blender's own Pose
+Library. In Blender, **Import PoseCraft Library as Pose Assets** in the PoseCraft panel does the
+same from a saved `posecraft_library.json`. Needs add-on 0.9.0.
 
 ## Menus and keyboard shortcuts
 
