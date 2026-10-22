@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- PoseCraft: the stick figure in its pose (viewport colours) plus a 3D axis gizmo (dark navy tile). -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#262a38"/>
+      <stop offset="1" stop-color="#181b24"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg)"/>
+  <g stroke="#4dccff" stroke-width="11" stroke-linecap="round" fill="none">
+    <path d="M136 70 L136 140"/>
+    <path d="M136 82 L98 106 L74 134"/>
+    <path d="M136 82 L172 72 L198 44"/>
+    <path d="M136 140 L112 178 L96 216"/>
+    <path d="M136 140 L164 172 L194 196"/>
+  </g>
+  <circle cx="136" cy="50" r="20" fill="#4dccff"/>
+  <g fill="#ff991a">
+    <circle cx="98" cy="106" r="10"/>
+    <circle cx="74" cy="134" r="10"/>
+    <circle cx="172" cy="72" r="10"/>
+    <circle cx="198" cy="44" r="10"/>
+    <circle cx="136" cy="140" r="10"/>
+    <circle cx="112" cy="178" r="10"/>
+    <circle cx="96" cy="216" r="10"/>
+    <circle cx="164" cy="172" r="10"/>
+    <circle cx="194" cy="196" r="10"/>
+  </g>
+  <!-- axis gizmo: X red, Y green, Z blue -->
+  <g stroke-width="8" stroke-linecap="round">
+    <path d="M40 214 L72 214" stroke="#ff4d5e"/>
+    <path d="M40 214 L40 182" stroke="#5ee06b"/>
+    <path d="M40 214 L60 196" stroke="#5aa2ff"/>
+  </g>
+  <circle cx="40" cy="214" r="6" fill="#ffffff"/>
+</svg>

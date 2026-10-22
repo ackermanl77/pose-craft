@@ -5,7 +5,7 @@ the window, connecting them to slots the other parts of MainWindow define."""
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -53,6 +53,32 @@ DEFAULT_VIDEO_ROTATION_SMOOTHING = 35
 DEFAULT_AUTO_SEND_DEBOUNCE_MS = 350
 
 
+class _FitScrollWidth(QObject):
+    """Keep a vertical-only scroll area at least as wide as its content plus the scrollbar.
+
+    The minimum used to be taken once while the window was built, before fonts and styles
+    settled and without the scrollbar, so the controls panel cut its widest rows off on the
+    right (UI1). This refits whenever the content's layout changes."""
+
+    def __init__(self, scroll):
+        super().__init__(scroll)
+        self.scroll = scroll
+        scroll.widget().installEventFilter(self)
+        self.fit()
+
+    def fit(self) -> None:
+        scroll = self.scroll
+        need = (scroll.widget().minimumSizeHint().width() + scroll.verticalScrollBar().sizeHint().width()
+                + 2 * scroll.frameWidth())
+        if scroll.minimumWidth() != need:
+            scroll.setMinimumWidth(need)
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() in (QEvent.Type.LayoutRequest, QEvent.Type.Show):
+            self.fit()
+        return False
+
+
 class LayoutMixin:
     def _build_ui(self) -> None:
         # Three panes side by side in a splitter: the controls (scrollable, so
@@ -68,11 +94,17 @@ class LayoutMixin:
         controls_layout.addWidget(self._build_export_group())
         controls_layout.addWidget(self._build_live_link_group())
         controls_layout.addStretch(1)
+        # The panel's width is fixed (below); a combo that grew to fit a long item later ("Person 1:
+        # 11/15 bones confident...") pushed the content past it and the right side was cut off
+        # (UI1). Combos elide instead; their drop-down still lists the whole text.
+        for combo in controls.findChildren(QComboBox):
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(12)
         controls_scroll = QScrollArea()
         controls_scroll.setWidget(controls)
         controls_scroll.setWidgetResizable(True)
         controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        controls_scroll.setMinimumWidth(controls.minimumSizeHint().width() + 24)
+        self._controls_width_fitter = _FitScrollWidth(controls_scroll)
         controls_scroll.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
 
         photo_pane = QWidget()

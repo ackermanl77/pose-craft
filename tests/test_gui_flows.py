@@ -573,3 +573,20 @@ def test_camera_presets_and_labels(qapp, settings):
         assert window.viewport._labels == []
     finally:
         window.close()
+
+
+def test_the_controls_panel_never_cuts_its_content_off(qapp, settings):
+    """UI1: the left panel's width was taken once while building the window (without the scrollbar),
+    and a combo that grew for a long person label pushed the content past it."""
+    from PySide6.QtWidgets import QScrollArea
+
+    window = MainWindow(settings=settings)
+    try:
+        window.resize(1600, 950)
+        window.show()
+        window.person_combo.addItem("Person 1: 11/15 bones confident, 4 low-confidence, 2 out of frame")
+        _wait_until(qapp, lambda: False, timeout=0.3)
+        scroll = window.findChildren(QScrollArea)[0]
+        assert scroll.viewport().width() >= scroll.widget().minimumSizeHint().width()
+    finally:
+        window.close()
