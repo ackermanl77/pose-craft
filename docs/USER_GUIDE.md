@@ -481,10 +481,10 @@ screen reader). **File > Open Recent** lists the last eight photos and videos.
    4.2 and later: the **v** menu at the top right > **Install from Disk...**),
    pick `pose_craft/export/blender_addon/import_pose.py` (or the
    `posecraft-blender-addon-<version>.zip` from a release), and enable
-   "PoseCraft Pose Importer". The current add-on is version 0.8.0 (Blender
+   "PoseCraft Pose Importer". The current add-on is version 0.9.0 (Blender
    3.6 or newer; checked in Blender 5.2.2). After updating PoseCraft, install
    the matching add-on too -- **Send Animation to Blender** needs 0.7.0 or
-   newer.
+   newer, **Send Library to Blender** 0.9.0.
 2. A **PoseCraft** tab appears in the 3D viewport's sidebar (press `N` if the
    sidebar isn't open).
 3. Select the armature you want to pose, then open that PoseCraft tab.

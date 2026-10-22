@@ -57,7 +57,12 @@ retarget/skeleton.py -- 15-bone humanoid hierarchy, T-pose rest directions,
 export/blender_pose.py -- axis-converts Y-up -> Blender Z-up, writes JSON (format v2:
      local + world rotation + rest direction per bone, optional "root"
      hip height / leg length); export/bvh_export.py -- single-frame or
-     animated BVH, the root standing on the floor
+     animated BVH, the root standing on the floor; export/gltf_export.py --
+     a skinned binary glTF; both take a skeleton preset
+     (export/skeleton_presets.py, B22: Mixamo, UE5 Mannequin in its A-pose,
+     HumanIK -- bone names, hierarchy and rest pose, the rotations conjugated
+     into each rig's rest); export/fbx_export.py -- FBX converted from the
+     glTF by a headless Blender (find_blender(), POSECRAFT_BLENDER)
   -- low-confidence bones flagged "low_confidence": true, bones reaching
      outside the photo "out_of_frame": true (per-landmark presence, B10)
         |
@@ -69,9 +74,11 @@ pose_craft_pose .json file            export/live_link.py: length-prefixed
         |                              with what it applied (protocol 2 for a
         |                              pose; protocol 3 for a video track sent as
         |                              a "pose_craft_animation" document, v1, in
-        |                              chunks of <= 30 frames / 200 KB)
+        |                              chunks of <= 30 frames / 200 KB; protocol 4
+        |                              for the pose library as Pose Library
+        |                              assets, F17)
         v                                              |
-export/blender_addon/import_pose.py (installed inside Blender; add-on 0.8.0,
+export/blender_addon/import_pose.py (installed inside Blender; add-on 0.9.0,
   bl_info minimum Blender 3.6, verified in Blender 5.2.2)
   -- Load Pose JSON operator, or a Live Link server (bpy.app.timers-polled,
      fully non-blocking: accept and incremental reads with a 2 s per-message
@@ -274,11 +281,16 @@ $env:QT_QPA_PLATFORM = "offscreen"
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-**Current count (2026-10-21, with the golden photos): 472 passed, 8
-skipped** in about 22 s; `ruff check` and `mypy` clean (446 on 2026-10-11). The eight skips are the LiteRT
+**Current count (2026-10-22, with the golden photos): 490 passed, 12
+skipped, 1 failed** in about 26 s; `ruff check` and `mypy` clean (472/8 on 2026-10-21, 446 on 2026-10-11). The twelve skips are the LiteRT
 reference test, the four opt-in GPU parity tests (`POSECRAFT_GPU_TESTS=1`), the
-two opt-in real-Blender tests (`POSECRAFT_BLENDER`: the Live Link/rig check and
-the extension install) and the opt-in real-DAZ test (`POSECRAFT_DAZ`). The
+six opt-in real-Blender tests (`POSECRAFT_BLENDER`: the Live Link/rig check, the
+extension install, the Pose Library assets and three FBX conversions) and the
+opt-in real-DAZ test (`POSECRAFT_DAZ`). All six real-Blender tests passed with
+Blender 5.2 on 2026-10-21, and CI's `blender` job runs them on Linux with
+Blender 4.2 LTS (not run on GitHub yet). The failure,
+`test_gui_live_link.py::test_hovering_a_bone_highlights_and_names_it`, fails the
+same way without the 2026-10-21 changes (see Known Issues). The
 real-photo golden test runs whenever the "full" model is cached (five photos,
 see below). Before: 428 passed, 8 skipped (2026-10-07). Earlier counts: 402/7 after the real-Blender check
 (2026-10-03), 298/6 after the P2 round
@@ -1153,6 +1165,11 @@ time each check ran, not guaranteed to stay true as the code changes.
   render correctly (see "Verification").
 
 ## Known Issues
+
+- **`test_hovering_a_bone_highlights_and_names_it` fails when it runs after
+  the rest of `tests/test_gui_live_link.py`** (it passes on its own), also on
+  the commit before the 2026-10-21 changes: an earlier test in the file leaves
+  state behind that the hover check trips over. Not investigated yet.
 
 - **The CUDA build is large.** All three flavours were built and smoke-tested
   on 2026-10-01 (Python 3.14.7, PyInstaller 6.22.3, models bundled). Each exe

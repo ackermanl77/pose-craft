@@ -12,8 +12,8 @@ the Live Link.
 - MVP stage: the full pipeline (photo or video -> pose estimation
   (MediaPipe's BlazePose models, plus the optional hand model, on ONNX
   Runtime -- DirectML or CUDA on a GPU, else the CPU) -> bone retargeting ->
-  JSON/BVH export or the live Blender link -> Blender add-on 0.8.0, or a DAZ
-  Studio pose preset for Genesis 9) is
+  JSON/BVH/glTF/FBX export or the live Blender link -> Blender add-on 0.9.0,
+  or a DAZ Studio pose preset for Genesis 9) is
   implemented, and all three build flavours build and launch. The add-on has
   been run headless in a real Blender 5.2.2 (PoseCraft-shaped, Mixamo-style
   and generated Rigify rigs, the BVH importer, a real Live Link server); its
@@ -118,13 +118,27 @@ skeleton. From there:
   it applies to a single person; the BVH stands on the floor). The BVH save
   dialogs (pose and video animation) also offer **glTF binary (.glb)**: a skinned
   skeleton with a small bone mesh and the animation, for Unity, Unreal, Godot,
-  three.js and Blender; the CLI and batch take `--format glb`. Or
+  three.js and Blender; the CLI and batch take `--format glb`. With Blender
+  installed (found in Program Files, on `PATH` or through `POSECRAFT_BLENDER`)
+  they also offer **FBX through Blender (.fbx)**, converted by a headless
+  Blender. The **Skeleton** choice next to the export buttons writes BVH, glTF
+  and FBX files on PoseCraft's own rig (Rigify names) or on the **Mixamo**,
+  **UE5 Mannequin** or **HumanIK** bone names, hierarchy and rest pose (the
+  UE5 one in its A-pose), for Unity and Unreal without retargeting in
+  Blender; the CLI and batch take `--skeleton mixamo|ue5|humanik`. Or
 - **File > Batch Process Folder...** -- every photo in a folder, solved
   with the current detection settings, one `<photo>_person<N>.json` (or
   `.bvh`, `.duf`) per person, with a progress bar and Cancel. Without the GUI:
   `python -m pose_craft.cli --input photos --output poses [--format bvh|duf]
   [--mirror] [--model lite|full|heavy] [--cpu] [--hands] [--group-photo]
   [--detection-threshold 0.3]` (from a source install), or
+- **Pose > Pose Library...** -- keep poses with thumbnails, tags and
+  favourites, apply or export them, and **Send Library to Blender** to make
+  them Blender **Pose Library** assets (Asset Browser) on the Live Link
+  target armature, or
+- **File > Import Animation (BVH)...** -- open a BVH from another estimator
+  (e.g. ComfyUI's SAM 3D Body) as a tracked video, to correct it, retarget it
+  to another skeleton and send it to Blender, or
 - **Send to Blender (Live Link)** -- needs Blender running with the add-on's
   Live Link started first (see below). The host/port fields next to the
   button default to `127.0.0.1:8642` and only need changing if that port is
@@ -199,9 +213,11 @@ $env:QT_QPA_PLATFORM = "offscreen"
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-Last run 2026-10-07: **428 passed, 8 skipped** (the skips: the LiteRT
-reference test, the real-photo golden test, four opt-in GPU parity tests, the
-opt-in real-Blender test and the opt-in real-Blender extension install) -- re-run it rather than trusting this number.
+Last run 2026-10-22: **490 passed, 12 skipped, 1 failed** (the skips are the
+LiteRT reference test, the opt-in GPU parity tests and the opt-in real-Blender
+and real-DAZ tests; the failure, `test_gui_live_link.py::test_hovering_a_bone_highlights_and_names_it`,
+also fails without the latest changes -- see `docs/PROJECT_STATUS.md`) -- re-run
+it rather than trusting this number.
 
 Needs `requirements-test.txt` (numpy/scipy/opencv-python-headless/pytest plus
 CPU onnxruntime/onnx/tflite, not the Qt stack or the GPU runtime) -- covers the
@@ -219,8 +235,9 @@ scripts` and `python -m mypy` (configured in `pyproject.toml`; mypy covers
 fake estimators; no pytest-qt needed). Before a release, also run the GPU/CPU
 parity tests: `set POSECRAFT_GPU_TESTS=1` then `pytest -m gpu` (needs a GPU
 provider and the cached models) and, with Blender installed, the real-Blender
-add-on check: set `POSECRAFT_BLENDER` to `blender.exe`, then
-`pytest tests/test_real_blender.py` (about 5 s). See `docs/PROJECT_STATUS.md`'s
+add-on checks: set `POSECRAFT_BLENDER` to `blender.exe`, then
+`pytest tests/test_real_blender.py tests/test_real_blender_library.py tests/test_fbx_export.py`.
+CI's `blender` job runs those against Blender 4.2 LTS on Linux. See `docs/PROJECT_STATUS.md`'s
 "Verification" section for what is and isn't covered by an automated test
 today.
 
