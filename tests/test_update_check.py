@@ -68,6 +68,13 @@ class UpdateCheckTests(unittest.TestCase):
         self.assertIsNone(update_check.check_for_update("1.0.0", url="http://example.com/f", opener=_opener({}, calls)))
         self.assertEqual(calls, [])
 
+    def test_off_turns_the_check_off(self):
+        with mock.patch.dict(os.environ, {update_check.ENV_VAR: "OFF"}):
+            self.assertEqual(update_check.feed_url(), "")
+            self.assertIsNone(update_check.check_in_background("1.0.0", lambda info: None))
+        with mock.patch.dict(os.environ, {update_check.ENV_VAR: ""}):
+            self.assertTrue(update_check.feed_url().startswith("https://github.com/ackermanl77/"))
+
     def test_environment_variable_overrides_the_built_in_feed(self):
         with mock.patch.dict(os.environ, {update_check.ENV_VAR: " https://example.com/test.json "}):
             self.assertEqual(update_check.feed_url(), "https://example.com/test.json")

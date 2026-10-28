@@ -3,7 +3,12 @@ under the user's config folder) -- point that at a temporary folder so tests
 never read or write the real user's settings."""
 from __future__ import annotations
 
+import os
+
 import pytest
+
+# Never ask GitHub for a newer release during the tests (update_check.py).
+os.environ["POSECRAFT_UPDATE_FEED_URL"] = "off"
 
 
 def pytest_configure(config) -> None:

@@ -224,7 +224,7 @@ you've changed `assets/icon.png`/`assets/icon.ico`.
 Photos, videos and webcam recordings are processed on your computer and never uploaded. A
 source install downloads MediaPipe's pose and hand models from storage.googleapis.com the
 first time they are needed (the packaged app bundles them). The Live Link to Blender connects
-to 127.0.0.1 by default. A release may switch on the update check: once per launch it downloads a small version file from the release site and sends nothing but the app's name and version. There is no telemetry.
+to 127.0.0.1 by default. Once per launch the app checks for a newer release: it downloads a small version file (update.json) from this project's GitHub Releases and sends nothing but the app's name and version. To turn that off, set the environment variable POSECRAFT_UPDATE_FEED_URL to off. There is no telemetry.
 
 ## Test
 

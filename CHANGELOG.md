@@ -17,7 +17,7 @@ All notable changes to PoseCraft. The format follows
   onto matching shape keys.
 - Help > Diagnostics, a per-user installer, Authenticode signing and a self-test of every
   release build.
-- An update check that stays off until a release feed is configured.
+- A once-per-launch update check against the project's GitHub Releases (update.json).
 - Dependabot, and a `pip-audit` job in CI.
 - The MIT license, `THIRD_PARTY_NOTICES.md` (shipped in the build and the installer),
   `SECURITY.md` and a privacy note in the README.
