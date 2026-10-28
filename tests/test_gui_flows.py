@@ -590,3 +590,67 @@ def test_the_controls_panel_never_cuts_its_content_off(qapp, settings):
         assert scroll.viewport().width() >= scroll.widget().minimumSizeHint().width()
     finally:
         window.close()
+
+
+def test_the_main_actions_stay_in_view_and_solve_stands_out(qapp, settings):
+    """UI2: a toolbar keeps load, solve, export and send in view whatever the panel's scroll
+    position; it shares the menus' actions (so their enabled state), and Solve is styled as the
+    primary action there and in the panel."""
+    window = MainWindow(settings=settings)
+    try:
+        window.resize(1100, 700)
+        window.show()
+        toolbar = window.main_toolbar
+        assert toolbar.isVisible() and not toolbar.isMovable()
+        assert [a for a in toolbar.actions() if not a.isSeparator()] == [
+            window.open_action, window.open_video_action, window.solve_action,
+            window.export_action, window.export_bvh_action, window.send_action]
+        assert toolbar.widgetForAction(window.solve_action).objectName() == "primaryAction"
+        assert window.solve_btn.objectName() == "primaryAction"
+        # Nothing solved yet: solve, export and send are off in the toolbar too.
+        assert not window.solve_action.isEnabled() and not window.export_action.isEnabled()
+        assert not toolbar.widgetForAction(window.send_action).isEnabled()
+        window._set_result_actions_enabled(True)
+        assert toolbar.widgetForAction(window.export_bvh_action).isEnabled()
+    finally:
+        window.close()
+
+
+def test_the_3d_preview_has_navigation_and_an_axis_gizmo_that_matches_the_camera(qapp, settings):
+    """UI3: view presets, fit and zoom buttons over the preview, and a corner gizmo whose axes point
+    where the camera's own projection puts them."""
+    import numpy as np
+
+    from pose_craft.gui import viewport_3d
+
+    window = MainWindow(settings=settings)
+    try:
+        window.resize(1400, 800)
+        window.show()
+        qapp.processEvents()
+        viewport = window.viewport
+        nav = viewport.navigation
+        assert nav.isVisible() and viewport.axis_gizmo.isVisible()
+        assert nav.geometry().right() <= viewport.width() and viewport.axis_gizmo.geometry().bottom() <= viewport.height()
+        display_to_engine = viewport_3d._ENGINE_TO_DISPLAY  # a rotation: its transpose is its inverse
+        for preset in ("front", "side", "top", "default"):
+            nav.buttons[preset].click()
+            elevation, azimuth = viewport_3d.CAMERA_PRESETS[preset]
+            assert (viewport.opts["elevation"], viewport.opts["azimuth"]) == (elevation, azimuth)
+            centre = np.array([viewport.opts["center"].x(), viewport.opts["center"].y(), viewport.opts["center"].z()])
+            points_display = np.vstack([centre, centre + 0.3 * np.eye(3)])
+            screen = viewport.project_to_screen(points_display @ display_to_engine)
+            for index, (name, (dx, dy, _depth)) in enumerate(viewport_3d.axis_gizmo_directions(elevation, azimuth).items()):
+                drawn = screen[index + 1] - screen[0]
+                if np.hypot(dx, dy) < 0.2:  # pointing (almost) at the camera: no direction to compare
+                    continue
+                cosine = (drawn @ np.array([dx, dy])) / (np.linalg.norm(drawn) * np.hypot(dx, dy))
+                assert cosine > 0.95, (preset, name, drawn, (dx, dy))
+        before = viewport.opts["distance"]
+        nav.buttons["zoom_in"].click()
+        assert viewport.opts["distance"] == pytest.approx(before / viewport_3d.ZOOM_STEP)
+        nav.buttons["zoom_out"].click()
+        nav.buttons["zoom_out"].click()
+        assert viewport.opts["distance"] == pytest.approx(before * viewport_3d.ZOOM_STEP)
+    finally:
+        window.close()

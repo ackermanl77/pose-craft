@@ -162,6 +162,16 @@ class LayoutMixin:
                 outline-offset: 1px;
                 border: 1px solid #f6c453;
             }
+            /* UI2: the main action (Solve Pose, in the panel and the toolbar) stands out. */
+            QPushButton#primaryAction, QToolButton#primaryAction {
+                background: #2f6fd6; color: #ffffff; font-weight: bold;
+                border: 1px solid #2559ad; border-radius: 4px; padding: 5px 14px;
+            }
+            QPushButton#primaryAction:hover, QToolButton#primaryAction:hover { background: #3b7de6; }
+            QPushButton#primaryAction:disabled, QToolButton#primaryAction:disabled {
+                background: #5d6b80; color: #d0d4da; border-color: #5d6b80;
+            }
+            QPushButton#primaryAction:focus, QToolButton#primaryAction:focus { border: 2px solid #f6c453; }
             """
         )
 
@@ -301,6 +311,7 @@ class LayoutMixin:
         layout.addWidget(self._build_advanced_detect())
 
         self.solve_btn = QPushButton("Solve Pose")
+        self.solve_btn.setObjectName("primaryAction")
         self.solve_btn.setAccessibleName("Solve pose")
         self.solve_btn.setToolTip("Detect and solve every person in the photo (F5)")
         self.solve_btn.clicked.connect(self._on_solve_pose)
@@ -676,6 +687,7 @@ class LayoutMixin:
 
         pose_menu = bar.addMenu("&Pose")
         self.solve_action = self._action(pose_menu, "&Solve", self._on_solve_pose, ["F5", "Ctrl+Return"])
+        self.solve_action.setEnabled(False)  # like the panel's Solve Pose, until a photo is loaded
         self.send_action = self._action(pose_menu, "Send to &Blender", self._on_send_to_blender, "Ctrl+B")
         # F15: keep poses for later -- re-export, mirror and blend them without the photo.
         self.add_to_library_action = self._action(
@@ -725,3 +737,18 @@ class LayoutMixin:
         help_menu = bar.addMenu("&Help")
         self.diagnostics_action = self._action(help_menu, "&Diagnostics...", self._on_show_diagnostics)
         self._action(help_menu, "&About PoseCraft", self._on_about)
+
+        # UI2: the load -> solve -> export/send loop always in view -- the panel's own export and
+        # send buttons can be below the fold. The same actions as the menus, so they share their
+        # shortcuts and enabled state.
+        self.main_toolbar = self.addToolBar("Main toolbar")
+        self.main_toolbar.setObjectName("mainToolbar")
+        self.main_toolbar.setMovable(False)
+        self.main_toolbar.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        for action in (self.open_action, self.open_video_action, None, self.solve_action, None,
+                       self.export_action, self.export_bvh_action, self.send_action):
+            if action is None:
+                self.main_toolbar.addSeparator()
+            else:
+                self.main_toolbar.addAction(action)
+        self.main_toolbar.widgetForAction(self.solve_action).setObjectName("primaryAction")

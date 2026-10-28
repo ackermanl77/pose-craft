@@ -287,8 +287,8 @@ reference test, the four opt-in GPU parity tests (`POSECRAFT_GPU_TESTS=1`), the
 six opt-in real-Blender tests (`POSECRAFT_BLENDER`: the Live Link/rig check, the
 extension install, the Pose Library assets and three FBX conversions) and the
 opt-in real-DAZ test (`POSECRAFT_DAZ`). All six real-Blender tests passed with
-Blender 5.2 on 2026-10-21, and CI's `blender` job runs them on Linux with
-Blender 4.2 LTS (not run on GitHub yet). The failure,
+Blender 5.2 on 2026-10-21, and CI's `blender` job is configured to run them
+on Linux with Blender 4.2.23 LTS (not run on GitHub yet). The failure,
 `test_gui_live_link.py::test_hovering_a_bone_highlights_and_names_it`, fails the
 same way without the 2026-10-21 changes (see Known Issues). The
 real-photo golden test runs whenever the "full" model is cached (five photos,
@@ -429,7 +429,7 @@ by the default suite, since it needs a real display, GPU or Blender install:
     the timer being fired by Blender's own event loop rather than the test.
   `tests/test_real_blender.py` repeats these checks in one Blender run (~5 s)
   when `POSECRAFT_BLENDER` points at `blender.exe`; it's skipped otherwise
-  (CI has no Blender).
+  (CI downloads Blender 4.2.23 for its headless-Blender job).
 
 Re-run `pytest` yourself before trusting a pass count, and treat "manually
 checked" above as weaker evidence than an automated test -- it was true at the
@@ -1254,8 +1254,9 @@ Ranked roughly by how much they affect whether an exported pose is usable:
   no tag has been pushed): run it once (a manual `workflow_dispatch`) and launch
   each zip before trusting it. The local DirectML build of 2026-10-07 bundles all
   five models, the hand model included (checked with the release workflow's
-  bundled-model smoke test). No
-  headless-Blender job runs in CI (no Blender on the runners); the opt-in
+  bundled-model smoke test). CI defines a headless-Blender job in
+  `.github/workflows/ci.yml`, using checksum-pinned Blender 4.2.23 on Ubuntu;
+  its GitHub Actions result has not yet been verified. The opt-in
   `tests/test_real_blender.py` is the local equivalent (T4).
 - **Fingers are unverified on real photos (B11).** The hand pass follows
   MediaPipe Holistic's crop rule without its re-crop model, finger twist

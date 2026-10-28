@@ -20,8 +20,8 @@ import numpy as np
 import pyqtgraph.opengl as gl
 from pyqtgraph import Transform3D, Vector
 from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QVector4D
-from PySide6.QtWidgets import QLabel
+from PySide6.QtGui import QColor, QPainter, QPen, QVector4D
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QToolButton, QWidget
 
 from pose_craft.export.blender_pose import low_confidence_threshold
 from pose_craft.retarget.skeleton import ALL_BONE_NAMES, BONES, bone_local_euler_deg, image_to_world_scale
@@ -110,6 +110,100 @@ def photo_camera_view(
     tangent = np.tan(np.radians(fov_degrees) / 2.0)
     distance = max(half_width / tangent, half_height * max(view_aspect, 1e-6) / tangent)
     return center, float(distance)
+
+
+# UI3: the axis gizmo's colours (the display axes, as the origin's GLAxisItem draws them) and the
+# zoom step of the overlay's - / + buttons.
+AXIS_COLORS = {"X": "#ff5555", "Y": "#55dd55", "Z": "#5599ff"}
+ZOOM_STEP = 1.25
+
+
+def axis_gizmo_directions(elevation_deg: float, azimuth_deg: float) -> dict[str, tuple[float, float, float]]:
+    """Where the display axes X, Y, Z point on screen for pyqtgraph's orbit camera at
+    `elevation_deg` / `azimuth_deg`: (right, down, toward the viewer) for each unit axis. The
+    camera sits at centre + distance * (cos el cos az, cos el sin az, sin el), looking at the centre
+    with Z up."""
+    elevation, azimuth = np.radians(elevation_deg), np.radians(azimuth_deg)
+    toward_camera = np.array([np.cos(elevation) * np.cos(azimuth), np.cos(elevation) * np.sin(azimuth), np.sin(elevation)])
+    right = np.array([-np.sin(azimuth), np.cos(azimuth), 0.0])
+    up = np.cross(toward_camera, right)
+    return {name: (float(axis @ right), float(-(axis @ up)), float(axis @ toward_camera))
+            for name, axis in zip("XYZ", np.eye(3))}
+
+
+class _AxisGizmo(QWidget):
+    """The corner axis indicator (UI3): which way X, Y and Z point from the current camera."""
+
+    SIZE = 64
+
+    def __init__(self, viewport: "SkeletonViewport"):
+        super().__init__(viewport)
+        self._viewport = viewport
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAccessibleName("Axis orientation")
+        self._painted_for: tuple[float, float] | None = None
+
+    def camera_angles(self) -> tuple[float, float]:
+        return float(self._viewport.opts["elevation"]), float(self._viewport.opts["azimuth"])
+
+    def refresh_if_moved(self) -> None:
+        if self.camera_angles() != self._painted_for:
+            self.update()
+
+    def paintEvent(self, event) -> None:
+        self._painted_for = self.camera_angles()
+        directions = axis_gizmo_directions(*self._painted_for)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        centre = QPointF(self.SIZE / 2, self.SIZE / 2)
+        reach = self.SIZE / 2 - 12
+        # Axes pointing away from the viewer first, so the nearer ones are drawn on top.
+        for name, (dx, dy, depth) in sorted(directions.items(), key=lambda item: item[1][2]):
+            colour = QColor(AXIS_COLORS[name])
+            if depth < 0:
+                colour.setAlpha(140)
+            tip = QPointF(centre.x() + dx * reach, centre.y() + dy * reach)
+            painter.setPen(QPen(colour, 2))
+            painter.drawLine(centre, tip)
+            painter.drawText(QPointF(tip.x() + dx * 6 - 4, tip.y() + dy * 6 + 4), name)
+        painter.end()
+
+
+class _NavigationBar(QWidget):
+    """View presets, fit and zoom over the preview's corner (UI3), like Blender's viewport buttons."""
+
+    def __init__(self, viewport: "SkeletonViewport"):
+        super().__init__(viewport)
+        self.setObjectName("viewportNavigation")
+        self.setAccessibleName("3D preview navigation")
+        self.setAttribute(Qt.WA_StyledBackground)
+        self.setStyleSheet(
+            "#viewportNavigation { background: rgba(20, 20, 20, 190); border-radius: 4px; }"
+            "#viewportNavigation QToolButton { color: #eee; padding: 2px 6px; border: none; }"
+            "#viewportNavigation QToolButton:hover { background: rgba(255, 255, 255, 40); }"
+        )
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(0)
+        self.buttons: dict[str, QToolButton] = {}
+        for key, text, tip, slot in (
+            ("front", "Front", "Front view (1)", lambda: viewport.set_camera_preset("front")),
+            ("side", "Side", "Side view (3)", lambda: viewport.set_camera_preset("side")),
+            ("top", "Top", "Top view (7)", lambda: viewport.set_camera_preset("top")),
+            ("default", "3/4", "The default three-quarter view (0)", lambda: viewport.set_camera_preset("default")),
+            ("fit", "Fit", "Frame the skeleton (F)", viewport.frame_skeleton),
+            ("zoom_out", "\u2212", "Zoom out", lambda: viewport.zoom(ZOOM_STEP)),
+            ("zoom_in", "+", "Zoom in", lambda: viewport.zoom(1 / ZOOM_STEP)),
+        ):
+            button = QToolButton(self)
+            button.setText(text)
+            button.setToolTip(tip)
+            button.setAccessibleName(tip.split(" (")[0])
+            button.setFocusPolicy(Qt.TabFocus)
+            button.clicked.connect(slot)
+            layout.addWidget(button)
+            self.buttons[key] = button
 
 
 def _engine_to_display(points: np.ndarray) -> np.ndarray:
@@ -298,6 +392,9 @@ class SkeletonViewport(gl.GLViewWidget):
         self._hover_label.setStyleSheet("background:rgba(20,20,20,210); color:#eee; padding:3px; border-radius:3px;")
         self._hover_label.setAttribute(Qt.WA_TransparentForMouseEvents)
         self._hover_label.hide()
+        # UI3: on-screen navigation, as in Blender -- the same views as the View menu, plus zoom.
+        self.navigation = _NavigationBar(self)
+        self.axis_gizmo = _AxisGizmo(self)
         self.setMouseTracking(True)
         self._bone_lines: gl.GLLinePlotItem | None = None
         self._bone_bodies: gl.GLMeshItem | None = None
@@ -434,6 +531,21 @@ class SkeletonViewport(gl.GLViewWidget):
     def leaveEvent(self, ev) -> None:
         self._hover_label.hide()
         super().leaveEvent(ev)
+
+    def zoom(self, factor: float) -> None:
+        """Moves the camera `factor` times as far from the centre (below 1 zooms in)."""
+        distance = float(self.opts["distance"]) * factor
+        self.setCameraPosition(distance=max(_MIN_CAMERA_DISTANCE * 0.25, distance))
+
+    def resizeEvent(self, ev) -> None:
+        super().resizeEvent(ev)
+        self.navigation.adjustSize()
+        self.navigation.move(max(0, self.width() - self.navigation.width() - 6), 6)
+        self.axis_gizmo.move(6, max(0, self.height() - self.axis_gizmo.height() - 6))
+
+    def paintGL(self, *args, **kwargs) -> None:
+        super().paintGL(*args, **kwargs)
+        self.axis_gizmo.refresh_if_moved()  # only when the camera turned: no repaint loop
 
     def set_camera_preset(self, name: str) -> None:
         """Front, side or top view (or the default three-quarter one), framed

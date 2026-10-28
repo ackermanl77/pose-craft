@@ -73,6 +73,9 @@ resize:
 - **Middle**: the loaded photo, with every detected person's skeleton drawn
   on it.
 - **Right**: the **3D preview** of whichever person is currently selected.
+- **Toolbar** (under the menus): Open Photo, Open Video, **Solve**, Export
+  Pose JSON, Export BVH and Send to Blender, always in view however far the
+  left panel is scrolled.
 
 A status bar along the bottom reports what's happening -- solve results,
 export/send confirmations, and errors -- with a progress bar and a **Cancel**
@@ -388,6 +391,12 @@ detected body points are drawn as faint gray dots behind it. Where the two
 agree, the export reproduces the photo; where the skeleton leaves the dots,
 that's what the export will get wrong, so check it before exporting. It is
 independent of the photo overlay.
+
+The buttons in its top-right corner change the view -- **Front**, **Side**,
+**Top**, **3/4** (the default angle), **Fit** (frame the skeleton) and zoom
+**−** / **+** -- the same views as the View menu and its keys (1, 3, 7, 0, F).
+The small gizmo in the bottom-left corner shows which way the X (red), Y
+(green) and Z (blue, up) axes point from the current angle.
 
 - The skeleton **stands on the grid**: the grid is the floor, at the pose's
   lowest point.

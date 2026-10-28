@@ -1,0 +1,276 @@
+<title>Diagnóstico PoseCraft</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one reading column; tiles → pipeline → composition → matrix → issues → steps, summary before detail. */
+:root {
+  --bg: #f5f7fa;
+  --surface: #ffffff;
+  --ink: #16202e;
+  --muted: #5b6676;
+  --line: #dde3eb;
+  --accent: #2c6bd1;       /* armature-selected blue */
+  --accent-soft: #e4edfb;
+  --ok: #1d7a4a;  --ok-soft: #e1f3e8;
+  --warn: #9a6200; --warn-soft: #fbf0d9;
+  --bad: #b3261e;  --bad-soft: #fbe3e1;
+  --mid: #a14a0d;  --mid-soft: #fbe9dc;
+  --off: #66707e;  --off-soft: #eceff3;
+  --f-display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --f-body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --f-mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0f141b; --surface: #171e28; --ink: #e6ebf2; --muted: #98a3b3; --line: #273140;
+  --accent: #6ea2f2; --accent-soft: #1b2a42;
+  --ok: #5cc98d; --ok-soft: #15301f; --warn: #e2b04f; --warn-soft: #33280f;
+  --bad: #f07f76; --bad-soft: #3a1a18; --mid: #ee9a5c; --mid-soft: #382213;
+  --off: #9aa4b2; --off-soft: #232b37; color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #0f141b; --surface: #171e28; --ink: #e6ebf2; --muted: #98a3b3; --line: #273140;
+  --accent: #6ea2f2; --accent-soft: #1b2a42;
+  --ok: #5cc98d; --ok-soft: #15301f; --warn: #e2b04f; --warn-soft: #33280f;
+  --bad: #f07f76; --bad-soft: #3a1a18; --mid: #ee9a5c; --mid-soft: #382213;
+  --off: #9aa4b2; --off-soft: #232b37; color-scheme: dark; }
+
+body { background: var(--bg); color: var(--ink); font: 15px/1.55 var(--f-body); }
+.wrap { max-width: 980px; margin: 0 auto; padding-block: 40px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 44px; }
+code, .mono { font-family: var(--f-mono); font-size: .86em; }
+h1, h2 { font-family: var(--f-display); text-wrap: balance; margin: 0; }
+h1 { font-size: clamp(30px, 5vw, 44px); line-height: 1.08; letter-spacing: -.01em; }
+h2 { font-size: 22px; }
+.eyebrow { font: 500 12px/1.4 var(--f-mono); color: var(--muted); letter-spacing: .04em; }
+.lede { color: var(--muted); max-width: 64ch; margin: 10px 0 0; font-size: 16px; }
+section { display: grid; gap: 16px; min-width: 0; }
+.sec-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 14px; }
+.sec-head .note { color: var(--muted); font-size: 13px; }
+
+/* tiles */
+.tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.tile { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px; display: grid; gap: 6px; align-content: start; }
+.tile .big { font: 700 30px/1 var(--f-display); font-variant-numeric: tabular-nums; }
+.tile .lbl { font-weight: 600; }
+.tile .sub { color: var(--muted); font-size: 13px; }
+.meter { height: 6px; border-radius: 3px; background: var(--off-soft); display: flex; overflow: hidden; }
+.meter span { display: block; height: 100%; }
+@media (max-width: 760px) { .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+/* pipeline */
+.pipe { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0; align-items: stretch; }
+.stage { background: var(--surface); border: 1px solid var(--line); padding: 14px; display: grid; gap: 6px; align-content: start; min-width: 0; position: relative; }
+.stage + .stage { border-left: none; }
+.stage:first-child { border-radius: 10px 0 0 10px; }
+.stage:last-child { border-radius: 0 10px 10px 0; }
+.stage .k { font: 500 11px/1.3 var(--f-mono); color: var(--accent); letter-spacing: .04em; }
+.stage .t { font-weight: 600; }
+.stage .d { color: var(--muted); font-size: 13px; }
+.stage::after { content: "→"; position: absolute; right: -9px; top: 14px; z-index: 1; background: var(--bg); color: var(--muted); font-size: 13px; line-height: 1; padding: 2px 0; }
+.stage:last-child::after { content: none; }
+@media (max-width: 860px) {
+  .pipe { grid-template-columns: 1fr; }
+  .stage + .stage { border-left: 1px solid var(--line); border-top: none; }
+  .stage:first-child { border-radius: 10px 10px 0 0; } .stage:last-child { border-radius: 0 0 10px 10px; }
+  .stage::after { content: "↓"; right: auto; left: 14px; top: auto; bottom: -9px; padding: 0 4px; }
+}
+.gaps { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.gap { border: 1px dashed var(--line); border-radius: 10px; padding: 12px 14px; display: grid; gap: 4px; font-size: 13.5px; }
+.gap b { font-weight: 600; }
+.gap span { color: var(--muted); }
+@media (max-width: 700px) { .gaps { grid-template-columns: 1fr; } }
+
+/* bars */
+.bars { display: grid; gap: 8px; }
+.bar { display: grid; grid-template-columns: minmax(0, 210px) minmax(0, 1fr) 56px; gap: 12px; align-items: center; font-size: 13.5px; }
+.bar .n { font-family: var(--f-mono); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar .track { height: 14px; background: var(--off-soft); border-radius: 3px; overflow: hidden; }
+.bar .fill { height: 100%; background: var(--accent); border-radius: 3px; }
+.bar.hi .fill { background: var(--mid); }
+.bar .v { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--f-mono); font-size: 12.5px; }
+.cols2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px; }
+.cols2 h3 { margin: 0 0 10px; font-size: 14px; font-weight: 600; color: var(--muted); }
+@media (max-width: 760px) { .cols2 { grid-template-columns: 1fr; } .bar { grid-template-columns: minmax(0, 150px) minmax(0, 1fr) 48px; } }
+.callout { color: var(--muted); font-size: 14px; max-width: 70ch; margin: 0; }
+
+/* matrix */
+.tbl-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; min-width: 620px; font-size: 14px; }
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font: 500 11.5px/1.3 var(--f-mono); color: var(--muted); letter-spacing: .04em; text-transform: uppercase; }
+tr:last-child td { border-bottom: none; }
+td:first-child { font-weight: 600; white-space: nowrap; }
+td:last-child { color: var(--muted); }
+.pill { display: inline-block; font: 500 12px/1 var(--f-body); padding: 5px 9px; border-radius: 999px; white-space: nowrap; }
+.p-ok { background: var(--ok-soft); color: var(--ok); }
+.p-exp { background: var(--accent-soft); color: var(--accent); }
+.p-part { background: var(--warn-soft); color: var(--warn); }
+.p-no { background: var(--off-soft); color: var(--off); }
+
+/* lists */
+.fixed { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.fixed li { display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 8px; }
+.fixed li::before { content: "✓"; color: var(--ok); font-weight: 600; }
+.fixed .ref { color: var(--muted); font-family: var(--f-mono); font-size: 12px; margin-left: 6px; }
+.issues { display: grid; gap: 10px; }
+.issue { display: grid; grid-template-columns: 82px minmax(0, 1fr); gap: 14px; padding: 12px 14px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
+.issue .sev { font: 600 12px/1 var(--f-body); padding: 6px 0; border-radius: 6px; text-align: center; align-self: start; }
+.s-crit { background: var(--bad-soft); color: var(--bad); }
+.s-high { background: var(--mid-soft); color: var(--mid); }
+.s-med { background: var(--warn-soft); color: var(--warn); }
+.s-low { background: var(--off-soft); color: var(--off); }
+.issue .t { font-weight: 600; }
+.issue p { margin: 2px 0 0; color: var(--muted); font-size: 14px; }
+@media (max-width: 520px) { .issue { grid-template-columns: 1fr; gap: 8px; } .issue .sev { justify-self: start; padding: 6px 10px; } }
+.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; counter-reset: s; }
+.steps li { counter-increment: s; display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 12px; }
+.steps li::before { content: counter(s); width: 28px; height: 28px; border-radius: 50%; background: var(--accent); color: var(--surface); font: 600 13px/28px var(--f-mono); text-align: center; }
+.steps .t { font-weight: 600; }
+.steps p { margin: 2px 0 0; color: var(--muted); font-size: 14px; max-width: 70ch; }
+.src { color: var(--muted); font-size: 12.5px; border-top: 1px solid var(--line); padding-top: 14px; }
+</style>
+
+<main class="wrap">
+
+<header>
+  <div class="eyebrow">pose_craft/ · pyproject.toml · docs/PROJECT_STATUS.md — 2026‑10‑27</div>
+  <h1>Diagnóstico PoseCraft</h1>
+  <p class="lede">Estado de la app de escritorio que convierte la foto de una persona en una pose de Blender: qué funciona, qué está verificado solo a medias y qué falta antes de publicar un primer release.</p>
+</header>
+
+<section aria-label="Resumen">
+  <div class="tiles">
+    <div class="tile">
+      <div class="meter" aria-hidden="true"><span style="width:97.6%;background:var(--ok)"></span><span style="width:2.4%;background:var(--off)"></span></div>
+      <div class="big">493 / 505</div>
+      <div class="lbl">Tests pasando</div>
+      <div class="sub">12 omitidos (opt‑in GPU, Blender, DAZ) · 0 fallos · 52 archivos · 24.9 s</div>
+    </div>
+    <div class="tile">
+      <div class="big">13 341</div>
+      <div class="lbl">Líneas en pose_craft/</div>
+      <div class="sub">35 módulos Python · 9 201 líneas de tests</div>
+    </div>
+    <div class="tile">
+      <div class="big">1 906</div>
+      <div class="lbl">import_pose.py</div>
+      <div class="sub">14% del código en el add‑on de Blender, un solo archivo</div>
+    </div>
+    <div class="tile">
+      <div class="big">59 · 0</div>
+      <div class="lbl">Commits · tags</div>
+      <div class="sub">5 archivos sin commitear (+87 −23); ningún release etiquetado</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><h2>Arquitectura</h2><span class="note">pipeline de una foto a un rig, 5 etapas</span></div>
+  <div class="pipe">
+    <div class="stage"><span class="k">ENTRADA</span><span class="t">Foto o video</span><span class="d"><code>imaging.py</code> · rutas unicode, aviso de baja resolución</span></div>
+    <div class="stage"><span class="k">ESTIMACIÓN</span><span class="t">BlazePose en ONNX</span><span class="d">DirectML → CUDA → CPU, cada uno validado contra CPU al cargar; multi‑persona, manos</span></div>
+    <div class="stage"><span class="k">RETARGET</span><span class="t">skeleton.py</span><span class="d">15 huesos + 15 por mano; dirección y roll por hueso; Y‑up</span></div>
+    <div class="stage"><span class="k">EXPORT</span><span class="t">JSON v2 · BVH · glTF · FBX · DAZ</span><span class="d">Y‑up → Z‑up; presets Mixamo, UE5, HumanIK</span></div>
+    <div class="stage"><span class="k">BLENDER</span><span class="t">Add‑on 0.9.0</span><span class="d">Live Link TCP <code>127.0.0.1:8642</code>, protocolos 2–4</span></div>
+  </div>
+  <div class="gaps">
+    <div class="gap"><b>✕ release.yml nunca ejecutado</b><span>Construye los zips DirectML/CPU y SHA256SUMS, pero ningún tag lo ha disparado; solo hay builds locales.</span></div>
+    <div class="gap"><b>✕ job <code>blender</code> de CI sin correr en GitHub</b><span>Los 6 tests reales de Blender pasan localmente con 5.2; en CI (4.2 LTS) aún no han corrido.</span></div>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><h2>Composición del código</h2><span class="note">líneas por paquete y top 8 de 35 archivos</span></div>
+  <div class="cols2">
+    <div>
+      <h3>Por paquete</h3>
+      <div class="bars">
+        <div class="bar"><span class="n">gui/</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="v">4 115</span></div>
+        <div class="bar"><span class="n">estimation/</span><div class="track"><div class="fill" style="width:67.6%"></div></div><span class="v">2 783</span></div>
+        <div class="bar"><span class="n">export/blender_addon/</span><div class="track"><div class="fill" style="width:46.3%"></div></div><span class="v">1 906</span></div>
+        <div class="bar"><span class="n">export/</span><div class="track"><div class="fill" style="width:40.4%"></div></div><span class="v">1 664</span></div>
+        <div class="bar"><span class="n">pose_craft/ (raíz)</span><div class="track"><div class="fill" style="width:39.6%"></div></div><span class="v">1 630</span></div>
+        <div class="bar"><span class="n">retarget/</span><div class="track"><div class="fill" style="width:30.2%"></div></div><span class="v">1 243</span></div>
+      </div>
+    </div>
+    <div>
+      <h3>Por archivo</h3>
+      <div class="bars">
+        <div class="bar hi"><span class="n">import_pose.py</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="v">1 906</span></div>
+        <div class="bar"><span class="n">main_window.py</span><div class="track"><div class="fill" style="width:73.8%"></div></div><span class="v">1 407</span></div>
+        <div class="bar"><span class="n">skeleton.py</span><div class="track"><div class="fill" style="width:65.2%"></div></div><span class="v">1 243</span></div>
+        <div class="bar"><span class="n">onnx_pose.py</span><div class="track"><div class="fill" style="width:47.3%"></div></div><span class="v">901</span></div>
+        <div class="bar"><span class="n">window_layout.py</span><div class="track"><div class="fill" style="width:38.1%"></div></div><span class="v">727</span></div>
+        <div class="bar"><span class="n">video.py</span><div class="track"><div class="fill" style="width:38.0%"></div></div><span class="v">724</span></div>
+        <div class="bar"><span class="n">landmarker.py</span><div class="track"><div class="fill" style="width:32.6%"></div></div><span class="v">622</span></div>
+        <div class="bar"><span class="n">viewport_3d.py</span><div class="track"><div class="fill" style="width:28.3%"></div></div><span class="v">539</span></div>
+      </div>
+    </div>
+  </div>
+  <p class="callout"><code>import_pose.py</code> es 1.4× el segundo archivo: el add‑on se instala como un solo archivo dentro de Blender, así que concentra importador, servidor Live Link, mapeo de huesos y soporte Rigify. <code>main_window.py</code> ya se partió en tres mixins (C4); el add‑on no.</p>
+</section>
+
+<section>
+  <div class="sec-head"><h2>Matriz de funcionalidades</h2><span class="note">implementado vs. verificado</span></div>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Funcionalidad</th><th>Estado</th><th>Detalle</th></tr></thead>
+      <tbody>
+        <tr><td>Detección en foto</td><td><span class="pill p-ok">Verificada</span></td><td>Multi‑persona, teselas para fotos de grupo; ejes comprobados en 5 fotos golden CC0</td></tr>
+        <tr><td>Aceleración GPU</td><td><span class="pill p-ok">Verificada</span></td><td>DirectML y CUDA con prueba de paridad contra CPU (peor caso 7e‑4) en RTX 5080 e iGPU AMD</td></tr>
+        <tr><td>Export JSON / BVH / glTF</td><td><span class="pill p-exp">Expuesta</span></td><td>Pose y animación; presets de esqueleto Mixamo, UE5 Mannequin, HumanIK</td></tr>
+        <tr><td>Export FBX</td><td><span class="pill p-exp">Expuesta</span></td><td>Convertido desde glTF por un Blender headless; requiere Blender instalado</td></tr>
+        <tr><td>Corrección manual + undo</td><td><span class="pill p-exp">Expuesta</span></td><td>Arrastre de articulaciones, inversión de profundidad, ajuste por hueso en <code>QUndoStack</code></td></tr>
+        <tr><td>Librería de poses</td><td><span class="pill p-exp">Expuesta</span></td><td>Reexportar, espejo, mezcla; envío a Blender como assets de Pose Library (F15, F17)</td></tr>
+        <tr><td>Live Link a Blender</td><td><span class="pill p-part">Parcial</span></td><td>Verificado headless en Blender 5.2.2; panel, lista de mapeo y otras versiones sin probar</td></tr>
+        <tr><td>Roll de huesos</td><td><span class="pill p-part">Parcial</span></td><td>Brazo o pierna recta: roll inferido del torso, no medido; ángulos nunca comparados con poses reales</td></tr>
+        <tr><td>Manos y dedos</td><td><span class="pill p-part">Parcial</span></td><td>Sin verificar en fotos reales; el giro de los dedos no se mide</td></tr>
+        <tr><td>Video multi‑persona</td><td><span class="pill p-part">Parcial</span></td><td>IDs heurísticos; probado con escenas sintéticas, no con metraje real</td></tr>
+        <tr><td>Export DAZ</td><td><span class="pill p-part">Parcial</span></td><td>Solo Genesis 9; torso como un único hueso</td></tr>
+        <tr><td>Release firmado</td><td><span class="pill p-no">Sin probar</span></td><td><code>sign_build.py</code> funciona con certificado autofirmado; sin certificado real</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2>Resuelto recientemente</h2>
+  <ul class="fixed">
+    <li><span>Test de hover que fallaba según el orden de ejecución: ahora vacía la cola de eventos Qt antes de capturar <span class="ref">sin commitear</span></span></li>
+    <li><span>Panel de controles cortado en ventanas bajas; el icono suma un gizmo de ejes <span class="ref">d9712b9</span></span></li>
+    <li><span>Presets de esqueleto, export FBX, librería a Blender e importación BVH <span class="ref">107422f</span></span></li>
+    <li><span>Librería de poses, vista desde la cámara de la foto y ventana partida en mixins <span class="ref">92043e9</span></span></li>
+    <li><span><code>PoseCraft.exe --self-test</code>: modelos, solve golden CPU/GPU, exports y ventana en el build <span class="ref">435d261</span></span></li>
+    <li><span>Export a glTF binario (.glb) de poses y animaciones <span class="ref">7e59303</span></span></li>
+  </ul>
+</section>
+
+<section>
+  <h2>Problemas abiertos</h2>
+  <div class="issues">
+    <div class="issue"><span class="sev s-crit">Crítico</span><div><div class="t">El workflow de release nunca se ha ejecutado</div><p>Cero tags y ningún zip de CI probado: el primer release real sería también la primera prueba del pipeline.</p></div></div>
+    <div class="issue"><span class="sev s-high">Alto</span><div><div class="t">Cambios sin commitear en 5 archivos</div><p>El arreglo del test de hover, cambios del add‑on y la actualización de docs solo existen en la copia local de OneDrive.</p></div></div>
+    <div class="issue"><span class="sev s-high">Alto</span><div><div class="t">Sin firma de código real</div><p>SmartScreen marcará el .exe como no reconocido en cualquier otra máquina.</p></div></div>
+    <div class="issue"><span class="sev s-med">Medio</span><div><div class="t">Ángulos articulares sin validar</div><p>Las fotos golden comprueban ejes y regresiones, no los ángulos; el roll de miembros rectos es una suposición.</p></div></div>
+    <div class="issue"><span class="sev s-med">Medio</span><div><div class="t">Add‑on verificado solo headless en 5.2.2</div><p>La UI del panel, el timer de Live Link en el bucle real de Blender, Blender 3.6–4.x y un FBX real de Mixamo siguen sin probar.</p></div></div>
+    <div class="issue"><span class="sev s-med">Medio</span><div><div class="t">mypy cubre 13 de 35 archivos</div><p>ruff pasa en todo el repo; el chequeo de tipos deja fuera la mayor parte de <code>gui/</code> y <code>estimation/</code>.</p></div></div>
+    <div class="issue"><span class="sev s-low">Bajo</span><div><div class="t">Build CUDA de 1.73 GB y DirectML en mantenimiento</div><p>DirectML es la descarga principal (508 MB), pero su rueda va atrasada (1.24.4 frente a 1.30.0).</p></div></div>
+    <div class="issue"><span class="sev s-low">Bajo</span><div><div class="t">Manos y video sin material real</div><p>Dedos y tracking multi‑persona solo se han probado con fotos sintéticas o escenas guionizadas.</p></div></div>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><h2>Próximos pasos recomendados</h2><span class="note">en orden</span></div>
+  <ol class="steps">
+    <li><div><div class="t">Commitear el arreglo del test y los cambios del add‑on</div><p>Deja la suite en verde dentro del historial, no solo en disco, antes de cualquier otro cambio.</p></div></li>
+    <li><div><div class="t">Ejecutar release.yml con workflow_dispatch</div><p>Descargar y lanzar cada zip (DirectML y CPU) con <code>--self-test</code> antes de etiquetar una versión.</p></div></li>
+    <li><div><div class="t">Hacer push y ver correr el job <code>blender</code> de CI</div><p>Confirma el add‑on en Blender 4.2 LTS, la versión más cercana al mínimo de <code>bl_info</code> que se puede probar en CI.</p></div></li>
+    <li><div><div class="t">Validar ángulos con fotos de pose conocida</div><p>Un set pequeño con ángulos medidos convierte el roll inferido en un error cuantificado.</p></div></li>
+    <li><div><div class="t">Conseguir un certificado de firma y ampliar mypy</div><p>La firma quita el aviso de SmartScreen; extender mypy a <code>gui/</code> y <code>estimation/</code> cubre el código más grande.</p></div></li>
+  </ol>
+</section>
+
+<footer class="src">Fuente: docs/PROJECT_STATUS.md, <code>pytest -q</code> en .venv (493 passed, 12 skipped), <code>ruff check</code> y <code>mypy</code> limpios, conteo de líneas de pose_craft/**/*.py, <code>git log</code> y <code>git status</code> — snapshot local del 2026‑10‑27.</footer>
+
+</main>
