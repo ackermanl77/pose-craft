@@ -627,7 +627,18 @@ def test_the_3d_preview_has_navigation_and_an_axis_gizmo_that_matches_the_camera
     try:
         window.resize(1400, 800)
         window.show()
-        qapp.processEvents()
+        # On a screen smaller than 1400x800 (CI's 1024x768) Windows shrinks the window after
+        # show(), and the viewport's last resizeEvent -- which places the overlays -- comes later.
+        from PySide6.QtTest import QTest
+
+        QTest.qWaitForWindowExposed(window)
+        last = None
+        for _ in range(50):
+            qapp.processEvents()
+            if window.viewport.size() == last:
+                break
+            last = window.viewport.size()
+            QTest.qWait(20)
         viewport = window.viewport
         nav = viewport.navigation
         assert nav.isVisible() and viewport.axis_gizmo.isVisible()

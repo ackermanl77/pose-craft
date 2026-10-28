@@ -7,8 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from pose_craft import app as app_module
-from pose_craft import selftest
+pytest.importorskip("PySide6")  # this module needs a real Qt install; CI's lightweight venv skips it
+
+from pose_craft import app as app_module  # noqa: E402
+from pose_craft import selftest  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 

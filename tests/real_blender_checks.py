@@ -343,14 +343,14 @@ results["resampled"] = {
 
 # --- 1 again: unregister stops the server ------------------------------------------------------
 addon_utils.disable("import_pose", default_set=True)
-probe = socket.socket()
+# Is anything still accepting connections on the port? A connect, not a bind: on Linux the
+# connections the server just closed sit in TIME_WAIT on that port, so a plain bind() fails
+# there even though nothing is listening any more (the add-on itself rebinds with SO_REUSEADDR).
 try:
-    probe.bind(("127.0.0.1", port))
-    port_freed = True
-except OSError:
+    socket.create_connection(("127.0.0.1", port), timeout=1).close()
     port_freed = False
-finally:
-    probe.close()
+except OSError:
+    port_freed = True
 results["unregistered"] = {
     "classes_gone": not hasattr(bpy.types, "POSECRAFT_PT_panel") and not hasattr(bpy.types.Scene, "posecraft_target"),
     "port_freed": port_freed,
