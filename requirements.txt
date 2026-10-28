@@ -1,18 +1,18 @@
-numpy==2.5.3
+numpy==2.5.4
 scipy==1.18.1
 # Pose estimation: MediaPipe's BlazePose models on ONNX Runtime (see
 # pose_craft/estimation/onnx_pose.py). onnxruntime-gpu also runs on the CPU, so
 # this is the only runtime needed either way; install requirements-gpu.txt on
 # top for NVIDIA GPU acceleration. onnx + tflite are for the one-time
 # conversion of the downloaded .task model bundle to ONNX.
-onnxruntime-gpu==1.30.0
-onnx==1.23.0
+onnxruntime-gpu==1.31.0
+onnx==1.23.2
 tflite==2.18.0
 # headless: the app only decodes, resizes and warps images (and reads video
 # frames); the GUI is Qt, so OpenCV's own GUI and the contrib modules (~22 MB
 # in a build) aren't needed. Same package CI tests with.
 opencv-python-headless==5.0.0.93
-PySide6==6.11.2
+PySide6==6.12.0
 pyqtgraph==0.14.0
 PyOpenGL==3.1.10
 
