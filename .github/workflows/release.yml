@@ -24,7 +24,7 @@ jobs:
       matrix:
         flavor: [dml, cpu]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:
@@ -124,7 +124,7 @@ jobs:
   addon:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # One zip for both: an extension on Blender 4.2+ (blender_manifest.toml) and a
       # legacy add-on on 3.6-4.1 (bl_info).
       - name: Zip the Blender add-on
