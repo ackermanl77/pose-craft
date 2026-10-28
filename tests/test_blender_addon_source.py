@@ -436,6 +436,61 @@ def test_a_stalled_client_never_blocks_a_poll_and_expires():
             sock.close()
 
 
+def test_live_link_poll_bounds_accepts_connections_and_reads():
+    class _Client:
+        def __init__(self):
+            self.recv_calls = 0
+            self.recv_sizes = []
+            self.close_calls = 0
+
+        def setblocking(self, _blocking):
+            pass
+
+        def recv(self, size):
+            self.recv_calls += 1
+            self.recv_sizes.append(size)
+            raise BlockingIOError
+
+        def close(self):
+            self.close_calls += 1
+
+    class _Server:
+        def __init__(self, clients):
+            self.clients = list(clients)
+            self.accept_calls = 0
+
+        def accept(self):
+            self.accept_calls += 1
+            if not self.clients:
+                raise BlockingIOError
+            return self.clients.pop(0), ("127.0.0.1", 0)
+
+    loaded = _load_pure_functions("LiveLinkReader", "_poll_live_link_server", "_drop_connection")
+    clients = [_Client() for _ in range(loaded["MAX_LIVE_LINK_CONNECTIONS"] + 4)]
+    server = _Server(clients)
+    loaded["_server_socket"] = server
+    loaded["_connections"] = {}
+    poll = loaded["_poll_live_link_server"]
+    try:
+        for tick, (expected_clients, expected_closed) in enumerate(((4, 0), (8, 0), (8, 4))):
+            before_accepts = server.accept_calls
+            poll()
+            assert server.accept_calls - before_accepts <= loaded["MAX_LIVE_LINK_ACCEPTS_PER_TICK"]
+            assert len(loaded["_connections"]) == expected_clients
+            assert sum(client.close_calls for client in clients) == expected_closed
+            assert [client.recv_calls for client in clients] == (
+                [tick + 1] * 4 + [tick] * 4 + [0] * 4
+            )
+
+        for client in clients[:8]:
+            assert len(client.recv_sizes) == client.recv_calls
+            assert set(client.recv_sizes) == {loaded["MAX_LIVE_LINK_READ_BYTES_PER_CONNECTION_PER_TICK"]}
+        assert all(client.recv_calls == 0 for client in clients[8:])
+    finally:
+        for conn in list(loaded["_connections"]):
+            loaded["_drop_connection"](conn)
+
+
 # --- B17: the Live Link target is captured, not "whatever is selected" -------------
 
 

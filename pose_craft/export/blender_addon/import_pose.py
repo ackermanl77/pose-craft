@@ -270,6 +270,9 @@ MAX_LIVE_LINK_PAYLOAD_BYTES = 262144  # 256 KB (a plain literal: the tests read 
 # A connection has this long, from accept, to deliver its whole message before
 # it's dropped. Reads never block: each timer tick takes whatever has arrived.
 LIVE_LINK_MESSAGE_DEADLINE_SECONDS = 2.0
+MAX_LIVE_LINK_CONNECTIONS = 8
+MAX_LIVE_LINK_ACCEPTS_PER_TICK = 4
+MAX_LIVE_LINK_READ_BYTES_PER_CONNECTION_PER_TICK = 65536
 
 # Live Link server state. Blender add-ons that need to survive across operator
 # calls conventionally keep this at module scope rather than on a class instance.
@@ -1626,10 +1629,11 @@ def _drop_connection(conn: socket.socket) -> None:
 
 def _poll_live_link_server():
     """`bpy.app.timers` callback on Blender's main thread, so nothing here may
-    block (B16): accepts any waiting connections, then takes whatever bytes
-    each one has delivered (non-blocking recv into a LiveLinkReader) and
-    applies a document once it's complete. A connection that hasn't finished
-    its message within LIVE_LINK_MESSAGE_DEADLINE_SECONDS is dropped.
+    block (B16): accepts a bounded number of waiting connections, then takes a
+    bounded amount of data from each active connection (non-blocking recv into
+    a LiveLinkReader) and applies a document once it's complete. Excess
+    connections are closed. A connection that hasn't finished its message
+    within LIVE_LINK_MESSAGE_DEADLINE_SECONDS is dropped.
     Returning None stops the timer; any other value is the delay until the
     next call.
     """
@@ -1638,7 +1642,7 @@ def _poll_live_link_server():
     if _server_socket is None:
         return None
 
-    while True:
+    for _ in range(MAX_LIVE_LINK_ACCEPTS_PER_TICK):
         try:
             conn, _addr = _server_socket.accept()
         except BlockingIOError:
@@ -1647,6 +1651,9 @@ def _poll_live_link_server():
             _live_link_status = f"Server error: {exc}"
             _tag_view3d_redraw()
             return None
+        if len(_connections) >= MAX_LIVE_LINK_CONNECTIONS:
+            conn.close()
+            continue
         conn.setblocking(False)
         _connections[conn] = LiveLinkReader(time.monotonic() + LIVE_LINK_MESSAGE_DEADLINE_SECONDS)
 
@@ -1654,15 +1661,15 @@ def _poll_live_link_server():
     for conn, reader in list(_connections.items()):
         document, closed = None, False
         try:
-            while document is None:
-                try:
-                    data = conn.recv(65536)
-                except BlockingIOError:
-                    break
+            try:
+                data = conn.recv(MAX_LIVE_LINK_READ_BYTES_PER_CONNECTION_PER_TICK)
+            except BlockingIOError:
+                data = None
+            if data is not None:
                 if not data:
                     closed = True
-                    break
-                document = reader.feed(data)
+                else:
+                    document = reader.feed(data)
         except (OSError, ValueError) as exc:
             _live_link_status = f"Dropped a Live Link message: {exc}"
             _connections.pop(conn, None)
