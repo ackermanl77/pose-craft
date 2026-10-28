@@ -113,7 +113,7 @@ jobs:
           python scripts/build_installer.py --flavor ${{ matrix.flavor }}
           Move-Item dist/installer/PoseCraft-*-setup.exe .
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: PoseCraft-${{ matrix.flavor }}
           path: |
@@ -129,7 +129,7 @@ jobs:
       # legacy add-on on 3.6-4.1 (bl_info).
       - name: Zip the Blender add-on
         run: python3 scripts/build_addon_zip.py --out .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: PoseCraft-addon
           path: posecraft-blender-addon-*.zip
@@ -148,7 +148,7 @@ jobs:
         working-directory: artifacts
         run: sha256sum *.zip *.exe > SHA256SUMS && cat SHA256SUMS
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: PoseCraft-release
           path: artifacts/*
