@@ -433,10 +433,13 @@ def test_hovering_a_bone_highlights_and_names_it(qapp):
     _move(view, pos)
     assert view.hover_info() == (1, "shin.L", None)
     assert view.toolTip() == "Person 8: shin.L"  # the label the window passes (a video's track ID)
-    color = view.grab().toImage().pixelColor(int(pos.x()), int(pos.y()))
+    qapp.processEvents()
+    grabbed = view.grab()
+    scale = grabbed.devicePixelRatio()
+    color = grabbed.toImage().pixelColor(round(pos.x() * scale), round(pos.y() * scale))
     assert (color.red(), color.green(), color.blue()) == (
         photo_view.HOVER_COLOR.red(), photo_view.HOVER_COLOR.green(), photo_view.HOVER_COLOR.blue()
-    )
+    ), f"hover pixel differs at device scale {scale} (grab size {grabbed.size()}, widget size {view.size()})"
 
     # A redraw while the mouse rests keeps the highlight on what's under it.
     view.set_skeleton_overlay(list(people))

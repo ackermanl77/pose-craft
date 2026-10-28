@@ -213,11 +213,9 @@ $env:QT_QPA_PLATFORM = "offscreen"
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-Last run 2026-10-22: **490 passed, 12 skipped, 1 failed** (the skips are the
-LiteRT reference test, the opt-in GPU parity tests and the opt-in real-Blender
-and real-DAZ tests; the failure, `test_gui_live_link.py::test_hovering_a_bone_highlights_and_names_it`,
-also fails without the latest changes -- see `docs/PROJECT_STATUS.md`) -- re-run
-it rather than trusting this number.
+Last run 2026-10-27: **493 passed, 12 skipped** (the skips are the LiteRT
+reference test, opt-in GPU parity tests and opt-in real-Blender and real-DAZ
+tests). The offscreen Qt hover regression and the full suite pass.
 
 Needs `requirements-test.txt` (numpy/scipy/opencv-python-headless/pytest plus
 CPU onnxruntime/onnx/tflite, not the Qt stack or the GPU runtime) -- covers the

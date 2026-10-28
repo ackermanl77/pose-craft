@@ -1166,10 +1166,11 @@ time each check ran, not guaranteed to stay true as the code changes.
 
 ## Known Issues
 
-- **`test_hovering_a_bone_highlights_and_names_it` fails when it runs after
-  the rest of `tests/test_gui_live_link.py`** (it passes on its own), also on
-  the commit before the 2026-10-21 changes: an earlier test in the file leaves
-  state behind that the hover check trips over. Not investigated yet.
+- **Resolved 2026-10-27 — order-dependent hover test.** The synthetic mouse move
+  queued a widget repaint, but the pixel assertion grabbed the widget before
+  flushing Qt's event queue. The test now processes pending events before the
+  grab and samples in device-pixel coordinates. The full suite passes
+  (493 passed, 12 skipped).
 
 - **The CUDA build is large.** All three flavours were built and smoke-tested
   on 2026-10-01 (Python 3.14.7, PyInstaller 6.22.3, models bundled). Each exe
