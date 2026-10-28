@@ -9,12 +9,16 @@ the Live Link.
 
 ## Current Status
 
-- MVP stage: the full pipeline (photo or video -> pose estimation
-  (MediaPipe's BlazePose models, plus the optional hand model, on ONNX
+- MVP stage: the full pipeline (photo, video or a webcam recording -> pose
+  estimation (MediaPipe's BlazePose models, plus the optional hand and face
+  models -- fingers, and 52 ARKit-style face expression weights -- on ONNX
   Runtime -- DirectML or CUDA on a GPU, else the CPU) -> bone retargeting ->
-  JSON/BVH/glTF/FBX export or the live Blender link -> Blender add-on 0.9.0,
-  or a DAZ Studio pose preset for Genesis 9) is
-  implemented, and all three build flavours build and launch. The add-on has
+  JSON/BVH/glTF/FBX export or the live Blender link -> Blender add-on 0.10.0,
+  which keys face expressions onto matching shape keys, or a DAZ Studio pose
+  preset for Genesis 9) is
+  implemented, and all three build flavours build and launch. Webcam
+  recording (File > Record from Webcam...) has only been tested with a video
+  file standing in for the camera. The add-on has
   been run headless in a real Blender 5.2.2 (PoseCraft-shaped, Mixamo-style
   and generated Rigify rigs, the BVH importer, a real Live Link server); its
   panel UI, and the accuracy of a solve on real photos and footage, have not
@@ -184,6 +188,15 @@ python scripts/convert_models.py
 set POSECRAFT_FLAVOR=dml
 pyinstaller PoseCraft.spec
 ```
+
+Check the build with `dist\PoseCraft\PoseCraft.exe --self-test` (from source:
+`python -m pose_craft.app --self-test`; `pose_craft/selftest.py`). Without opening a
+window it checks ONNX Runtime and its providers, the bundled models, a real solve of a
+bundled CC0 photo against its golden output on the CPU (then the GPU against the CPU; no
+GPU is reported, not a failure) and the hand model, the JSON/BVH/glTF exports, and the
+main window built offscreen. Nothing is downloaded and your settings aren't touched; exit
+code 0 means every check passed, and the report is also written to
+`%TEMP%\PoseCraft-selftest.txt`. The release workflow runs it on each flavour.
 
 To Authenticode-sign the result: `set CODESIGN_THUMBPRINT=<SHA-1 thumbprint>` (a
 code-signing certificate in the Windows store), then `python scripts/sign_build.py`

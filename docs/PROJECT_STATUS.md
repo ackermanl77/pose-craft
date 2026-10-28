@@ -78,7 +78,7 @@ pose_craft_pose .json file            export/live_link.py: length-prefixed
         |                              for the pose library as Pose Library
         |                              assets, F17)
         v                                              |
-export/blender_addon/import_pose.py (installed inside Blender; add-on 0.9.0,
+export/blender_addon/import_pose.py (installed inside Blender; add-on 0.10.0,
   bl_info minimum Blender 3.6, verified in Blender 5.2.2)
   -- Load Pose JSON operator, or a Live Link server (bpy.app.timers-polled,
      fully non-blocking: accept and incremental reads with a 2 s per-message
@@ -529,7 +529,8 @@ time each check ran, not guaranteed to stay true as the code changes.
   - **B13** folder batch processing: `pose_craft/batch.py`, `python -m
     pose_craft.cli --input DIR --output DIR [--format json|bvh] [--mirror]
     [--model] [--cpu] [--hands] [--group-photo] [--detection-threshold]`, and
-    File > Batch Process Folder with progress and Cancel. The export logic
+    File > Batch Process Folder (`pose_craft/gui/batch_dialog.py`, a worker
+    thread) with progress and Cancel. The export logic
     moved to the Qt-free `pose_craft/posing.py`, so both match Export All People.
   - **P5** the runtime cache stores the byte-identical detector once by content
     hash; BlazePose shares one detector session per file and device.
