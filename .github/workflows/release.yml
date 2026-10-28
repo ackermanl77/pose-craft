@@ -71,6 +71,10 @@ jobs:
       - name: Pre-convert the models
         run: python scripts/convert_models.py --out build/models
 
+      - name: Third-party notices
+        # Lists the packages actually being bundled; PoseCraft.spec ships the file.
+        run: python scripts/third_party_notices.py
+
       - name: Build
         shell: pwsh
         env:

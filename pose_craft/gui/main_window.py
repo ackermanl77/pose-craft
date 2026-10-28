@@ -572,6 +572,22 @@ class MainWindow(LayoutMixin, InputsMixin, ExportMixin, QMainWindow):
 
         QMessageBox.about(self, "About PoseCraft", ABOUT_TEXT.format(version=__version__))
 
+    def show_update(self, info) -> None:
+        """A newer release exists (pose_craft/update_check.py; app.py checks once per launch)."""
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        from pose_craft import __version__
+
+        self.statusBar().showMessage(f"PoseCraft {info.version} is available.", 15000)
+        notes = f"\n\n{info.notes}" if info.notes else ""
+        answer = QMessageBox.question(
+            self, "Update available",
+            f"PoseCraft {info.version} is available (you have {__version__}).{notes}\n\nOpen the download page?",
+        )
+        if answer == QMessageBox.Yes:
+            QDesktopServices.openUrl(QUrl(info.url))
+
     # -- settings (F7) --------------------------------------------------------------
 
     def _restore_settings(self) -> None:

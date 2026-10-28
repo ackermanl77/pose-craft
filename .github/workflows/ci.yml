@@ -140,3 +140,16 @@ jobs:
           export POSECRAFT_BLENDER="$HOME/blender/blender"
           "$POSECRAFT_BLENDER" --version
           python -m pytest -q tests/test_real_blender.py tests/test_fbx_export.py tests/test_real_blender_library.py
+
+  audit:
+    # Known vulnerabilities in the pinned/required Python packages (OSV / PyPI advisory data).
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: pip-audit
+        run: |
+          python -m pip install pip-audit==2.10.1
+          python -m pip_audit -r requirements.txt --progress-spinner off

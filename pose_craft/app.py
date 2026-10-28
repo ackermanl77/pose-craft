@@ -7,6 +7,7 @@ from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from pose_craft import __version__, update_check
 from pose_craft.diagnostics import configure_logging, install_excepthooks
 from pose_craft.gui.main_window import MainWindow
 
@@ -36,6 +37,16 @@ class _ErrorDialogRelay(QObject):
         QMessageBox.critical(None, "PoseCraft error", text)
 
 
+class _UpdateRelay(QObject):
+    """Hands a found update from the checking thread to the main window on the GUI thread."""
+
+    found = Signal(object)
+
+    def __init__(self, window: MainWindow):
+        super().__init__()
+        self.found.connect(window.show_update, Qt.QueuedConnection)
+
+
 def main() -> int:
     from pose_craft.selftest import run_self_test, wants_self_test
 
@@ -55,6 +66,9 @@ def main() -> int:
     # first Solve doesn't pay the cold start (only when it's already cached).
     window = MainWindow(warm_up=True)
     window.show()
+    updates = _UpdateRelay(window)
+    # Does nothing until pose_craft/update_check.py's UPDATE_FEED_URL is set.
+    update_check.check_in_background(__version__, updates.found.emit)
     return app.exec()
 
 

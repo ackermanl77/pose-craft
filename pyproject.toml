@@ -9,6 +9,7 @@ build-backend = "setuptools.build_meta"
 name = "posecraft"
 description = "Turn a photo of a person into a Blender pose: BlazePose landmarks retargeted to an armature."
 requires-python = ">=3.12"
+license = { text = "MIT" }
 dynamic = ["version"]
 
 [tool.setuptools.dynamic]

@@ -219,6 +219,13 @@ for GitHub's artifact storage quota to reset). See `docs/PROJECT_STATUS.md`'s "R
 was chosen over `--onefile`. Re-run `python scripts/generate_icon.py` first if
 you've changed `assets/icon.png`/`assets/icon.ico`.
 
+## Privacy
+
+Photos, videos and webcam recordings are processed on your computer and never uploaded. A
+source install downloads MediaPipe's pose and hand models from storage.googleapis.com the
+first time they are needed (the packaged app bundles them). The Live Link to Blender connects
+to 127.0.0.1 by default. A release may switch on the update check: once per launch it downloads a small version file from the release site and sends nothing but the app's name and version. There is no telemetry.
+
 ## Test
 
 ```powershell

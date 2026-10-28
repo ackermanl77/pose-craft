@@ -15,7 +15,8 @@ import windows_resources  # noqa: E402
 VERSION_PATH = windows_resources.write_version_file(workpath)
 MANIFEST_PATH = windows_resources.write_manifest(workpath)
 
-datas = [('assets/icon.png', 'assets'), ('assets/icon.ico', 'assets')]
+# The license and third-party notices travel with every build (scripts/third_party_notices.py).
+datas = [('assets/icon.png', 'assets'), ('assets/icon.ico', 'assets'), ('LICENSE', '.'), ('THIRD_PARTY_NOTICES.md', '.')]
 # --self-test (pose_craft/selftest.py) solves this CC0 photo and compares it with its golden output.
 datas += [('tests/data/golden/yoga_tree.jpg', 'selftest'), ('tests/data/golden/yoga_tree.golden.json', 'selftest')]
 binaries = []
