@@ -10,7 +10,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:
@@ -50,7 +50,7 @@ jobs:
     # C3: ruff over everything, mypy over the pure modules (pyproject.toml has both configs).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:
@@ -73,7 +73,7 @@ jobs:
     # coverage in the log. No artifact upload: the account's Actions storage is limited.
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:
@@ -105,7 +105,7 @@ jobs:
       BLENDER_VERSION: "4.2.23"
       BLENDER_SHA256: bea0eb3146be13eae6225409a117b215184f41b7f79e799f97cb3abb8f6dc404
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:
@@ -145,7 +145,7 @@ jobs:
     # Known vulnerabilities in the pinned/required Python packages (OSV / PyPI advisory data).
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
