@@ -686,3 +686,26 @@ def test_the_face_option_is_offered_remembered_and_locked_while_solving(qapp, se
         assert again.face_checkbox.isChecked()
     finally:
         again.close()
+
+
+def test_the_navigation_bar_stacks_when_the_preview_is_narrower_than_it(qapp, settings):
+    """On a 1024x768 screen the preview can be narrower than the bar's row of buttons, which then
+    ran off its left edge: the bar turns into a column in the corner instead."""
+    from PySide6.QtWidgets import QBoxLayout
+
+    window = MainWindow(settings=settings)
+    try:
+        window.show()
+        qapp.processEvents()
+        viewport, nav = window.viewport, window.viewport.navigation
+        viewport.resize(nav.row_width() - 40, 400)
+        qapp.processEvents()
+        assert nav._layout.direction() == QBoxLayout.TopToBottom
+        assert nav.geometry().left() >= 0 and nav.geometry().right() <= viewport.width()
+        assert nav.geometry().bottom() <= viewport.height()
+        viewport.resize(nav.row_width() + 200, 400)
+        qapp.processEvents()
+        assert nav._layout.direction() == QBoxLayout.LeftToRight
+        assert nav.geometry().right() <= viewport.width()
+    finally:
+        window.close()

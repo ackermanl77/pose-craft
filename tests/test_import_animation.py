@@ -72,6 +72,7 @@ def test_files_that_cant_be_imported_say_why(tmp_path):
 
 
 def test_the_window_imports_an_animation_and_exports_it_on_another_skeleton(tmp_path, monkeypatch):
+    pytest.importorskip("PySide6")  # the GUI half; CI's lightweight venv has no Qt
     from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
 

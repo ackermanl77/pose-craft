@@ -21,7 +21,7 @@ import pyqtgraph.opengl as gl
 from pyqtgraph import Transform3D, Vector
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QColor, QPainter, QPen, QVector4D
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QToolButton, QWidget
+from PySide6.QtWidgets import QBoxLayout, QHBoxLayout, QLabel, QToolButton, QWidget
 
 from pose_craft.export.blender_pose import low_confidence_threshold
 from pose_craft.retarget.skeleton import ALL_BONE_NAMES, BONES, bone_local_euler_deg, image_to_world_scale
@@ -204,6 +204,20 @@ class _NavigationBar(QWidget):
             button.clicked.connect(slot)
             layout.addWidget(button)
             self.buttons[key] = button
+        self._layout = layout
+
+    def row_width(self) -> int:
+        """The width the buttons need side by side."""
+        margins = self._layout.contentsMargins()
+        return sum(button.sizeHint().width() for button in self.buttons.values()) + margins.left() + margins.right()
+
+    def fit_to(self, available_width: int) -> None:
+        """One row when it fits the preview's width, else a column down the corner: on a small
+        screen (1024x768) the preview can be narrower than the row, which was then cut off."""
+        direction = QBoxLayout.LeftToRight if self.row_width() <= available_width else QBoxLayout.TopToBottom
+        if self._layout.direction() != direction:
+            self._layout.setDirection(direction)
+        self.adjustSize()
 
 
 def _engine_to_display(points: np.ndarray) -> np.ndarray:
@@ -539,7 +553,7 @@ class SkeletonViewport(gl.GLViewWidget):
 
     def resizeEvent(self, ev) -> None:
         super().resizeEvent(ev)
-        self.navigation.adjustSize()
+        self.navigation.fit_to(self.width() - 12)
         self.navigation.move(max(0, self.width() - self.navigation.width() - 6), 6)
         self.axis_gizmo.move(6, max(0, self.height() - self.axis_gizmo.height() - 6))
 
