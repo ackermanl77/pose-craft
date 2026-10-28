@@ -53,10 +53,11 @@ def _load_pure_functions(*names: str) -> dict:
     the module itself can't be imported without Blender."""
     import json
     import math
+    import re
     import time
 
     tree = ast.parse(ADDON_PATH.read_text(encoding="utf-8"))
-    namespace: dict = {"json": json, "math": math, "time": time}
+    namespace: dict = {"json": json, "math": math, "re": re, "time": time}
     for node in tree.body:
         if isinstance(node, ast.Assign) and all(isinstance(t, ast.Name) for t in node.targets):
             try:

@@ -40,6 +40,7 @@ class BatchSettings:
     max_people: int = 4
     group_photo: bool = False
     hands: bool = False
+    face: bool = False  # F12: expressions into each pose JSON
     detection_threshold: float = 0.5
     skeleton: str = "posecraft"  # B22: the Export group's skeleton, for BVH/GLB
 
@@ -70,6 +71,9 @@ class BatchWorker(QThread):
                 if settings.hands:
                     estimator.enable_hands(should_cancel=self._cancel.is_set)
                     estimator.hands = True
+                if settings.face:
+                    estimator.enable_face(should_cancel=self._cancel.is_set)
+                    estimator.face = True
                 result = solve_folder(
                     self._input_dir, self._output_dir, estimator, fmt=self._fmt, mirror=self._mirror,
                     on_progress=lambda number, total, photo: self.progress.emit(number, total, photo.name),

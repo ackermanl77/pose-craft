@@ -654,3 +654,24 @@ def test_the_3d_preview_has_navigation_and_an_axis_gizmo_that_matches_the_camera
         assert viewport.opts["distance"] == pytest.approx(before * viewport_3d.ZOOM_STEP)
     finally:
         window.close()
+
+
+def test_the_face_option_is_offered_remembered_and_locked_while_solving(qapp, settings):
+    """F12: "Face expressions" sits with the detection options, is saved with them, and is
+    disabled while a solve runs (the worker has already taken its value)."""
+    window = MainWindow(settings=settings)
+    try:
+        assert window.face_checkbox.accessibleName() == "Face expressions" and not window.face_checkbox.isChecked()
+        window.face_checkbox.setChecked(True)
+        window._save_settings()
+        window._set_busy(True, "Solving...")
+        assert not window.face_checkbox.isEnabled()
+        window._set_busy(False)
+        assert window.face_checkbox.isEnabled()
+    finally:
+        window.close()
+    again = MainWindow(settings=settings)
+    try:
+        assert again.face_checkbox.isChecked()
+    finally:
+        again.close()

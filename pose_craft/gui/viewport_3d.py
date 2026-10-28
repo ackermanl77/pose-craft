@@ -136,7 +136,7 @@ class _AxisGizmo(QWidget):
 
     SIZE = 64
 
-    def __init__(self, viewport: "SkeletonViewport"):
+    def __init__(self, viewport: SkeletonViewport):
         super().__init__(viewport)
         self._viewport = viewport
         self.setFixedSize(self.SIZE, self.SIZE)
@@ -173,7 +173,7 @@ class _AxisGizmo(QWidget):
 class _NavigationBar(QWidget):
     """View presets, fit and zoom over the preview's corner (UI3), like Blender's viewport buttons."""
 
-    def __init__(self, viewport: "SkeletonViewport"):
+    def __init__(self, viewport: SkeletonViewport):
         super().__init__(viewport)
         self.setObjectName("viewportNavigation")
         self.setAccessibleName("3D preview navigation")

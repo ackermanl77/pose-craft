@@ -158,3 +158,13 @@ class InputsMixin:
         path, _ = QFileDialog.getOpenFileName(self, "Load Video", self._last_dir(), _VIDEO_FILTER)
         if path:
             self.load_video(path)
+
+    def _on_record_webcam(self, sources=None) -> None:
+        """Records a clip from a webcam (F14) and tracks it like an opened video."""
+        from pose_craft.gui.webcam_dialog import WebcamDialog
+
+        if self._worker_running():
+            return
+        dialog = WebcamDialog(self, settings=self._settings, sources=sources)
+        if dialog.exec() == WebcamDialog.Accepted and dialog.clip is not None:
+            self.load_video(str(dialog.clip.path))

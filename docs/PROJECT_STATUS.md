@@ -192,6 +192,7 @@ a real Blender) -- see "Verification" below.
 | Pose estimation entry point, world-axis conversion, cached `PoseEstimator`, model download + ONNX conversion cache | `pose_craft/estimation/landmarker.py` |
 | BlazePose pipeline on ONNX Runtime (detector, group-photo tiles, ROI, landmarks, video tracking, GPU/CPU session setup) | `pose_craft/estimation/onnx_pose.py` |
 | Video: tracking people through a clip with stable IDs, per-person One Euro smoothing, foot locking | `pose_craft/estimation/video.py` |
+| Recording from a webcam into a clip (F14; retimed to the measured frame rate) and its dialog | `pose_craft/estimation/webcam.py`, `pose_craft/gui/webcam_dialog.py` |
 | TFLite -> ONNX converter for the pose (and hand) models | `pose_craft/estimation/tflite_to_onnx.py` |
 | Pre-convert the models for a release build | `scripts/convert_models.py` |
 | Release build (DirectML + CPU zips, add-on zip, SHA256SUMS) | `.github/workflows/release.yml` |
@@ -436,6 +437,34 @@ checked" above as weaker evidence than an automated test -- it was true at the
 time each check ran, not guaranteed to stay true as the code changes.
 
 ## Recently Fixed
+
+- **2026-10-28 -- webcam recording (F14).** File > Record from Webcam...: `estimation/webcam.py`
+  records from a camera index (DirectShow on Windows) or a file into an .mp4 under
+  `%LOCALAPPDATA%\PoseCraft\recordings`, and rewrites it at the measured frame rate when the camera
+  delivers more than 10% off what it reports; `gui/webcam_dialog.py` (camera, length, countdown,
+  live preview, Stop / Cancel, remembered in QSettings) hands the clip to `load_video()`, so it is
+  tracked like any video. `tests/test_webcam.py` drives it with a video file standing in for the
+  camera (no camera on the dev machine, so it hasn't been run against real hardware). Live
+  streaming to Blender while recording is not done.
+
+- **2026-10-27 -- face expressions (F12), the main toolbar (UI2), the 3D preview's navigation (UI3).**
+  - `estimation/onnx_pose.py` face section: MediaPipe's face landmark (478 points) and blendshape
+    models on a crop from the pose's head points (levelled on the eyes), refined from the face's own
+    landmarks as MediaPipe's tracking does; the 146-point subset and the 52 output names are taken
+    from MediaPipe's `face_blendshapes_graph.cc`. `landmarker.py`: the pinned `face_landmarker.task`
+    (SHA-256), its conversion, `DetectedPerson.face`, `PoseEstimator.face` / `enable_face()` /
+    `find_face()`; video runs it per frame and `_FaceSmoother` One-Euro filters the weights.
+  - `tflite_to_onnx.py`: SUB, MUL, DIV, SQUARED_DIFFERENCE, NEG, SQRT, RSQRT, SUM, TRANSPOSE (axes
+    remapped for NCHW) and STRIDED_SLICE for the blendshape model, and scalar tensor shapes. The pose
+    and hand models convert byte-identically (converter version unchanged). Checked against LiteRT on
+    the original models: blendshapes within 1e-6, landmarks within 3e-4 px.
+  - Against MediaPipe's own FaceLandmarker on three public-domain portraits: landmarks within about
+    1 px on average, blendshapes within 0.01-0.026 on average (the leading expressions agree).
+  - Documents carry `"face": {"blendshapes": ...}` (still version 2); Mirror swaps Left/Right. The
+    add-on (0.10.0) sets and keys the rig's ARKit-named shape keys (name matching ignores case,
+    `_`/`-` and exporter prefixes) and blends them when resampling an animation.
+  - Tests: `tests/test_face.py` (incl. the converter and a portrait vs MediaPipe when the model is
+    cached, `tests/data/face`), the real-Blender check sets and keys shape keys in Blender 5.2.
 
 - **2026-10-21 -- skeleton presets (B22), FBX through Blender (F11), library to Blender's Pose
   Library (F17), animation import (F18), real-Blender CI (T4).**

@@ -60,6 +60,13 @@ HAND_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarke
 HAND_MODEL_SHA256 = ("fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1",)
 HAND_MODEL_FILENAME = "hand_landmarker.task"
 
+# The face landmarker (F12, the "Face expressions" option), pinned and checked the same
+# way. Its 478-point landmark model and its blendshape model are used (see onnx_pose's
+# face section); the bundle's face detector is never converted.
+FACE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+FACE_MODEL_SHA256 = ("64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff",)
+FACE_MODEL_FILENAME = "face_landmarker.task"
+
 # A real .task model is several MB; anything smaller almost certainly means a
 # truncated download or an HTML error page saved under the expected filename.
 MIN_MODEL_BYTES = 1_000_000
@@ -108,6 +115,11 @@ def hand_model_cache_path() -> Path:
     return CACHE_DIR / HAND_MODEL_FILENAME
 
 
+def face_model_cache_path() -> Path:
+    """Where the face landmarker bundle lives (or would be downloaded to)."""
+    return CACHE_DIR / FACE_MODEL_FILENAME
+
+
 def _cached_file_ok(path: Path, accepted: tuple[str, ...]) -> bool:
     return path.exists() and path.stat().st_size >= MIN_MODEL_BYTES and (not accepted or file_sha256(path) in accepted)
 
@@ -142,6 +154,16 @@ def ensure_hand_model_downloaded(
     like the pose models (see ensure_model_downloaded)."""
     return _download_verified(
         HAND_MODEL_URL, hand_model_cache_path(), HAND_MODEL_SHA256, "hand", on_progress, should_cancel
+    )
+
+
+def ensure_face_model_downloaded(
+    on_progress: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> Path:
+    """The face landmarker bundle (F12), downloaded once and SHA-256-checked like the others."""
+    return _download_verified(
+        FACE_MODEL_URL, face_model_cache_path(), FACE_MODEL_SHA256, "face", on_progress, should_cancel
     )
 
 
@@ -211,6 +233,16 @@ class HandLandmarks:
 
 
 @dataclasses.dataclass
+class FaceLandmarks:
+    """One face (F12): its expression weights, named as ARKit's blendshapes -- the shape keys
+    many rigs carry (VRoid, Ready Player Me, Character Creator's ARKit set) -- and where it is."""
+
+    blendshapes: dict  # name -> 0..1
+    image_xy: np.ndarray  # (478, 2) normalized image x/y
+    presence: float  # the face model's presence score, 0..1
+
+
+@dataclasses.dataclass
 class DetectedPerson:
     landmarks: np.ndarray  # (33, 3) in the engine's Y-up, +Z-toward-camera frame
     image_landmarks_xy: np.ndarray  # (33, 2) normalized [0, 1] image-space x/y, for click-to-select
@@ -219,6 +251,8 @@ class DetectedPerson:
     hands: dict = dataclasses.field(default_factory=dict)
     # (33,) per-landmark presence, 0..1: inside the frame (B10). None when unknown.
     landmark_presence: np.ndarray | None = None
+    # The face's expression, only with the "Face expressions" option (F12).
+    face: FaceLandmarks | None = None
 
     def hand_world(self) -> dict[str, np.ndarray]:
         return {side: hand.world for side, hand in self.hands.items()}
@@ -279,6 +313,37 @@ def ensure_hand_onnx_model(task_path: Path) -> Path:
     if not path.exists():
         convert_task_bundle(task_path, {"landmarks": path}, HAND_TASK_BUNDLE_MEMBERS)
     return path
+
+
+def face_onnx_model_paths(task_path: Path) -> dict[str, Path]:
+    """Where the face bundle's landmark and blendshape models are cached as ONNX (next to it)."""
+    from pose_craft.estimation.tflite_to_onnx import CONVERTER_VERSION, FACE_TASK_BUNDLE_MEMBERS
+
+    stem = f"{task_path.stem}.v{CONVERTER_VERSION}"
+    return {key: task_path.with_name(f"{stem}.{key}.onnx") for key in FACE_TASK_BUNDLE_MEMBERS}
+
+
+def ensure_face_onnx_models(task_path: Path) -> dict[str, Path]:
+    """Converts the face bundle's two models to ONNX once, reusing the conversion afterwards."""
+    from pose_craft.estimation.tflite_to_onnx import FACE_TASK_BUNDLE_MEMBERS, convert_task_bundle
+
+    paths = face_onnx_model_paths(task_path)
+    if not all(path.exists() for path in paths.values()):
+        convert_task_bundle(task_path, paths, FACE_TASK_BUNDLE_MEMBERS)
+    return paths
+
+
+def is_face_model_available() -> bool:
+    """Whether the face models can be loaded without any network access."""
+    return _cached_file_ok(face_model_cache_path(), FACE_MODEL_SHA256)
+
+
+def resolve_face_onnx_models(
+    on_progress: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> dict[str, Path]:
+    """The face landmark and blendshape models, downloaded and converted once."""
+    return ensure_face_onnx_models(ensure_face_model_downloaded(on_progress=on_progress, should_cancel=should_cancel))
 
 
 def shared_detector_path(directory: Path, detector_sha256: str) -> Path:
@@ -439,6 +504,12 @@ _HAND_POSE_LANDMARKS = {"L": (15, 19, 17), "R": (16, 20, 18)}
 HAND_MIN_POSE_VISIBILITY = 0.5
 
 
+# F12: the pose's eyes and nose must be visible for a face pass (a head seen from behind
+# has none to read).
+FACE_POSE_LANDMARKS = (0, 2, 5)
+FACE_MIN_POSE_VISIBILITY = 0.5
+
+
 class PoseEstimator:
     """Owns one BlazePose model pair on ONNX Runtime -- on the GPU (DirectML or
     CUDA, whichever the installed onnxruntime build offers) when `use_gpu` is set
@@ -457,6 +528,9 @@ class PoseEstimator:
     # B11, per call like group_photo: also run the hand landmark model on each
     # person's hands (needs enable_hands() first, which loads the model).
     hands: bool = False
+    # F12, per call too: also run the face models on each person's head (needs
+    # enable_face() first).
+    face: bool = False
     # B10, per call too: a person is reported when the detector scores them at
     # least min_detection_confidence and the landmark model's presence clears
     # min_presence_confidence. Lower them for hard photos (small, dark, unusual
@@ -488,6 +562,7 @@ class PoseEstimator:
         self.max_people = max_people
         self.use_gpu = use_gpu
         self._hand_model = None
+        self._face_model = None
 
     @classmethod
     def for_variant(
@@ -527,6 +602,36 @@ class PoseEstimator:
     def hands_ready(self) -> bool:
         """True once enable_hands() has loaded the hand model."""
         return self._hand_model is not None
+
+    def enable_face(
+        self,
+        on_progress: Callable[[int, int], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> None:
+        """Loads the face landmark and blendshape models (F12) on this estimator's device,
+        once -- downloading and converting them first if needed."""
+        if self._face_model is None:
+            from pose_craft.estimation.onnx_pose import FaceLandmarker
+
+            paths = resolve_face_onnx_models(on_progress=on_progress, should_cancel=should_cancel)
+            self._face_model = FaceLandmarker(paths["landmarks"], paths["blendshapes"], use_gpu=self.use_gpu)
+
+    @property
+    def face_ready(self) -> bool:
+        """True once enable_face() has loaded the face models."""
+        return self._face_model is not None
+
+    def find_face(self, image_rgb: np.ndarray, person: DetectedPerson, result) -> None:
+        """The face of one solved person (a photo's or a video frame's): the face models on a
+        crop around the pose's head points, stored in person.face (left None when the head is
+        barely visible or the model sees no face there)."""
+        if self._face_model is None:
+            return
+        if min(result.visibility[i] for i in FACE_POSE_LANDMARKS) < FACE_MIN_POSE_VISIBILITY:
+            return
+        found = self._face_model.detect(image_rgb, result.image_xy)
+        if found is not None:
+            person.face = FaceLandmarks(blendshapes=found.blendshapes, image_xy=found.image_xy, presence=found.presence)
 
     def find_hands(self, image_rgb: np.ndarray, person: DetectedPerson, result) -> None:
         """The hands of one already-solved person (a video frame's, B21); see _find_hands."""
@@ -607,6 +712,7 @@ class PoseEstimator:
             tiled=True if self.group_photo else None,
         )
         find_hands = self.hands and self._hand_model is not None
+        find_face = self.face and self._face_model is not None
         people = []
         for result in results:
             person = DetectedPerson(
@@ -617,6 +723,8 @@ class PoseEstimator:
             )
             if find_hands:
                 self._find_hands(image_rgb, person, result)
+            if find_face:
+                self.find_face(image_rgb, person, result)
             people.append(person)
         people.sort(key=lambda p: p.centroid_xy()[0])
         return people

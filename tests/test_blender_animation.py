@@ -28,7 +28,7 @@ from test_blender_addon_source import _extract_top_level_constant, _load_pure_fu
 _PARSE = (
     "validate_pose_document", "_validate_quaternion", "_validate_vector", "is_animation_document", "_plain_int",
     "parse_animation_document", "animation_frame_numbers", "resample_animation", "interpolate_pose_documents",
-    "slerp_wxyz", "keep_quaternion_hemisphere",
+    "slerp_wxyz", "keep_quaternion_hemisphere", "face_blendshapes",
 )
 
 
@@ -127,7 +127,7 @@ def _addon(scene, armature=None):
     apply_pose_document records the frame each pose was applied at."""
     loaded = _load_pure_functions(
         *_PARSE, "_scene_fps", "_apply_animation_document", "_apply_live_link_document",
-        "live_link_request_error", "pick_live_link_target", "build_live_link_reply", "_summarize",
+        "live_link_request_error", "pick_live_link_target", "build_live_link_reply", "_summarize", "_face_summary",
     )
     log = {"applied_at": [], "keyed": [], "undo": []}
 
@@ -136,13 +136,20 @@ def _addon(scene, armature=None):
         names = [n for n in document["bones"] if n != "foot.R"]
         return names, ["foot.R"] if "foot.R" in document["bones"] else [], []
 
-    def keyframe_applied(obj, names, sc, frame=None, advance=True, root_location=False):
+    def keyframe_applied(obj, names, sc, frame=None, advance=True, root_location=False, shape_keys=()):
         log["keyed"].append((frame, advance, len(names)))
+        if shape_keys:
+            log.setdefault("face_keyed", []).append((frame, len(shape_keys)))
+
+    def apply_face_document(obj, document):
+        # Stands in for the rig's shape keys: one per face weight the pose carries.
+        return [f"key:{name}" for name in (document.get("face") or {}).get("blendshapes", {})]
 
     armature = armature or types.SimpleNamespace(type="ARMATURE", name="Rig")
     scene.posecraft_target = armature
     loaded.update(
         apply_pose_document=apply_pose_document,
+        apply_face_document=apply_face_document,
         _keyframe_applied=keyframe_applied,
         _should_keyframe=lambda sc: False,
         _live_link_status="",

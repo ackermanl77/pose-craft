@@ -123,6 +123,7 @@ class SolveWorker(QThread):
         hands: bool = False,
         min_detection_confidence: float = 0.5,
         parent=None,
+        face: bool = False,
     ):
         super().__init__(parent)
         self._min_detection_confidence = min_detection_confidence
@@ -133,6 +134,7 @@ class SolveWorker(QThread):
         self._use_gpu = use_gpu
         self._group_photo = group_photo
         self._hands = hands
+        self._face = face
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -159,10 +161,19 @@ class SolveWorker(QThread):
             estimator.max_people = self._max_people
             estimator.group_photo = self._group_photo
             estimator.hands = self._hands
+            estimator.face = self._face
             estimator.min_detection_confidence = self._min_detection_confidence
             if self._hands:
                 # B11: loads (on first use, downloads) the hand landmark model.
                 estimator.enable_hands(
+                    on_progress=lambda downloaded, total: self.progress.emit(downloaded, total),
+                    should_cancel=self._cancel.is_set,
+                )
+                if self._cancel.is_set():
+                    raise DownloadCancelled("solve cancelled")
+            if self._face:
+                # F12: loads (on first use, downloads) the face landmark and blendshape models.
+                estimator.enable_face(
                     on_progress=lambda downloaded, total: self.progress.emit(downloaded, total),
                     should_cancel=self._cancel.is_set,
                 )
@@ -219,7 +230,7 @@ class VideoSolveWorker(QThread):
 
     def __init__(
         self, path: str, estimator: PoseEstimator | None, model_variant: str, use_gpu: bool, max_people: int = 1, hands: bool = False,
-        parent=None, min_detection_confidence: float = 0.5,
+        parent=None, min_detection_confidence: float = 0.5, face: bool = False,
     ):
         super().__init__(parent)
         self._min_detection_confidence = min_detection_confidence
@@ -229,6 +240,7 @@ class VideoSolveWorker(QThread):
         self._model_variant = model_variant
         self._use_gpu = use_gpu
         self._hands = hands
+        self._face = face
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -247,6 +259,8 @@ class VideoSolveWorker(QThread):
             estimator.min_detection_confidence = self._min_detection_confidence
             if self._hands:  # fingers in video (B21): the hand model, downloaded once if needed
                 estimator.enable_hands(should_cancel=self._cancel.is_set)
+            if self._face:  # expressions in video (F12)
+                estimator.enable_face(should_cancel=self._cancel.is_set)
             result = solve_video(
                 self._path,
                 estimator,
@@ -254,6 +268,7 @@ class VideoSolveWorker(QThread):
                 on_progress=lambda done, total: self.progress.emit(done, total),
                 should_cancel=self._cancel.is_set,
                 hands=self._hands,
+                face=self._face,
             )
             self.finished_ok.emit(result, estimator)
         except (DownloadCancelled, InterruptedError):
@@ -518,6 +533,7 @@ class MainWindow(LayoutMixin, InputsMixin, ExportMixin, QMainWindow):
             max_people=self.max_people_spin.value(),
             group_photo=self.group_photo_checkbox.isChecked(),
             hands=self.hands_checkbox.isChecked(),
+            face=self.face_checkbox.isChecked(),
             detection_threshold=self.detection_threshold_spin.value(),
             skeleton=self.skeleton_combo.currentData() or "posecraft",
         )
@@ -569,6 +585,7 @@ class MainWindow(LayoutMixin, InputsMixin, ExportMixin, QMainWindow):
         self.max_people_spin.setValue(int(s.value("detect/max_people", 4)))
         self.group_photo_checkbox.setChecked(str(s.value("detect/group_photo", "false")).lower() == "true")
         self.hands_checkbox.setChecked(str(s.value("detect/hands", "false")).lower() == "true")
+        self.face_checkbox.setChecked(str(s.value("detect/face", "false")).lower() == "true")
         self.detection_threshold_spin.setValue(float(s.value("detect/detection_threshold", 0.5)))
         self.low_confidence_spin.setValue(float(s.value("detect/low_confidence_threshold", LOW_CONFIDENCE_THRESHOLD)))
         self.video_rotation_smoothing_spin.setValue(int(s.value("video/rotation_smoothing", DEFAULT_VIDEO_ROTATION_SMOOTHING)))
@@ -595,6 +612,7 @@ class MainWindow(LayoutMixin, InputsMixin, ExportMixin, QMainWindow):
         s.setValue("detect/max_people", self.max_people_spin.value())
         s.setValue("detect/group_photo", "true" if self.group_photo_checkbox.isChecked() else "false")
         s.setValue("detect/hands", "true" if self.hands_checkbox.isChecked() else "false")
+        s.setValue("detect/face", "true" if self.face_checkbox.isChecked() else "false")
         s.setValue("detect/detection_threshold", self.detection_threshold_spin.value())
         s.setValue("detect/low_confidence_threshold", self.low_confidence_spin.value())
         s.setValue("video/rotation_smoothing", self.video_rotation_smoothing_spin.value())
@@ -619,9 +637,11 @@ class MainWindow(LayoutMixin, InputsMixin, ExportMixin, QMainWindow):
         for widget in (
             self.load_btn, self.load_video_btn, self.solve_btn, self.max_people_spin,
             self.model_variant_combo, self.use_gpu_checkbox, self.group_photo_checkbox, self.hands_checkbox,
+            self.face_checkbox,
         ):
             widget.setEnabled(not busy)
-        for action in (self.open_action, self.open_video_action, self.solve_action, self.recent_menu.menuAction()):
+        for action in (self.open_action, self.open_video_action, self.record_webcam_action, self.solve_action,
+                       self.recent_menu.menuAction()):
             action.setEnabled(not busy)
         if not busy:
             self.solve_btn.setEnabled(self._image_bgr is not None)
@@ -782,6 +802,7 @@ class MainWindow(LayoutMixin, InputsMixin, ExportMixin, QMainWindow):
             self.group_photo_checkbox.isChecked(),
             self.hands_checkbox.isChecked(),
             self.detection_threshold_spin.value(),
+            face=self.face_checkbox.isChecked(),
         )
         self._worker.finished_ok.connect(self._on_solve_finished)
         self._worker.failed.connect(self._on_solve_failed)
@@ -839,6 +860,9 @@ class MainWindow(LayoutMixin, InputsMixin, ExportMixin, QMainWindow):
         if self.hands_checkbox.isChecked():
             hands = sum(len(getattr(person, "hands", {}) or {}) for person in people)
             status += f" -- {hands} hand(s) found"
+        if self.face_checkbox.isChecked():
+            faces = sum(getattr(person, "face", None) is not None for person in people)
+            status += f" -- {faces} face(s) read"
         self.statusBar().showMessage(status)
         self._update_preview_for_selected_person()
 
@@ -916,7 +940,7 @@ class MainWindow(LayoutMixin, InputsMixin, ExportMixin, QMainWindow):
         self._video_worker = VideoSolveWorker(
             path, estimator, self.model_variant_combo.currentText(), self.use_gpu_checkbox.isChecked(),
             self.max_people_spin.value(), min_detection_confidence=self.detection_threshold_spin.value(),
-            hands=self.hands_checkbox.isChecked(),
+            hands=self.hands_checkbox.isChecked(), face=self.face_checkbox.isChecked(),
         )
         self._video_worker.finished_ok.connect(self._on_video_finished)
         self._video_worker.failed.connect(self._on_video_failed)
@@ -1315,6 +1339,7 @@ class MainWindow(LayoutMixin, InputsMixin, ExportMixin, QMainWindow):
             rotations, source_note="Sent live from PoseCraft", bone_confidence=confidence,
             hip_height=hip_height, leg_length=leg_length,
             out_of_frame=self._out_of_frame_for(self.person_combo.currentIndex()),
+            face_blendshapes=self._face_for(self.person_combo.currentIndex()),
         )
 
     def _current_animation_live_link_document(self, track: int) -> dict | None:
@@ -1323,10 +1348,12 @@ class MainWindow(LayoutMixin, InputsMixin, ExportMixin, QMainWindow):
         frame_indices, rotations_by_frame, roots = self._video_track_frames(track)
         if not rotations_by_frame:
             return None
+        faces = [self._mirrored_face(getattr(person, "face", None)) for person in self._video.people_of(track)]
         return build_animation_document(
             list(zip(frame_indices, rotations_by_frame)), self._video.fps,
             source=f"{Path(self._video.path).name}, Person {track + 1}",
             root_positions_cm=roots if len(roots) == len(rotations_by_frame) else None,
+            faces=faces if any(faces) and len(faces) == len(rotations_by_frame) else None,
         )
 
     def _start_live_link_send(self, document: dict, automatic: bool = False) -> None:

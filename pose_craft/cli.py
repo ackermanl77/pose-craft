@@ -35,6 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-people", type=int, default=4, help="people to detect per photo (default: 4)")
     parser.add_argument("--group-photo", action="store_true", help="also search tiles for small faces (slower)")
     parser.add_argument("--hands", action="store_true", help="also solve hands and fingers")
+    parser.add_argument("--face", action="store_true",
+                        help="also read facial expressions (ARKit blendshapes, in the pose JSON)")
     parser.add_argument("--detection-threshold", type=float, default=0.5, help="person detector threshold, 0.1-0.9 (default: 0.5)")
     parser.add_argument("--no-overwrite", action="store_true", help="keep pose files that already exist")
     parser.add_argument(
@@ -59,6 +61,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.hands:
             estimator.enable_hands()
             estimator.hands = True
+        if getattr(args, "face", False):
+            estimator.enable_face()
+            estimator.face = True
         print(f"pose model: {args.model} on {estimator.device}")
         result = solve_folder(
             args.input, args.output, estimator, fmt=args.format, mirror=args.mirror, overwrite=not args.no_overwrite,

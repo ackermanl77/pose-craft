@@ -489,6 +489,39 @@ class _HandSmoother:
         return hands
 
 
+class _FaceSmoother:
+    """One person's face through a video (F12): the expression weights One-Euro smoothed
+    together (they jitter frame to frame like landmarks do); a face missing for up to
+    HAND_HOLD_SECONDS keeps its last expression."""
+
+    def __init__(self, min_cutoff: float, beta: float, fps: float):
+        self._filter = OneEuroFilter(min_cutoff, beta)
+        self._last = None
+        self._missing = 0
+        self._hold_frames = max(1, int(round(HAND_HOLD_SECONDS * fps)))
+
+    def reset(self) -> None:
+        self._filter.reset()
+        self._last = None
+
+    def __call__(self, person: DetectedPerson, t: float):
+        from pose_craft.estimation.landmarker import FaceLandmarks
+
+        face = person.face
+        if face is None:
+            self._missing += 1
+            if self._last is not None and self._missing <= self._hold_frames:
+                return self._last
+            self.reset()
+            return None
+        self._missing = 0
+        names = sorted(face.blendshapes)
+        values = np.clip(self._filter(np.array([face.blendshapes[n] for n in names], dtype=float), t), 0.0, 1.0)
+        self._last = FaceLandmarks(blendshapes=dict(zip(names, (float(v) for v in values))),
+                                   image_xy=face.image_xy, presence=face.presence)
+        return self._last
+
+
 def smooth_people(
     people: list[DetectedPerson | None], fps: float, min_cutoff: float = DEFAULT_MIN_CUTOFF, beta: float = DEFAULT_BETA
 ) -> list[DetectedPerson | None]:
@@ -498,12 +531,14 @@ def smooth_people(
     world_filter = OneEuroFilter(min_cutoff, beta)
     image_filter = OneEuroFilter(min_cutoff, beta)
     hand_smoother = _HandSmoother(min_cutoff, beta, fps)
+    face_smoother = _FaceSmoother(min_cutoff, beta, fps)
     smoothed: list[DetectedPerson | None] = []
     for index, person in enumerate(people):
         if person is None:
             world_filter.reset()
             image_filter.reset()
             hand_smoother.reset()
+            face_smoother.reset()
             smoothed.append(None)
             continue
         t = index / fps
@@ -515,6 +550,7 @@ def smooth_people(
                 visibility=person.visibility,
                 landmark_presence=person.landmark_presence,
                 hands=hand_smoother(person, landmarks, t),
+                face=face_smoother(person, t),
             )
         )
     return smoothed
@@ -625,13 +661,15 @@ def solve_video(
     on_progress: Callable[[int, int], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
     hands: bool = False,
+    face: bool = False,
 ) -> VideoSolve:
     """Decodes `path` with OpenCV and tracks up to `max_people` people through
     it -- one (the best detection) with the estimator's own track(), several
     with a MultiPersonTracker (estimator.new_tracker), each with a stable ID
     -- smoothing each person's landmarks. `hands` (B21): also each tracked
     person's fingers, frame by frame (the estimator's hand model must be
-    loaded: PoseEstimator.enable_hands). Raises OSError if the file can't be
+    loaded: PoseEstimator.enable_hands). `face` (F12): each tracked person's face too
+    (PoseEstimator.enable_face first). Raises OSError if the file can't be
     opened, InterruptedError when should_cancel() turns true."""
     import cv2
 
@@ -674,6 +712,9 @@ def solve_video(
             if hands:
                 for track_id, result in results.items():
                     estimator.find_hands(image_rgb, frame_people[track_id], result)
+            if face:
+                for track_id, result in results.items():
+                    estimator.find_face(image_rgb, frame_people[track_id], result)
             raw.append(frame_people)
             if on_progress is not None:
                 on_progress(len(raw), total)

@@ -22,6 +22,11 @@ reader scales by its own leg length to place the hips (a crouch is well under
 1). The add-on's "Keep feet on the floor" option instead measures the floor
 on the rig itself.
 
+Face (F12, only when the app's "Face expressions" option found one): a top-level
+"face": {"blendshapes": {name: 0..1}} with ARKit's blendshape names (jawOpen,
+mouthSmileLeft, eyeBlinkRight ...), which the add-on sets on the rig's matching
+shape keys. Still version 2: an older add-on ignores it.
+
 Finger bones (B11, only when the app's "Hands and fingers" option solved
 them): the same three keys per bone, named as in Rigify (f_index.01.L ...
 thumb.03.R, see skeleton.FINGER_BONE_NAMES). Still version 2: a body-only
@@ -102,8 +107,11 @@ def build_pose_document(
     hip_height: float | None = None,
     leg_length: float | None = None,
     out_of_frame: set[str] | None = None,
+    face_blendshapes: dict[str, float] | None = None,
 ) -> dict:
     """bone_rotations: bone name -> local (parent-relative) Rotation, engine frame.
+
+    face_blendshapes: optional ARKit-named expression weights (F12), written as "face".
 
     out_of_frame: bones depending on a landmark outside the photo (see
     retarget.skeleton.bones_out_of_frame), written as "out_of_frame": true (B10)
@@ -143,7 +151,24 @@ def build_pose_document(
         document["root"] = {"hip_height": float(hip_height)}
         if leg_length is not None:
             document["root"]["leg_length"] = float(leg_length)
+    if face_blendshapes:
+        document["face"] = {"blendshapes": {name: round(float(value), 4) for name, value in face_blendshapes.items()}}
     return document
+
+
+def mirror_blendshapes(blendshapes: dict[str, float] | None) -> dict[str, float] | None:
+    """The expression of the mirrored pose (F12): ...Left and ...Right weights swap."""
+    if not blendshapes:
+        return blendshapes
+
+    def mirrored(name: str) -> str:
+        if name.endswith("Left"):
+            return name[:-4] + "Right"
+        if name.endswith("Right"):
+            return name[:-5] + "Left"
+        return name
+
+    return {mirrored(name): value for name, value in blendshapes.items()}
 
 
 def build_animation_document(
@@ -152,6 +177,7 @@ def build_animation_document(
     *,
     source: str = "",
     root_positions_cm: list | None = None,
+    faces: list | None = None,
 ) -> dict:
     """A tracked person's solved video frames for Live Link's "Send Animation
     to Blender" (add-on 0.7.0+): {"format": ANIMATION_FORMAT_NAME, "version":
@@ -167,7 +193,10 @@ def build_animation_document(
     each frame then carries "root_offset", its horizontal travel from the
     first frame in Blender axes, and the document "root_leg_length", that
     skeleton's leg length in the same units -- the add-on scales the travel by
-    its rig's own leg length (add-on 0.8.0+; an older add-on ignores both)."""
+    its rig's own leg length (add-on 0.8.0+; an older add-on ignores both).
+
+    faces: optional expression weights per frame (F12; None where no face was found), carried
+    in each frame's pose as "face" (add-on 0.10.0+ keys the rig's shape keys from it)."""
     indices = [int(index) for index, _rotations in frames]
     if any(b <= a for a, b in zip(indices, indices[1:])):
         raise ValueError("animation frame indices must increase")
@@ -177,10 +206,12 @@ def build_animation_document(
         "fps": float(fps),
         "source": source,
         "frames": [
-            {"frame_index": index, "pose": build_pose_document(rotations)}
-            for index, (_frame, rotations) in zip(indices, frames)
+            {"frame_index": index, "pose": build_pose_document(rotations, face_blendshapes=face)}
+            for index, (_frame, rotations), face in zip(indices, frames, faces or [None] * len(frames))
         ],
     }
+    if faces is not None and len(faces) != len(frames):
+        raise ValueError("faces needs one entry per frame")
     if root_positions_cm is not None:
         if len(root_positions_cm) != len(frames):
             raise ValueError("root_positions_cm needs one position per frame")
@@ -216,6 +247,7 @@ def save_pose_file(
     hip_height: float | None = None,
     leg_length: float | None = None,
     out_of_frame: set[str] | None = None,
+    face_blendshapes: dict[str, float] | None = None,
 ) -> None:
     document = build_pose_document(
         bone_rotations,
@@ -224,6 +256,7 @@ def save_pose_file(
         hip_height=hip_height,
         leg_length=leg_length,
         out_of_frame=out_of_frame,
+        face_blendshapes=face_blendshapes,
     )
     Path(path).write_text(json.dumps(document, indent=2), encoding="utf-8")
 

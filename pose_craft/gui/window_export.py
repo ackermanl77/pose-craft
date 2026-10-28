@@ -189,6 +189,20 @@ class ExportMixin:
             return None
         return self._person_document_inputs(index)
 
+    def _mirrored_face(self, face) -> dict | None:
+        """A FaceLandmarks' expression weights as exported (F12): Left/Right swapped with the mirror."""
+        if face is None:
+            return None
+        from pose_craft.export.blender_pose import mirror_blendshapes
+
+        return mirror_blendshapes(face.blendshapes) if self.mirror_checkbox.isChecked() else dict(face.blendshapes)
+
+    def _face_for(self, index: int) -> dict | None:
+        """Person `index`'s expression weights (F12), or None when no face was read."""
+        if not 0 <= index < len(self._people):
+            return None
+        return self._mirrored_face(getattr(self._people[index], "face", None))
+
     def _person_document_inputs(self, index: int):
         return self._document_inputs_for(
             self._people[index],
@@ -229,7 +243,7 @@ class ExportMixin:
         try:
             save_pose_file(
                 rotations, path, source_note="Exported from PoseCraft", bone_confidence=confidence,
-                hip_height=hip_height, leg_length=leg_length, out_of_frame=self._out_of_frame_for(index),
+                hip_height=hip_height, leg_length=leg_length, out_of_frame=self._out_of_frame_for(index), face_blendshapes=self._face_for(index),
             )
         except OSError as exc:
             self._report_export_error("Export Pose JSON", path, exc)
@@ -265,7 +279,7 @@ class ExportMixin:
             try:
                 save_pose_file(
                     rotations, path, source_note="Exported from PoseCraft (batch)", bone_confidence=confidence,
-                    hip_height=hip_height, leg_length=leg_length, out_of_frame=self._out_of_frame_for(index),
+                    hip_height=hip_height, leg_length=leg_length, out_of_frame=self._out_of_frame_for(index), face_blendshapes=self._face_for(index),
                 )
             except OSError as exc:
                 self._report_export_error("Export All People", str(path), exc)

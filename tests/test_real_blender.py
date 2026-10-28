@@ -44,6 +44,8 @@ def _write_inputs(work: Path) -> dict:
     confidence = {name: 0.9 for name in body}
     confidence["shin.R"] = 0.2
     (work / "pose_body.json").write_text(json.dumps(blender_pose.build_pose_document(body, bone_confidence=confidence)))
+    face = {"jawOpen": 0.7, "mouthSmileLeft": 0.4, "eyeBlinkRight": 1.0, "cheekPuff": 0.2}
+    (work / "pose_face.json").write_text(json.dumps(blender_pose.build_pose_document(body, face_blendshapes=face)))
 
     hands = {}
     for side in sk.HAND_SIDES:
@@ -116,6 +118,14 @@ def test_the_addon_in_a_real_blender(tmp_path):
     assert euler["keys"] == 2 * 15 * 3 and euler["key_frames"] == [1.0, 6.0] and euler["frame_after"] == 11
     assert euler["max_err"] < TOLERANCE_DEG
     assert results["floor"]["posed_min"] == pytest.approx(results["floor"]["rest_min"], abs=1e-4)
+
+    # F12: the face sets (and keys) the shape keys named like ARKit's blendshapes, on a mesh parented
+    # to the rig and on one bound by an Armature modifier; others are left alone.
+    face = results["face"]
+    assert face["operator"] == ["FINISHED"]
+    assert face["parented"] == {"jawOpen": 0.7, "blendShape1.mouthSmileLeft": 0.4, "eye_blink_right": 1.0, "browInnerUp": 0.25}
+    assert face["modifier"] == {"CheekPuff": 0.2}
+    assert face["keyed"] == {"parented": 3, "modifier": 1}
 
     mixamo = results["mixamo"]
     assert mixamo["applied"] == 47 and mixamo["unmatched"] == []  # 3 spine bones for one

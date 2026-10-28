@@ -128,6 +128,7 @@ import dataclasses
 import json
 import math
 import os
+import re
 import socket
 import time
 
@@ -137,7 +138,7 @@ from mathutils import Quaternion, Vector
 bl_info = {
     "name": "PoseCraft Pose Importer",
     "author": "PoseCraft",
-    "version": (0, 9, 0),
+    "version": (0, 10, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > PoseCraft",
     "description": "Applies a PoseCraft .json pose export (file or Live Link) to an armature's pose bones",
@@ -1025,6 +1026,34 @@ def slerp_wxyz(a, b, t: float) -> list:
     return [v / norm for v in q]
 
 
+def face_blendshapes(document) -> dict:
+    """A pose document's face expression weights (F12) as {name: 0..1} -- {} when it has
+    none; malformed entries are dropped. Pure (no bpy)."""
+    face = document.get("face") if isinstance(document, dict) else None
+    shapes = face.get("blendshapes") if isinstance(face, dict) else None
+    if not isinstance(shapes, dict):
+        return {}
+    weights = {}
+    for name, value in shapes.items():
+        if isinstance(name, str) and isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            weights[name] = min(1.0, max(0.0, float(value)))
+    return weights
+
+
+def shape_key_match_name(name: str) -> str:
+    """A shape key or blendshape name reduced for matching: the part after an exporter's
+    "blendShape1." or "mesh:" prefix, lower case, without "_", "-" or spaces -- so "jawOpen",
+    "JawOpen", "jaw_open" and "blendShape1.jawOpen" all match ARKit's "jawOpen". Pure."""
+    tail = re.split(r"[.:|]", name)[-1]
+    return re.sub(r"[^a-z0-9]", "", tail.lower())
+
+
+def match_shape_keys(key_names, blendshapes: dict) -> dict:
+    """{shape key name: weight} for the keys named like one of `blendshapes`. Pure."""
+    by_name = {shape_key_match_name(name): value for name, value in blendshapes.items()}
+    return {key: by_name[shape_key_match_name(key)] for key in key_names if shape_key_match_name(key) in by_name}
+
+
 def interpolate_pose_documents(a: dict, b: dict, t: float) -> dict:
     """The pose a fraction t of the way from pose document a to b: each bone's
     local and world rotation slerped, "low_confidence" kept if either has it.
@@ -1048,7 +1077,15 @@ def interpolate_pose_documents(a: dict, b: dict, t: float) -> dict:
         if bone_a.get("low_confidence") or bone_b.get("low_confidence"):
             merged["low_confidence"] = True
         bones[name] = merged
-    return dict(nearer, bones=bones)
+    result = dict(nearer, bones=bones)
+    face_a, face_b = face_blendshapes(a), face_blendshapes(b)
+    if face_a and face_b:  # F12: expressions blend linearly
+        result["face"] = {"blendshapes": {
+            name: face_a[name] + t * (face_b[name] - face_a[name]) if name in face_a and name in face_b
+            else (face_a if t < 0.5 else face_b).get(name, 0.0)
+            for name in set(face_a) | set(face_b)
+        }}
+    return result
 
 
 def resample_animation(samples, first_frame_index: int, start_frame: int, clip_fps: float, scene_fps: float,
@@ -1211,9 +1248,37 @@ def apply_pose_document(
     return applied, unmatched, low_confidence
 
 
+def _face_meshes(armature_obj: bpy.types.Object) -> list:
+    """The meshes the armature deforms (an Armature modifier) or carries (parented), with shape keys."""
+    meshes = []
+    for obj in bpy.data.objects:
+        if obj.type != "MESH" or obj.data.shape_keys is None:
+            continue
+        if obj.parent is armature_obj or any(m.type == "ARMATURE" and m.object is armature_obj for m in obj.modifiers):
+            meshes.append(obj)
+    return meshes
+
+
+def apply_face_document(armature_obj: bpy.types.Object, document) -> list:
+    """F12: sets the shape keys of the armature's meshes named like the document's face
+    blendshapes (ARKit names: jawOpen, mouthSmileLeft ...); returns the key blocks set."""
+    weights = face_blendshapes(document)
+    if not weights:
+        return []
+    applied = []
+    for mesh in _face_meshes(armature_obj):
+        keys = mesh.data.shape_keys
+        names = [block.name for block in keys.key_blocks if block != keys.reference_key]
+        for name, value in match_shape_keys(names, weights).items():
+            block = keys.key_blocks[name]
+            block.value = value
+            applied.append(block)
+    return applied
+
+
 def _keyframe_applied(
     armature_obj: bpy.types.Object, bone_names: list[str], scene, frame=None, advance: bool = True,
-    root_location: bool = False,
+    root_location: bool = False, shape_keys=(),
 ) -> None:
     """B18: keys each applied bone's rotation (and the root's location, which
     floor contact may have moved) at the current frame (or `frame`), then
@@ -1229,8 +1294,19 @@ def _keyframe_applied(
         parents = {bone.name: (bone.parent.name if bone.parent else None) for bone in armature_obj.data.bones}
         root = top_ancestor(bone_names[0], parents)
         pose_bones[root].keyframe_insert("location", frame=frame, group=root)
+    for block in shape_keys:  # F12: the face's shape keys, keyed with the bones
+        block.keyframe_insert("value", frame=frame)
     if advance and scene.posecraft_frame_step:
         scene.frame_set(frame + scene.posecraft_frame_step)
+
+
+def _face_summary(document, face_keys) -> str:
+    """The status's face part (F12): how many shape keys were set, or that the rig has none to set."""
+    if not face_blendshapes(document):
+        return ""
+    if not face_keys:
+        return "; face: no shape keys named like ARKit's blendshapes on this rig's meshes"
+    return f"; face: {len(face_keys)} shape key(s) set"
 
 
 def _should_keyframe(scene) -> bool:
@@ -1280,11 +1356,12 @@ class POSECRAFT_OT_load_pose(bpy.types.Operator):
         except ValueError as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+        face_keys = apply_face_document(armature_obj, document)
         if _should_keyframe(context.scene):
-            _keyframe_applied(armature_obj, applied, context.scene)
+            _keyframe_applied(armature_obj, applied, context.scene, shape_keys=face_keys)
 
         message, level = _summarize(applied, unmatched, low_confidence)
-        self.report({level}, message)
+        self.report({level}, message + _face_summary(document, face_keys))
         return {"FINISHED"}
 
     def invoke(self, context, event):
@@ -1512,7 +1589,7 @@ def _apply_animation_document(armature_obj, document: dict, scene) -> dict:
     )
     state["tail"] = samples[-1]
     root_motion = bool(getattr(scene, "posecraft_root_motion", False)) and animation["root_leg_length"] is not None
-    applied_all, unmatched_all, low_all, requested = [], [], [], 0
+    applied_all, unmatched_all, low_all, requested, face_keyed = [], [], [], 0, 0
     try:
         for frame, pose, offset in keys:
             scene.frame_set(frame)  # evaluate the rig (and any keys already there) at this frame
@@ -1524,7 +1601,10 @@ def _apply_animation_document(armature_obj, document: dict, scene) -> dict:
             moved = move_root and _apply_root_motion(
                 armature_obj, applied, offset, animation["root_leg_length"], state, scene.posecraft_floor_contact
             )
-            _keyframe_applied(armature_obj, applied, scene, frame=frame, advance=False, root_location=moved)
+            face_keys = apply_face_document(armature_obj, pose)
+            face_keyed = max(face_keyed, len(face_keys))
+            _keyframe_applied(armature_obj, applied, scene, frame=frame, advance=False, root_location=moved,
+                              shape_keys=face_keys)
             for target, names in ((applied_all, applied), (unmatched_all, unmatched), (low_all, low_confidence)):
                 target.extend(name for name in names if name not in target)
             requested = max(requested, len(pose["bones"]))
@@ -1541,6 +1621,7 @@ def _apply_animation_document(armature_obj, document: dict, scene) -> dict:
             "end_frame": keys[-1][0] if keys else None,
             "chunk_index": animation["chunk_index"],
             "chunk_count": animation["chunk_count"],
+            "face_shape_keys": face_keyed,
         },
     }
 
@@ -1595,9 +1676,11 @@ def _apply_live_link_document(document) -> dict:
         armature_obj, document, scene.posecraft_match_rig_rest, scene.posecraft_floor_contact,
         scene.posecraft_pose_controls,
     )
+    face_keys = apply_face_document(armature_obj, document)
     if _should_keyframe(scene):
-        _keyframe_applied(armature_obj, applied, scene)
+        _keyframe_applied(armature_obj, applied, scene, shape_keys=face_keys)
     _live_link_status, _level = _summarize(applied, unmatched, low_confidence)
+    _live_link_status += _face_summary(document, face_keys)
     try:
         # B18: each received pose is its own Ctrl+Z step, like Load Pose JSON.
         bpy.ops.ed.undo_push(message="PoseCraft pose")

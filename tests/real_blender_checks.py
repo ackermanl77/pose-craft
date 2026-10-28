@@ -134,6 +134,59 @@ results["floor"] = {
     "posed_min": min(min(pb.head.z, pb.tail.z) for pb in obj.pose.bones),
 }
 
+# --- 2a+. F12: a pose's face sets the rig's ARKit-named shape keys, and keys them ----------------
+reset()
+obj = armature("PC", {n: (v["head"], v["tail"], v["parent"]) for n, v in rig_spec.items() if n in body_names})
+
+
+def face_mesh(name, keys, bind):
+    bpy.ops.mesh.primitive_cube_add()
+    mesh = bpy.context.active_object
+    mesh.name = name
+    if bind == "parent":
+        mesh.parent = obj
+    else:
+        mesh.modifiers.new("Armature", "ARMATURE").object = obj
+    mesh.shape_key_add(name="Basis")
+    for key in keys:
+        mesh.shape_key_add(name=key, from_mix=False).value = 0.25  # a key the face doesn't name keeps this
+    return mesh
+
+
+parented = face_mesh("Head", ["jawOpen", "blendShape1.mouthSmileLeft", "eye_blink_right", "browInnerUp"], "parent")
+bound = face_mesh("Teeth", ["CheekPuff"], "modifier")
+bpy.ops.object.select_all(action="DESELECT")
+bpy.context.view_layer.objects.active = obj
+obj.select_set(True)
+scene = bpy.context.scene  # reset() started a new scene
+scene.posecraft_insert_keyframes, scene.posecraft_frame_step = True, 0
+scene.frame_set(1)
+face_operator = bpy.ops.posecraft.load_pose(filepath=str(WORK / "pose_face.json"))
+
+
+def shape_values(mesh):
+    return {kb.name: round(kb.value, 4) for kb in mesh.data.shape_keys.key_blocks if kb.name != "Basis"}
+
+
+def shape_fcurves(mesh):
+    animation = mesh.data.shape_keys.animation_data
+    action = animation.action if animation else None
+    return len(addon_fcurves(action)) if action else 0
+
+
+def addon_fcurves(action):
+    # Blender 5 keeps F-curves in the action's layers/channelbags; older versions on the action.
+    if hasattr(action, "fcurves"):
+        return list(action.fcurves)
+    return [fc for layer in action.layers for strip in layer.strips for bag in strip.channelbags for fc in bag.fcurves]
+
+
+results["face"] = {
+    "operator": sorted(face_operator),
+    "parented": shape_values(parented), "modifier": shape_values(bound),
+    "keyed": {"parented": shape_fcurves(parented), "modifier": shape_fcurves(bound)},
+}
+
 # --- 2b. Mixamo-style A-pose rig (hips, clavicles, 3 spine bones, fingers) -------------------
 P, spec = "mixamorig:", {}
 

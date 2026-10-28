@@ -45,6 +45,16 @@ class BatchResult:
         return text
 
 
+
+def _face_blendshapes(person, mirror: bool):
+    """A person's expression weights as exported (F12), mirrored with the pose; None without a face."""
+    from pose_craft.export.blender_pose import mirror_blendshapes
+
+    face = getattr(person, "face", None)
+    if face is None:
+        return None
+    return mirror_blendshapes(face.blendshapes) if mirror else dict(face.blendshapes)
+
 def photos_in(folder: Path) -> list[Path]:
     """The photos directly in `folder`, sorted by name (no recursion)."""
     return sorted(path for path in Path(folder).iterdir() if path.is_file() and path.suffix.lower() in PHOTO_SUFFIXES)
@@ -119,6 +129,7 @@ def solve_folder(
                         rotations, target, source_note=f"Exported from PoseCraft (batch: {photo.name})",
                         bone_confidence=confidence, hip_height=hip_height, leg_length=leg_length,
                         out_of_frame=out_of_frame_bones(edited, mirror),
+                        face_blendshapes=_face_blendshapes(person, mirror),
                     )
             except OSError as error:
                 outcome.error = f"couldn't write {target.name}: {error}"

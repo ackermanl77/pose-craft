@@ -308,6 +308,15 @@ class LayoutMixin:
             "Off: the 15-bone body pose exactly as before."
         )
         layout.addWidget(self.hands_checkbox)
+        self.face_checkbox = QCheckBox("Face e&xpressions")
+        self.face_checkbox.setAccessibleName("Face expressions")
+        self.face_checkbox.setToolTip(
+            "Also reads each person's facial expression (MediaPipe's face landmark and blendshape models, "
+            "about 4 MB, downloaded on first use) as the 52 ARKit blendshapes -- jawOpen, mouthSmileLeft, "
+            "eyeBlinkRight... -- sent in the JSON and over Live Link, where the Blender add-on sets the "
+            "rig's shape keys with those names. Off: no face pass."
+        )
+        layout.addWidget(self.face_checkbox)
         layout.addWidget(self._build_advanced_detect())
 
         self.solve_btn = QPushButton("Solve Pose")
@@ -666,6 +675,7 @@ class LayoutMixin:
         file_menu = bar.addMenu("&File")
         self.open_action = self._action(file_menu, "&Open Photo...", self._on_load_photo, QKeySequence.Open)
         self.open_video_action = self._action(file_menu, "Open &Video...", self._on_load_video, "Ctrl+Shift+O")
+        self.record_webcam_action = self._action(file_menu, "Record from &Webcam...", self._on_record_webcam)
         self.import_animation_action = self._action(file_menu, "&Import Animation (BVH)...", self._on_import_animation)
         self.recent_menu = file_menu.addMenu("Open &Recent")
         file_menu.addSeparator()

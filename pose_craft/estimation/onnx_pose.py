@@ -899,3 +899,158 @@ class HandLandmarker:
             if refined is not None:
                 result = refined
         return result
+
+
+# -- face (F12) -------------------------------------------------------------------
+# MediaPipe's face landmarker: its 478-point landmark model on a crop derived from the
+# pose's head landmarks (as Holistic does -- the bundle's face detector is never used),
+# then its blendshape model, which turns 146 of those points into the 52 ARKit-style
+# expression weights a rig's shape keys are named after.
+
+FACE_LANDMARK_INPUT_SIZE = 256
+NUM_FACE_LANDMARKS = 478
+MIN_FACE_PRESENCE = 0.5
+# The first crop comes from the pose's 11 head points (nose, eyes, ears, mouth), which
+# span ear to ear but not forehead to chin: a wider margin than the landmark-derived crop.
+FACE_ROI_FROM_POSE_SCALE = 1.9
+# FaceLandmarksDetectorGraph's RectTransformation for the crop from the face's own landmarks.
+FACE_ROI_FROM_LANDMARKS_SCALE = 1.5
+# BlazePose head points, and the eyes the crop is levelled on (the subject's right eye,
+# then left, as MediaPipe's face rect rotation uses them).
+_POSE_HEAD_POINTS = list(range(11))
+_POSE_RIGHT_EYE, _POSE_LEFT_EYE = 5, 2
+# Face mesh points the landmark-derived crop is levelled on (outer corners of the eyes).
+_FACE_ROTATION_POINTS = (33, 263)
+
+# MediaPipe's FaceBlendshapesGraph (face_blendshapes_graph.cc): the landmarks its model
+# reads, in image pixels, and the names of its 52 outputs, in order.
+FACE_BLENDSHAPE_LANDMARKS = (
+    0, 1, 4, 5, 6, 7, 8, 10, 13, 14, 17, 21, 33, 37, 39, 40, 46, 52, 53, 54, 55, 58, 61, 63, 65, 66, 67, 70, 78,
+    80, 81, 82, 84, 87, 88, 91, 93, 95, 103, 105, 107, 109, 127, 132, 133, 136, 144, 145, 146, 148, 149, 150, 152,
+    153, 154, 155, 157, 158, 159, 160, 161, 162, 163, 168, 172, 173, 176, 178, 181, 185, 191, 195, 197, 234, 246,
+    249, 251, 263, 267, 269, 270, 276, 282, 283, 284, 285, 288, 291, 293, 295, 296, 297, 300, 308, 310, 311, 312,
+    314, 317, 318, 321, 323, 324, 332, 334, 336, 338, 356, 361, 362, 365, 373, 374, 375, 377, 378, 379, 380, 381,
+    382, 384, 385, 386, 387, 388, 389, 390, 397, 398, 400, 402, 405, 409, 415, 454, 466, 468, 469, 470, 471, 472,
+    473, 474, 475, 476, 477,
+)
+FACE_BLENDSHAPE_NAMES = (
+    "_neutral", "browDownLeft", "browDownRight", "browInnerUp", "browOuterUpLeft", "browOuterUpRight", "cheekPuff",
+    "cheekSquintLeft", "cheekSquintRight", "eyeBlinkLeft", "eyeBlinkRight", "eyeLookDownLeft", "eyeLookDownRight",
+    "eyeLookInLeft", "eyeLookInRight", "eyeLookOutLeft", "eyeLookOutRight", "eyeLookUpLeft", "eyeLookUpRight",
+    "eyeSquintLeft", "eyeSquintRight", "eyeWideLeft", "eyeWideRight", "jawForward", "jawLeft", "jawOpen", "jawRight",
+    "mouthClose", "mouthDimpleLeft", "mouthDimpleRight", "mouthFrownLeft", "mouthFrownRight", "mouthFunnel",
+    "mouthLeft", "mouthLowerDownLeft", "mouthLowerDownRight", "mouthPressLeft", "mouthPressRight", "mouthPucker",
+    "mouthRight", "mouthRollLower", "mouthRollUpper", "mouthShrugLower", "mouthShrugUpper", "mouthSmileLeft",
+    "mouthSmileRight", "mouthStretchLeft", "mouthStretchRight", "mouthUpperUpLeft", "mouthUpperUpRight",
+    "noseSneerLeft", "noseSneerRight",
+)
+
+
+def _rotated_box_roi(points_px: np.ndarray, rotation: float, image_w: int, image_h: int) -> NormRect:
+    """The rect around `points_px` (pixels) in the frame rotated by `rotation`, as a NormRect."""
+    center = (points_px.min(axis=0) + points_px.max(axis=0)) / 2.0
+    offsets = points_px - center
+    reverse = _normalize_radians(-rotation)
+    cos_r, sin_r = math.cos(reverse), math.sin(reverse)
+    projected = np.stack(
+        [offsets[:, 0] * cos_r - offsets[:, 1] * sin_r, offsets[:, 0] * sin_r + offsets[:, 1] * cos_r], axis=1
+    )
+    low, high = projected.min(axis=0), projected.max(axis=0)
+    mid = (low + high) / 2.0
+    cos_f, sin_f = math.cos(rotation), math.sin(rotation)
+    center_x = mid[0] * cos_f - mid[1] * sin_f + center[0]
+    center_y = mid[0] * sin_f + mid[1] * cos_f + center[1]
+    return NormRect(center_x / image_w, center_y / image_h, (high[0] - low[0]) / image_w,
+                    (high[1] - low[1]) / image_h, rotation)
+
+
+def _level_rotation(start_px, end_px) -> float:
+    """The crop rotation that makes start -> end point right (MediaPipe's target angle 0)."""
+    return _normalize_radians(-math.atan2(-(end_px[1] - start_px[1]), end_px[0] - start_px[0]))
+
+
+def face_roi_from_pose(pose_xy: np.ndarray, image_w: int, image_h: int) -> NormRect | None:
+    """The face crop from the pose's head landmarks ((33, 2) normalized): around nose,
+    eyes, ears and mouth, levelled on the eyes, square and widened. None when the
+    eyes coincide."""
+    size = np.array([image_w, image_h], dtype=np.float64)
+    points = np.asarray(pose_xy, dtype=np.float64)[_POSE_HEAD_POINTS] * size
+    right_eye, left_eye = points[_POSE_RIGHT_EYE], points[_POSE_LEFT_EYE]
+    if float(np.hypot(*(left_eye - right_eye))) < 1e-6:
+        return None
+    rect = _rotated_box_roi(points, _level_rotation(right_eye, left_eye), image_w, image_h)
+    return transform_rect(rect, image_w, image_h, FACE_ROI_FROM_POSE_SCALE)
+
+
+def face_roi_from_landmarks(face_xy: np.ndarray, image_w: int, image_h: int) -> NormRect:
+    """FaceLandmarksDetectorGraph's next crop from a face's own (478, 2) normalized
+    landmarks: their bounding box, levelled on the eye corners (33 -> 263), then
+    scaled 1.5 and made square."""
+    xy = np.asarray(face_xy, dtype=np.float64)
+    low, high = xy.min(axis=0), xy.max(axis=0)
+    start, end = (xy[i] * np.array([image_w, image_h]) for i in _FACE_ROTATION_POINTS)
+    rect = NormRect((low[0] + high[0]) / 2.0, (low[1] + high[1]) / 2.0, high[0] - low[0], high[1] - low[1],
+                    _level_rotation(start, end))
+    return transform_rect(rect, image_w, image_h, FACE_ROI_FROM_LANDMARKS_SCALE)
+
+
+@dataclasses.dataclass
+class FaceResult:
+    image_xy: np.ndarray  # (478, 2) normalized image coordinates
+    blendshapes: dict  # FACE_BLENDSHAPE_NAMES (without "_neutral") -> 0..1
+    presence: float
+
+
+class FaceLandmarker:
+    """MediaPipe's face landmark and blendshape models on ONNX Runtime, run on crops
+    derived from the pose (see face_roi_from_pose). The landmark model follows
+    BlazePose's device rules; the blendshape model (146 points in, 52 numbers out)
+    always runs on the CPU."""
+
+    def __init__(self, landmarks_path: Path, blendshapes_path: Path, use_gpu: bool = True):
+        self._session = create_session(landmarks_path, use_gpu)
+        reason = gpu_session_problem(self._session, landmarks_path) if use_gpu else None
+        if reason:
+            log.warning("not using the GPU for the face model: %s", reason)
+            self._session = create_session(landmarks_path, use_gpu=False)
+        self._input = self._session.get_inputs()[0].name
+        self._outputs = [o.name for o in self._session.get_outputs()]
+        self._blendshapes = create_session(blendshapes_path, use_gpu=False)
+        self._blendshapes_input = self._blendshapes.get_inputs()[0].name
+
+    def landmarks_for_roi(self, image_rgb: np.ndarray, roi: NormRect,
+                          min_presence: float = MIN_FACE_PRESENCE) -> tuple[np.ndarray, float] | None:
+        """(478, 2) normalized image x/y and the face presence for one crop, or None."""
+        tensor = landmark_input(image_rgb, roi, FACE_LANDMARK_INPUT_SIZE)
+        outputs = dict(zip(self._outputs, self._session.run(None, {self._input: tensor})))
+        # Identity = landmarks (x, y, z in input pixels), Identity_1 = face presence (a logit).
+        presence = 1.0 / (1.0 + math.exp(-float(outputs["Identity_1"].reshape(-1)[0])))
+        if presence < min_presence:
+            return None
+        xy = outputs["Identity"].reshape(NUM_FACE_LANDMARKS, 3)[:, :2] / FACE_LANDMARK_INPUT_SIZE
+        return project_to_image(xy, roi).astype(np.float64), presence
+
+    def blendshapes(self, face_xy: np.ndarray, image_w: int, image_h: int) -> dict:
+        """The 52 expression weights from a face's normalized landmarks (the model reads them in pixels)."""
+        points = np.asarray(face_xy)[list(FACE_BLENDSHAPE_LANDMARKS)] * np.array([image_w, image_h])
+        scores = self._blendshapes.run(None, {self._blendshapes_input: points.astype(np.float32)[None]})[0].reshape(-1)
+        return {name: float(score) for name, score in zip(FACE_BLENDSHAPE_NAMES, scores) if name != "_neutral"}
+
+    def detect(self, image_rgb: np.ndarray, pose_xy: np.ndarray, refine: bool = True) -> FaceResult | None:
+        """One face from its person's pose landmarks ((33, 2) normalized), or None when
+        the model doesn't see a face there. With `refine`, a second pass on the crop the
+        first pass's own landmarks give (kept if it still sees the face)."""
+        image_rgb = np.ascontiguousarray(image_rgb)
+        h, w = image_rgb.shape[:2]
+        roi = face_roi_from_pose(pose_xy, w, h)
+        if roi is None:
+            return None
+        found = self.landmarks_for_roi(image_rgb, roi)
+        if found is not None and refine:
+            refined = self.landmarks_for_roi(image_rgb, face_roi_from_landmarks(found[0], w, h))
+            if refined is not None:
+                found = refined
+        if found is None:
+            return None
+        xy, presence = found
+        return FaceResult(image_xy=xy, blendshapes=self.blendshapes(xy, w, h), presence=presence)

@@ -142,13 +142,31 @@ hands were found. The first solve with it on downloads the hand model (about
 7.5 MB) in a source install; a release build ships it. With it off, exports
 are the same 15-bone body pose as before. Photos only: video stays body-only.
 
+**Face expressions** (off by default, remembered) also reads each person's
+facial expression: for every person whose eyes and nose are visible, the app
+crops the face from the body pose and runs MediaPipe's face landmark and
+blendshape models on it. The result is the 52 **ARKit blendshapes** --
+`jawOpen`, `mouthSmileLeft`, `eyeBlinkRight`, `browInnerUp` ... each 0 to 1 --
+the expression set that VRoid, Ready Player Me, Character Creator's ARKit
+morphs and many other rigs name their shape keys after. They go into the pose
+JSON (as `"face"`) and over Live Link, and in video into every frame of
+**Send Animation to Blender** (smoothed, and held for a moment when the face
+is briefly lost). In Blender the add-on (0.10.0 or newer) sets the shape keys
+with those names on the meshes your armature deforms or carries, and keys
+them when keyframing is on; the names match whatever their case or an
+exporter's prefix (`JawOpen`, `jaw_open`, `blendShape1.jawOpen`). A rig with
+no such shape keys simply ignores it, and the add-on says so. **Mirror**
+swaps the Left and Right expressions with the pose. The first solve with it on
+downloads the face model (about 3.7 MB). BVH, glTF and FBX exports carry the
+skeleton only, not the expression.
+
 **Solve Pose** (or **F5**) runs the actual detection. On the very first solve, a source install also
 downloads the pose model, and the progress bar shows how far along it is
 (the downloaded model is also converted once to the
 format the app runs it in -- well under a second). **Cancel** (or **Esc**)
 stops a download. Every solve after that reuses the already-loaded model,
 so later clicks are noticeably faster. While a solve is running, **Load
-Photo**, **Load Video**, **Max people to detect**, **Model quality**, **Use GPU**, **Group photo** and **Hands and fingers** are disabled -- this is intentional:
+Photo**, **Load Video**, **Max people to detect**, **Model quality**, **Use GPU**, **Group photo**, **Hands and fingers** and **Face expressions** are disabled -- this is intentional:
 swapping the photo or the detection settings mid-solve could let a stale
 result land on the wrong photo.
 
@@ -248,6 +266,18 @@ with swapped numbers); after longer they get a new number. With Max people set t
 clearest person is tracked, as before. Each person's landmarks are smoothed
 over time on their own (a One Euro filter: strong smoothing while the body
 is still, little lag when it moves fast).
+
+**File > Record from Webcam...** records a clip to track instead of opening
+one: pick the **Camera**, the **Length** (up to 5 minutes; **Stop** ends it
+sooner) and a **Countdown** to step back into view, then **Record**. The
+dialog shows the camera's picture while it records; when it ends the clip is
+tracked exactly like an opened video (hands and face too, if ticked). The
+clips are kept in `%LOCALAPPDATA%\PoseCraft\recordings` (named by date and
+time), so you can open one again later; **Cancel** during a recording throws
+it away. A webcam often delivers fewer frames per second than it reports in
+dim light, so the clip is timed by the frames that actually arrived and the
+animation plays at the speed you moved. For the best results, light the room
+well and stand far enough back that your whole body is in the picture.
 
 The **Video** section then shows a frame slider: scrub to any frame to see
 it, its skeletons and the selected person's 3D preview; the selected person
@@ -465,7 +495,7 @@ same from a saved `posecraft_library.json`. Needs add-on 0.9.0.
 
 | Key | Does |
 |---|---|
-| Ctrl+O / Ctrl+Shift+O | Open a photo / a video |
+| Ctrl+O / Ctrl+Shift+O | Open a photo / a video (File > Record from Webcam... records one) |
 | F5 or Ctrl+Enter | Solve Pose |
 | Esc | Cancel a running solve or video |
 | Page Down / Page Up | Next / previous person |

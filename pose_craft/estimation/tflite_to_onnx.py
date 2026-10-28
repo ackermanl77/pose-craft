@@ -7,7 +7,10 @@ set those BlazePose graphs use (checked for the lite/full/heavy variants):
 CONV_2D, DEPTHWISE_CONV_2D, ADD, PAD, MAX_POOL_2D, RESIZE_BILINEAR,
 DEPTH_TO_SPACE, CONCATENATION, RESHAPE and LOGISTIC -- plus PRELU, MEAN and
 FULLY_CONNECTED, the extra ops of MediaPipe's hand landmarker (palm detector and
-21-point hand landmark model, for finger poses) -- plus DEQUANTIZE and DENSIFY,
+21-point hand landmark model, for finger poses) -- plus SUB, MUL, DIV,
+SQUARED_DIFFERENCE, NEG, SQRT, RSQRT, SUM, TRANSPOSE and STRIDED_SLICE, the extra ops of
+the face landmarker's blendshape model (an MLP-Mixer over 146 face points, F12) -- plus
+DEQUANTIZE and DENSIFY,
 which only ever act on constant weights (float16 and block-sparse storage) and so
 are folded into plain float32 initializers here. Anything else raises
 `UnsupportedTFLiteOp` instead of silently producing a wrong graph -- the general
@@ -37,6 +40,9 @@ _NHWC_TO_NCHW = [0, 3, 1, 2]
 _NCHW_TO_NHWC = [0, 2, 3, 1]
 # Where an NHWC axis ends up once the tensor is stored as NCHW.
 _NHWC_AXIS_IN_NCHW = {0: 0, 1: 2, 2: 3, 3: 1}
+# Elementwise binary ops: TFLite name -> ONNX op (SQUARED_DIFFERENCE is Sub then Mul).
+_BINARY_OPS = {"ADD": "Add", "SUB": "Sub", "MUL": "Mul", "DIV": "Div", "SQUARED_DIFFERENCE": "Sub"}
+_UNARY_OPS = {"NEG": "Neg", "SQRT": "Sqrt"}
 
 # tflite.TensorType values -> numpy dtypes (only the ones these graphs use).
 _TENSOR_DTYPES = {0: np.float32, 1: np.float16, 2: np.int32, 3: np.uint8, 4: np.int64, 9: np.int8}
@@ -160,7 +166,10 @@ class _Converter:
         return self.graph.Tensors(index)
 
     def _shape(self, index: int) -> list[int]:
-        return [int(v) for v in self._tensor(index).ShapeAsNumpy()]
+        shape = self._tensor(index).ShapeAsNumpy()
+        if isinstance(shape, int):
+            return []  # a scalar: the flatbuffer has no shape vector, and ShapeAsNumpy() gives 0
+        return [int(v) for v in shape]
 
     def _unique(self, base: str) -> str:
         self._name_counter += 1
@@ -315,19 +324,85 @@ class _Converter:
             self.values[out_index] = self._activation(out, options.FusedActivationFunction(), base)
             return
 
-        if name == "ADD":
-            options = _options(op, tfl.AddOptions)
+        if name in _BINARY_OPS:
+            out_rank = len(self._shape(out_index))
             operands = []
             for index in inputs:
                 constant = self._constant(index) if index not in self.values else None
-                if constant is not None and constant.ndim == 1 and len(self._shape(out_index)) == 4:
-                    # A per-channel constant broadcasts over NHWC's last axis; in NCHW
-                    # that's axis 1.
-                    operands.append(self._initializer(constant.astype(np.float32).reshape(1, -1, 1, 1), base + "_c"))
+                if constant is not None and out_rank == 4 and 0 < constant.ndim < 4:
+                    # A lower-rank constant broadcasts against NHWC's trailing axes: pad it to
+                    # rank 4 and store it NCHW like the activation (a per-channel [C] becomes
+                    # [1, C, 1, 1]).
+                    padded = constant.astype(np.float32).reshape((1,) * (4 - constant.ndim) + constant.shape)
+                    operands.append(self._initializer(padded.transpose(_NHWC_TO_NCHW), base + "_c"))
                 else:
+                    if index not in self.values and constant is None:
+                        raise UnsupportedTFLiteOp(f"{name} input has no producer")
+                    if index in self.values and out_rank == 4 and len(self._shape(index)) not in (0, 4):
+                        raise UnsupportedTFLiteOp(f"{name} broadcasting a rank-{len(self._shape(index))} activation to rank 4")
                     operands.append(self._value(index))
-            out = self._node("Add", operands, base)
-            self.values[out_index] = self._activation(out, options.FusedActivationFunction(), base)
+            out = self._node(_BINARY_OPS[name], operands, base)
+            if name == "SQUARED_DIFFERENCE":
+                self.values[out_index] = self._node("Mul", [out, out], base + "_sq")
+                return
+            options_class = {"ADD": tfl.AddOptions, "SUB": tfl.SubOptions, "MUL": tfl.MulOptions, "DIV": tfl.DivOptions}[name]
+            activation = _options(op, options_class).FusedActivationFunction() if op.BuiltinOptions() is not None else _ACT_NONE
+            self.values[out_index] = self._activation(out, activation, base)
+            return
+
+        if name in _UNARY_OPS:
+            self.values[out_index] = self._node(_UNARY_OPS[name], [self._value(inputs[0])], base)
+            return
+
+        if name == "RSQRT":
+            root = self._node("Sqrt", [self._value(inputs[0])], base + "_sqrt")
+            self.values[out_index] = self._node("Reciprocal", [root], base)
+            return
+
+        if name == "TRANSPOSE":
+            perm = self._constant(inputs[1])
+            if perm is None:
+                raise UnsupportedTFLiteOp("TRANSPOSE with a non-constant permutation")
+            perm = [int(a) for a in perm]
+            if len(perm) == 4:
+                # Both sides are stored NCHW: NCHW axis k is NHWC axis _NHWC_TO_NCHW[k], which the
+                # TFLite permutation takes from NHWC axis perm[...], stored at NCHW _NHWC_AXIS_IN_NCHW[...].
+                perm = [_NHWC_AXIS_IN_NCHW[perm[_NHWC_TO_NCHW[k]]] for k in range(4)]
+            self.values[out_index] = self._node("Transpose", [self._value(inputs[0])], base, perm=perm)
+            return
+
+        if name == "STRIDED_SLICE":
+            options = _options(op, tfl.StridedSliceOptions)
+            begin, end, strides = (self._constant(i) for i in inputs[1:4])
+            if begin is None or end is None or strides is None:
+                raise UnsupportedTFLiteOp("STRIDED_SLICE with non-constant bounds")
+            if options.EllipsisMask() or options.NewAxisMask():
+                raise UnsupportedTFLiteOp("STRIDED_SLICE with ellipsis or new-axis masks")
+            in_shape = self._shape(inputs[0])
+            rank = len(in_shape)
+            shrink = options.ShrinkAxisMask()
+            if rank == 4 and shrink:
+                raise UnsupportedTFLiteOp("STRIDED_SLICE dropping an axis of a rank-4 tensor")
+            starts, ends, axes, steps = [], [], [], []
+            big = np.iinfo(np.int64).max
+            for axis in range(rank):
+                step = int(strides[axis])
+                start = 0 if options.BeginMask() >> axis & 1 else int(begin[axis])
+                stop = (big if step > 0 else -big) if options.EndMask() >> axis & 1 else int(end[axis])
+                if shrink >> axis & 1:
+                    stop = start + 1 if start != -1 else big
+                starts.append(start)
+                ends.append(stop)
+                axes.append(_NHWC_AXIS_IN_NCHW[axis] if rank == 4 else axis)
+                steps.append(step)
+            tensors = [self._initializer(np.array(v, dtype=np.int64), base + suffix)
+                       for v, suffix in ((starts, "_starts"), (ends, "_ends"), (axes, "_axes"), (steps, "_steps"))]
+            out = self._node("Slice", [self._value(inputs[0]), *tensors], base)
+            dropped = [axis for axis in range(rank) if shrink >> axis & 1]
+            if dropped:
+                out = self._node("Squeeze", [out, self._initializer(np.array(dropped, dtype=np.int64), base + "_drop")],
+                                 base + "_squeeze")
+            self.values[out_index] = out
             return
 
         if name == "PAD":
@@ -416,11 +491,11 @@ class _Converter:
             )
             return
 
-        if name == "MEAN":
+        if name in ("MEAN", "SUM"):
             options = _options(op, tfl.ReducerOptions)
             axes = self._constant(inputs[1])
             if axes is None:
-                raise UnsupportedTFLiteOp("MEAN with non-constant axes")
+                raise UnsupportedTFLiteOp(f"{name} with non-constant axes")
             rank = len(self._shape(inputs[0]))
             axes = [int(a) % rank for a in np.atleast_1d(axes)]
             keep_dims = bool(options.KeepDims())
@@ -428,11 +503,16 @@ class _Converter:
                 if not keep_dims and sorted(axes) != [1, 2]:
                     # Only the spatial mean ([N, H, W, C] -> [N, C]) keeps the same
                     # axis order in both layouts once the reduced axes are dropped.
-                    raise UnsupportedTFLiteOp(f"MEAN over NHWC axes {axes} without keep_dims")
+                    raise UnsupportedTFLiteOp(f"{name} over NHWC axes {axes} without keep_dims")
                 axes = [_NHWC_AXIS_IN_NCHW[a] for a in axes]
-            self.values[out_index] = self._node(
-                "ReduceMean", [self._value(inputs[0])], base, axes=sorted(axes), keepdims=int(keep_dims)
-            )
+            if name == "SUM":
+                axes_input = self._initializer(np.array(sorted(axes), dtype=np.int64), base + "_axes")
+                self.values[out_index] = self._node(
+                    "ReduceSum", [self._value(inputs[0]), axes_input], base, keepdims=int(keep_dims))
+            else:
+                self.values[out_index] = self._node(
+                    "ReduceMean", [self._value(inputs[0])], base, axes=sorted(axes), keepdims=int(keep_dims)
+                )
             return
 
         if name == "FULLY_CONNECTED":
@@ -509,6 +589,10 @@ TASK_BUNDLE_MEMBERS = {"detector": "pose_detector.tflite", "landmarks": "pose_la
 # the hand crop comes from the pose's wrist and knuckle landmarks, as in
 # MediaPipe Holistic, so the palm detector is never converted.
 HAND_TASK_BUNDLE_MEMBERS = {"landmarks": "hand_landmarks_detector.tflite"}
+# The face landmarker bundle (F12): its 478-point landmark model and its blendshape model.
+# Like the hands, the crop comes from the pose's head landmarks, so the face detector is
+# never converted.
+FACE_TASK_BUNDLE_MEMBERS = {"landmarks": "face_landmarks_detector.tflite", "blendshapes": "face_blendshapes.tflite"}
 
 
 def convert_task_bundle(
