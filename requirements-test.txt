@@ -10,13 +10,13 @@
 # onnxruntime (the CPU build -- same `onnxruntime` module as requirements.txt's
 # onnxruntime-gpu), onnx and tflite cover the pose pipeline and model converter
 # tests; the ones needing a downloaded model or a reference runtime skip here.
-numpy==2.5.3
+numpy==2.5.4
 scipy==1.18.1
 opencv-python-headless==5.0.0.93
 pytest==9.1.1
-onnxruntime==1.30.0
-onnx==1.23.0
+onnxruntime==1.31.0
+onnx==1.23.2
 tflite==2.18.0
-ruff==0.16.10
+ruff==0.17.2
 mypy==2.4.0
 pytest-cov==7.1.0

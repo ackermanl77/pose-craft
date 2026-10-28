@@ -8,4 +8,4 @@
 # pose_craft/estimation/onnx_pose.py preloads via onnxruntime.preload_dlls() --
 # so no system-wide CUDA Toolkit install is needed, only a current NVIDIA driver.
 # Without these the app still works; ONNX Runtime just runs on the CPU.
-onnxruntime-gpu[cuda,cudnn]==1.30.0
+onnxruntime-gpu[cuda,cudnn]==1.31.0
