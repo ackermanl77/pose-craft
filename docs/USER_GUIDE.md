@@ -243,6 +243,13 @@ undoable with **Ctrl+Z** (redo **Ctrl+Y** or **Ctrl+Shift+Z**):
   like Blender's bone axes: **Y** runs along the bone (a twist), **X** and
   **Z** bend it. Its children follow. **Reset bone** clears one bone's
   adjustment, **Reset all edits** everything for this person.
+- **In the 3D preview**, as in Blender's pose mode: click a bone to pick it
+  (the same choice as Adjust bone), then press **R** with the mouse over the
+  preview and move the mouse around the bone's joint to turn it about the view
+  axis. **X**, **Y** or **Z** turns it about that axis of the bone instead
+  (again: back to the view axis); type a number for an exact angle (**-**
+  flips its sign). **Enter** or a click keeps it as one undo step, **Esc** or
+  a right-click puts the bone back. The boxes above follow as you turn.
 
 Corrections belong to one person and go into every export (JSON, BVH, Live
 Link, and every person of Export All). In a video they belong to the tracked

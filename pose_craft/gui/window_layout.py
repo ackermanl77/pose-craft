@@ -223,6 +223,11 @@ class LayoutMixin:
         group = QGroupBox("1. Load && Detect")
         layout = QVBoxLayout(group)
 
+        # Shown instead of the Load and Solve buttons while the toolbar has them (UI5).
+        self.toolbar_hint = QLabel("Load a photo or video and solve from the toolbar (Ctrl+O, F5).")
+        self.toolbar_hint.setWordWrap(True)
+        layout.addWidget(self.toolbar_hint)
+
         load_row = QHBoxLayout()
         self.load_btn = QPushButton("Load Photo...")
         self.load_btn.setAccessibleName("Load photo")
@@ -438,7 +443,7 @@ class LayoutMixin:
         layout = QVBoxLayout(group)
         hint = QLabel(
             "Drag a ringed joint on the photo to move it (its limb is re-solved); right-click a limb to flip "
-            "its depth (toward / away from the camera)."
+            "its depth (toward / away from the camera). In the 3D preview, click a bone and press R to rotate it."
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -694,6 +699,16 @@ class LayoutMixin:
         redo.setShortcuts([QKeySequence.Redo, QKeySequence("Ctrl+Shift+Z")])
         edit_menu.addAction(undo)
         edit_menu.addAction(redo)
+        # UI7: a bone's adjustment onto another bone or person, or mirrored onto the other side.
+        # A focused text field still gets Ctrl+C / Ctrl+V (Qt gives it standard keys first).
+        edit_menu.addSeparator()
+        self.copy_bone_action = self._action(edit_menu, "&Copy Bone Rotation", self._on_copy_bone, QKeySequence.Copy)
+        self.paste_bone_action = self._action(
+            edit_menu, "&Paste Bone Rotation", lambda: self._on_paste_bone(mirrored=False), QKeySequence.Paste
+        )
+        self.paste_mirrored_action = self._action(
+            edit_menu, "Paste &Mirrored to Other Side", lambda: self._on_paste_bone(mirrored=True), "Ctrl+Shift+V"
+        )
 
         pose_menu = bar.addMenu("&Pose")
         self.solve_action = self._action(pose_menu, "&Solve", self._on_solve_pose, ["F5", "Ctrl+Return"])
@@ -762,3 +777,14 @@ class LayoutMixin:
             else:
                 self.main_toolbar.addAction(action)
         self.main_toolbar.widgetForAction(self.solve_action).setObjectName("primaryAction")
+        # UI5: the panel's Load/Solve/Export/Send buttons repeat the toolbar, so they show only
+        # while the toolbar is hidden (its right-click menu can hide it).
+        toolbar_toggle = self.main_toolbar.toggleViewAction()
+        toolbar_toggle.toggled.connect(lambda toolbar_shown: self._show_panel_duplicates(not toolbar_shown))
+        self._show_panel_duplicates(not toolbar_toggle.isChecked())
+
+    def _show_panel_duplicates(self, show: bool) -> None:
+        for button in (self.load_btn, self.load_video_btn, self.solve_btn, self.export_btn, self.export_bvh_btn,
+                       self.send_to_blender_btn):
+            button.setVisible(show)
+        self.toolbar_hint.setVisible(not show)

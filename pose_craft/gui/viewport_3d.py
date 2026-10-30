@@ -19,8 +19,8 @@ from __future__ import annotations
 import numpy as np
 import pyqtgraph.opengl as gl
 from pyqtgraph import Transform3D, Vector
-from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QColor, QPainter, QPen, QVector4D
+from PySide6.QtCore import QEvent, QPointF, Qt, Signal
+from PySide6.QtGui import QColor, QCursor, QPainter, QPen, QVector4D
 from PySide6.QtWidgets import QBoxLayout, QHBoxLayout, QLabel, QToolButton, QWidget
 
 from pose_craft.export.blender_pose import low_confidence_threshold
@@ -376,7 +376,23 @@ def _compute_camera_frame(points: np.ndarray) -> tuple[np.ndarray, float]:
     return center, distance
 
 
+# UI6: how far (pixels) a press may move and still count as a click that selects a bone.
+CLICK_SLOP_PX = 4
+ROTATE_HELP = "X/Y/Z: the bone's own axis · type an angle · Enter or click: apply · Esc or right-click: cancel"
+
+
 class SkeletonViewport(gl.GLViewWidget):
+    """The 3D preview. UI6, as in Blender's pose mode: a click on a bone selects it
+    (bone_clicked), and R turns the selected bone with the mouse about the view axis --
+    X/Y/Z lock it to one of the bone's own axes, digits type the angle. The view reports the
+    angle (rotate_changed) and the window applies it; Enter or a click keeps it as one undo
+    step, Esc or a right-click puts the bone back (rotate_finished)."""
+
+    bone_clicked = Signal(str)
+    rotate_started = Signal()
+    rotate_changed = Signal(float, str)  # degrees, "" = about the view axis, else "X"/"Y"/"Z"
+    rotate_finished = Signal(bool)  # True: keep it, False: cancel
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setCameraPosition(distance=3.0, elevation=_DEFAULT_ELEVATION, azimuth=_DEFAULT_AZIMUTH)
@@ -416,6 +432,15 @@ class SkeletonViewport(gl.GLViewWidget):
         self._ghost: gl.GLScatterPlotItem | None = None
         self._labels: list[gl.GLTextItem] = []
         self._last_frame: tuple[np.ndarray, float] | None = None
+        self.setFocusPolicy(Qt.StrongFocus)  # R, X/Y/Z and typed angles come here
+        self.selected_bone: str | None = None
+        self._press: QPointF | None = None
+        self._rotating: dict | None = None
+        self._rotate_label = QLabel(self)
+        self._rotate_label.setStyleSheet("background:rgba(20,20,20,225); color:#fff; padding:4px; border-radius:3px;")
+        self._rotate_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._rotate_label.setWordWrap(True)
+        self._rotate_label.hide()
 
     def clear_skeleton(self) -> None:
         for name in ("_bone_lines", "_bone_bodies", "_joints", "_ghost"):
@@ -534,7 +559,133 @@ class SkeletonViewport(gl.GLViewWidget):
     def hover_label_text(self) -> str:
         return "" if self._hover_label.isHidden() else self._hover_label.text()
 
+    # -- select and rotate a bone (UI6) ------------------------------------------------
+
+    @property
+    def rotating(self) -> bool:
+        return self._rotating is not None
+
+    def view_axis_engine(self) -> np.ndarray:
+        """The unit vector from the view's centre toward the camera, engine frame."""
+        camera = self.cameraPosition()
+        center = self.opts["center"]
+        toward = np.array([camera.x() - center.x(), camera.y() - center.y(), camera.z() - center.z()])
+        return (toward / max(1e-9, float(np.linalg.norm(toward)))) @ _ENGINE_TO_DISPLAY
+
+    def start_rotate(self, at: QPointF | None = None) -> bool:
+        """R: starts turning the selected bone; False when there is none on screen."""
+        head = self._joint_positions.get(f"{self.selected_bone}.head")
+        if self._rotating is not None or head is None:
+            return False
+        pivot = self.project_to_screen(np.array([head]))[0]
+        if np.isnan(pivot).any():
+            return False
+        at = at or QPointF(self.mapFromGlobal(QCursor.pos()))
+        self._rotating = {"pivot": pivot, "last": self._screen_angle(at, pivot), "turned": 0.0, "axis": "", "typed": None}
+        self._hover_label.hide()
+        self.setFocus()
+        self.rotate_started.emit()
+        if self._rotating is not None:  # the window may have refused it
+            self._report_rotation()
+        return self._rotating is not None
+
+    @staticmethod
+    def _screen_angle(point: QPointF, pivot: np.ndarray) -> float:
+        # Counter-clockwise on screen (y grows downward) is positive: a turn about the axis
+        # pointing at the viewer.
+        return float(np.degrees(np.arctan2(-(point.y() - pivot[1]), point.x() - pivot[0])))
+
+    def rotation_angle(self) -> float:
+        state = self._rotating or {}
+        if state.get("typed") not in (None, "", "-", ".", "-."):
+            return float(state["typed"])
+        return float(state.get("turned", 0.0))
+
+    def _report_rotation(self) -> None:
+        state = self._rotating
+        angle = self.rotation_angle()
+        about = f"its {state['axis']} axis" if state["axis"] else "the view axis"
+        typed = "" if state["typed"] is None else f"  [{state['typed'] or ' '}]"
+        self._rotate_label.setText(f"Rotate {self.selected_bone}: {angle:.1f}° about {about}{typed}\n{ROTATE_HELP}")
+        # Wrapped to the view and placed under its navigation bar (top right), so neither hides the other.
+        self._rotate_label.setFixedWidth(max(160, self.width() - 12))
+        self._rotate_label.adjustSize()
+        self._rotate_label.move(6, self.navigation.y() + self.navigation.height() + 6)
+        self._rotate_label.show()
+        self._rotate_label.raise_()
+        self.rotate_changed.emit(angle, state["axis"])
+
+    def finish_rotate(self, apply: bool) -> None:
+        if self._rotating is None:
+            return
+        self._rotating = None
+        self._rotate_label.hide()
+        self.rotate_finished.emit(apply)
+
+    def event(self, ev) -> bool:
+        # Mid-rotation every key is the view's: digits are an angle and Esc a cancel here, not the
+        # window's camera-view (1, 3, 7, 0) or Cancel shortcuts.
+        # (getattr: Qt sends events while __init__ is still running.)
+        if getattr(self, "_rotating", None) is not None and ev.type() == QEvent.Type.ShortcutOverride:
+            ev.accept()
+            return True
+        return super().event(ev)
+
+    def keyPressEvent(self, ev) -> None:
+        if self._rotating is not None:
+            state, key, text = self._rotating, ev.key(), ev.text()
+            if key == Qt.Key_Escape:
+                self.finish_rotate(False)
+            elif key in (Qt.Key_Return, Qt.Key_Enter):
+                self.finish_rotate(True)
+            elif key in (Qt.Key_X, Qt.Key_Y, Qt.Key_Z):
+                axis = chr(key)
+                state["axis"] = "" if state["axis"] == axis else axis  # again: back to the view axis
+                self._report_rotation()
+            elif key == Qt.Key_Backspace and state["typed"] is not None:
+                state["typed"] = state["typed"][:-1] or None
+                self._report_rotation()
+            elif text and (text.isdigit() or text in ".-"):
+                typed = state["typed"] or ""
+                if text == "-":
+                    typed = typed[1:] if typed.startswith("-") else "-" + typed
+                elif text != "." or "." not in typed:
+                    typed += text
+                state["typed"] = typed
+                self._report_rotation()
+            ev.accept()
+            return
+        if ev.key() == Qt.Key_R and not ev.modifiers() and not ev.isAutoRepeat() and self.start_rotate():
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
+
+    def mousePressEvent(self, ev) -> None:
+        if self._rotating is not None:
+            self.finish_rotate(ev.button() == Qt.LeftButton)
+            ev.accept()
+            return
+        self._press = ev.position() if ev.button() == Qt.LeftButton else None
+        super().mousePressEvent(ev)
+
+    def mouseReleaseEvent(self, ev) -> None:
+        press, self._press = self._press, None
+        position = ev.position()
+        if press is not None and ev.button() == Qt.LeftButton and (position - press).manhattanLength() <= CLICK_SLOP_PX:
+            name = self.bone_at(position.x(), position.y())
+            if name is not None:
+                self.bone_clicked.emit(name)
+        super().mouseReleaseEvent(ev)
+
     def mouseMoveEvent(self, ev) -> None:
+        if self._rotating is not None:
+            state = self._rotating
+            angle = self._screen_angle(ev.position(), state["pivot"])
+            state["turned"] += (angle - state["last"] + 180.0) % 360.0 - 180.0  # across the ±180 seam
+            state["last"] = angle
+            if state["typed"] is None:
+                self._report_rotation()
+            return
         if ev.buttons() == Qt.NoButton:
             pos = ev.position() if hasattr(ev, "position") else QPointF(ev.pos())
             self.hover_at(pos.x(), pos.y())
@@ -662,4 +813,5 @@ class SkeletonViewport(gl.GLViewWidget):
         # enough that the old distance/center would clip it. Passing only `distance`
         # (not elevation/azimuth) leaves the user's own camera rotation alone.
         self._last_frame = _compute_camera_frame(joints)
-        self.frame_skeleton()
+        if self._rotating is None:  # mid-rotation the camera holds still, so the pivot stays put
+            self.frame_skeleton()

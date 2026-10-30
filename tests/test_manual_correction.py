@@ -87,3 +87,41 @@ def test_lateral_axes_follow_each_bones_roll():
     rolled = sk.bone_lateral_axes({"spine": Rotation.from_euler("y", 90, degrees=True)})
     np.testing.assert_allclose(rolled["spine"], [0.0, 0.0, -1.0], atol=1e-12)
     np.testing.assert_allclose(rolled["head"], [0.0, 0.0, -1.0], atol=1e-12)  # children carry it
+
+
+def test_a_mirrored_adjustment_is_the_reflection_on_the_opposite_bone():
+    """UI7: paste mirrored -- the opposite bone, and angles whose rotation is the original's
+    reflected through the midline (X -> -X), whatever the two rest frames are."""
+    flip = np.diag([-1.0, 1.0, 1.0])
+    for bone in ("forearm.L", "thigh.R", "foot.L", "spine", "head"):
+        other, angles = sk.mirrored_bone_angles(bone, (10.0, -15.0, 30.0))
+        assert other == sk.opposite_bone(bone)
+        expected = flip @ sk.bone_axes_rotation(bone, (10.0, -15.0, 30.0)).as_matrix() @ flip
+        np.testing.assert_allclose(sk.bone_axes_rotation(other, angles).as_matrix(), expected, atol=1e-3)
+    assert sk.opposite_bone("upper_arm.R") == "upper_arm.L" and sk.opposite_bone("neck") == "neck"
+    assert sk.mirrored_bone_angles("forearm.L", (10.0, -15.0, 30.0)) == ("forearm.R", (10.0, 15.0, -30.0))
+
+
+def test_turning_a_posed_bone_about_a_world_axis_gives_the_adjustment_that_does_it():
+    """UI6: rotating in the 3D view. The new adjustment, applied like any other, turns the bone's
+    world frame by exactly that angle about that world axis (head fixed), whatever its parents do."""
+    locals_ = {name: Rotation.from_euler("xyz", np.random.default_rng(i).uniform(-40, 40, 3), degrees=True)
+               for i, name in enumerate(sk.BONE_NAMES)}
+    bone, start = "forearm.L", (10.0, -5.0, 20.0)
+    before = sk.apply_bone_overrides(locals_, {bone: sk.bone_axes_rotation(bone, start)})
+    world_before = sk.world_rotations_from_local(before)[bone]
+    axis = np.array([0.3, -0.5, 0.8]) / np.linalg.norm([0.3, -0.5, 0.8])
+    angles = sk.rotated_bone_angles(bone, start, world_before, axis, 35.0)
+    after = sk.apply_bone_overrides(locals_, {bone: sk.bone_axes_rotation(bone, angles)})
+    world_after = sk.world_rotations_from_local(after)[bone]
+    expected = Rotation.from_rotvec(axis * np.radians(35.0)) * world_before
+    np.testing.assert_allclose(world_after.as_matrix(), expected.as_matrix(), atol=5e-3)  # angles are rounded to 0.1°
+
+
+def test_turning_about_the_bone_s_own_axis_adds_to_that_spin_box():
+    world = sk.world_rotations_from_local({})["upper_arm.R"]
+    for index, axis in enumerate("XYZ"):
+        start = [0.0, 0.0, 0.0]
+        angles = sk.rotated_bone_angles("upper_arm.R", tuple(start), world, sk.bone_axis_in_world("upper_arm.R", world, axis), 30.0)
+        start[index] = 30.0
+        assert angles == pytest.approx(tuple(start), abs=0.05)

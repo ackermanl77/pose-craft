@@ -69,6 +69,7 @@ from pose_craft.retarget.skeleton import (
     FLIPPABLE_BONES,
     JOINT_LABELS,
     ORIENTATION_CORRECTIONS,
+    bone_axis_in_world,
     bone_confidence,
     bone_lateral_axes,
     floor_height,
@@ -78,7 +79,10 @@ from pose_craft.retarget.skeleton import (
     measured_proportions,
     mirror_hands,
     mirror_landmarks,
+    mirrored_bone_angles,
     rotate_joint_positions,
+    rotated_bone_angles,
+    world_rotations_from_local,
 )
 
 log = logging.getLogger(__name__)
@@ -514,6 +518,14 @@ class MainWindow(LayoutMixin, InputsMixin, ExportMixin, QMainWindow):
 
         self._build_ui()
         self._build_menus()
+        # UI6: the 3D view selects and rotates bones; its selection is the "Adjust bone" choice.
+        self._view_rotation: dict | None = None
+        self.viewport.selected_bone = self.adjust_bone_combo.currentText()
+        self.adjust_bone_combo.currentTextChanged.connect(lambda name: setattr(self.viewport, "selected_bone", name))
+        self.viewport.bone_clicked.connect(self._on_viewport_bone_clicked)
+        self.viewport.rotate_started.connect(self._on_view_rotate_started)
+        self.viewport.rotate_changed.connect(self._on_view_rotate_changed)
+        self.viewport.rotate_finished.connect(self._on_view_rotate_finished)
         self._restore_settings()
         self._apply_accessibility_style()
         self._set_result_actions_enabled(False)
@@ -1335,6 +1347,78 @@ class MainWindow(LayoutMixin, InputsMixin, ExportMixin, QMainWindow):
                 spin.setValue(value)
         finally:
             self._syncing_adjust = False
+
+    # -- rotating a bone in the 3D view (UI6) ----------------------------------------------
+
+    def _on_viewport_bone_clicked(self, name: str) -> None:
+        if self.adjust_bone_combo.findText(name) >= 0:
+            self.adjust_bone_combo.setCurrentText(name)
+            self.statusBar().showMessage(f"{name} selected -- R rotates it here, or use the X/Y/Z boxes", 5000)
+
+    def _on_view_rotate_started(self) -> None:
+        """R in the 3D view: remembers the person's edits and the bone's posed frame to turn from."""
+        index = self.person_combo.currentIndex()
+        inputs = self._current_person_document_inputs()
+        bone = self.adjust_bone_combo.currentText()
+        if inputs is None or not self.adjust_bone_combo.isEnabled():
+            self.viewport.finish_rotate(False)
+            return
+        rotations = inputs[0]
+        edits = self._person_edits(index)
+        self._view_rotation = {
+            "index": index, "key": self._edit_key(index), "bone": bone, "before": edits, "after": edits,
+            "angles": edits.override_for(bone), "world": world_rotations_from_local(rotations)[bone],
+        }
+
+    def _on_view_rotate_changed(self, angle: float, axis: str) -> None:
+        state = self._view_rotation
+        if state is None:
+            return
+        toward_viewer = self.viewport.view_axis_engine()
+        if axis:
+            direction = bone_axis_in_world(state["bone"], state["world"], axis)
+            # The mouse turns things counter-clockwise on screen; an axis pointing away from the
+            # viewer turns the other way, so its angle flips to match what the mouse does.
+            angle = angle if float(np.dot(direction, toward_viewer)) >= 0 else -angle
+        else:
+            direction = toward_viewer
+        angles = rotated_bone_angles(state["bone"], state["angles"], state["world"], direction, angle)
+        state["after"] = state["before"].with_override(state["bone"], angles)
+        self._set_person_edits(state["key"], state["after"])  # a live preview, not an undo step yet
+        self._sync_adjust_controls()
+
+    def _on_view_rotate_finished(self, apply: bool) -> None:
+        state, self._view_rotation = self._view_rotation, None
+        if state is None:
+            return
+        self._set_person_edits(state["key"], state["before"])
+        if apply:
+            self._push_edit(state["index"], state["after"], f"Rotate {state['bone']}")
+        self._sync_adjust_controls()
+
+    def _on_copy_bone(self) -> None:
+        """UI7: remembers the selected bone's adjustment (its spin box values)."""
+        bone = self.adjust_bone_combo.currentText()
+        self._copied_bone = (bone, tuple(spin.value() for spin in self.adjust_spins))
+        x, y, z = self._copied_bone[1]
+        self.statusBar().showMessage(f"Copied {bone}: X {x:g}°, Y {y:g}°, Z {z:g}°", 5000)
+
+    def _on_paste_bone(self, mirrored: bool) -> None:
+        """UI7: the copied adjustment onto the selected bone, or mirrored onto the copied bone's
+        opposite (forearm.L -> forearm.R), as one undo step."""
+        copied = getattr(self, "_copied_bone", None)
+        if copied is None:
+            self.statusBar().showMessage("Copy a bone's rotation first (Ctrl+C).", 5000)
+            return
+        if not 0 <= self.person_combo.currentIndex() < len(self._people):
+            return
+        if mirrored:
+            bone, angles = mirrored_bone_angles(*copied)
+            self.adjust_bone_combo.setCurrentText(bone)
+        else:
+            bone, angles = self.adjust_bone_combo.currentText(), copied[1]
+        self._set_override(bone, angles)
+        self.statusBar().showMessage(f"Pasted {'mirrored ' if mirrored else ''}onto {bone}", 5000)
 
     def _on_reset_edits(self) -> None:
         index = self.person_combo.currentIndex()

@@ -1230,6 +1230,56 @@ def bone_axes_rotation(bone_name: str, angles_deg: tuple[float, float, float]) -
     return basis * Rotation.from_euler("xyz", angles_deg, degrees=True) * basis.inv()
 
 
+def bone_axis_in_world(bone_name: str, world_rotation: Rotation, axis: str) -> np.ndarray:
+    """The posed bone's own X, Y or Z axis (the spin boxes' axes) in the engine frame."""
+    local = np.eye(3)["XYZ".index(axis)]
+    return world_rotation.apply(_bone_axes_basis(bone_name).apply(local))
+
+
+def rotated_bone_angles(
+    bone_name: str,
+    angles_deg: tuple[float, float, float],
+    world_rotation: Rotation,
+    axis_engine: np.ndarray,
+    angle_deg: float,
+) -> tuple[float, float, float]:
+    """UI6: the manual adjustment that turns the posed bone by `angle_deg` about `axis_engine`
+    (engine frame, through its head) on top of the adjustment `angles_deg` it has now.
+    `world_rotation` is the bone's world rotation with that adjustment applied.
+
+    The bone's world frame is P * override (P: everything above it, see apply_bone_overrides);
+    turning it about world axis a gives R_a * P * override = P * R_(P^-1 a) * override, so the
+    new override is R_(P^-1 a) * override, read back as degrees about the bone's own axes."""
+    override = bone_axes_rotation(bone_name, angles_deg)
+    above = world_rotation * override.inv()
+    axis = np.asarray(axis_engine, dtype=float)
+    axis = above.inv().apply(axis / np.linalg.norm(axis))
+    turned = Rotation.from_rotvec(axis * np.radians(angle_deg)) * override
+    basis = _bone_axes_basis(bone_name)
+    x, y, z = (basis.inv() * turned * basis).as_euler("xyz", degrees=True)
+    return round(float(x), 1) + 0.0, round(float(y), 1) + 0.0, round(float(z), 1) + 0.0
+
+
+def opposite_bone(bone_name: str) -> str:
+    """The same bone on the other side ("forearm.L" <-> "forearm.R"); a midline bone is its own."""
+    for side, other in ((".L", ".R"), (".R", ".L")):
+        if bone_name.endswith(side):
+            return bone_name[: -len(side)] + other
+    return bone_name
+
+
+def mirrored_bone_angles(bone_name: str, angles_deg: tuple[float, float, float]) -> tuple[str, tuple[float, float, float]]:
+    """A manual adjustment reflected through the body's midline, like Blender's "paste X-flipped
+    pose": the opposite bone and the (X, Y, Z) degrees about its own axes that rotate it as the
+    mirror image of `angles_deg` on `bone_name`. The reflection is X -> -X, as in mirror_landmarks."""
+    other = opposite_bone(bone_name)
+    flip = np.diag([-1.0, 1.0, 1.0])
+    mirrored = Rotation.from_matrix(flip @ bone_axes_rotation(bone_name, angles_deg).as_matrix() @ flip)
+    basis = _bone_axes_basis(other)
+    angles = (basis.inv() * mirrored * basis).as_euler("xyz", degrees=True)
+    return other, tuple(round(float(value), 1) + 0.0 for value in angles)
+
+
 def apply_bone_overrides(
     local_rotations: dict[str, Rotation], overrides: dict[str, Rotation]
 ) -> dict[str, Rotation]:

@@ -438,6 +438,38 @@ def test_a_bone_adjustment_rotates_it_about_its_own_axis_and_reaches_every_expor
         window.close()
 
 
+def test_a_bone_rotation_copies_pastes_and_pastes_mirrored(qapp, settings):
+    """UI7: Ctrl+C / Ctrl+V move a bone's adjustment onto the selected bone; Ctrl+Shift+V puts
+    its mirror image on the opposite bone. Each paste is one undo step."""
+    window = MainWindow(settings=settings)
+    try:
+        window._people = [_bent_person()]
+        window._fill_person_combo()
+        window._on_paste_bone(mirrored=False)  # nothing copied yet: no edit
+        assert window._person_edits(0).is_empty()
+        window.adjust_bone_combo.setCurrentText("forearm.L")
+        for spin, value in zip(window.adjust_spins, (10.0, -15.0, 30.0)):
+            spin.setValue(value)
+        window.copy_bone_action.trigger()
+
+        window.adjust_bone_combo.setCurrentText("shin.L")
+        window.paste_bone_action.trigger()
+        assert window._person_edits(0).override_for("shin.L") == (10.0, -15.0, 30.0)
+
+        steps = window.undo_stack.count()
+        window.paste_mirrored_action.trigger()
+        assert window.adjust_bone_combo.currentText() == "forearm.R"
+        assert window._person_edits(0).override_for("forearm.R") == (10.0, 15.0, -30.0)
+        assert [spin.value() for spin in window.adjust_spins] == [10.0, 15.0, -30.0]
+        assert window.undo_stack.count() == steps + 1
+        window.undo_stack.undo()
+        assert window._person_edits(0).override_for("forearm.R") == (0.0, 0.0, 0.0)
+        assert window.copy_bone_action.shortcut().toString() == "Ctrl+C"
+        assert window.paste_mirrored_action.shortcut().toString() == "Ctrl+Shift+V"
+    finally:
+        window.close()
+
+
 def test_edits_are_cleared_by_a_new_solve(qapp, settings, no_dialogs):
     window = MainWindow(settings=settings)
     try:
@@ -616,6 +648,25 @@ def test_the_main_actions_stay_in_view_and_solve_stands_out(qapp, settings):
         window.close()
 
 
+def test_the_panel_drops_the_buttons_the_toolbar_already_has(qapp, settings):
+    """UI5: Load/Solve/Export/Send show once, in the toolbar; the panel shows a hint instead, and
+    gets its buttons back if the toolbar is hidden."""
+    window = MainWindow(settings=settings)
+    try:
+        window.resize(1100, 700)
+        window.show()
+        duplicates = (window.load_btn, window.load_video_btn, window.solve_btn, window.export_btn,
+                      window.export_bvh_btn, window.send_to_blender_btn)
+        assert not any(button.isVisible() for button in duplicates)
+        assert window.toolbar_hint.isVisible()
+        assert window.export_all_btn.isVisible() and window.export_daz_btn.isVisible()  # not in the toolbar
+        window.main_toolbar.toggleViewAction().trigger()
+        assert all(button.isVisible() for button in duplicates)
+        assert not window.toolbar_hint.isVisible()
+    finally:
+        window.close()
+
+
 def test_the_3d_preview_has_navigation_and_an_axis_gizmo_that_matches_the_camera(qapp, settings):
     """UI3: view presets, fit and zoom buttons over the preview, and a corner gizmo whose axes point
     where the camera's own projection puts them."""
@@ -707,5 +758,89 @@ def test_the_navigation_bar_stacks_when_the_preview_is_narrower_than_it(qapp, se
         qapp.processEvents()
         assert nav._layout.direction() == QBoxLayout.LeftToRight
         assert nav.geometry().right() <= viewport.width()
+    finally:
+        window.close()
+
+
+def _view_move(view, x: float, y: float) -> None:
+    from PySide6.QtCore import QEvent, QPointF
+    from PySide6.QtGui import QMouseEvent
+
+    point = QPointF(x, y)
+    QApplication.sendEvent(view, QMouseEvent(QEvent.MouseMove, point, view.mapToGlobal(point), Qt.NoButton,
+                                             Qt.NoButton, Qt.NoModifier))
+
+
+def _rotation_window(settings):
+    window = MainWindow(settings=settings)
+    window.resize(1200, 760)
+    window.show()
+    window._people = [_bent_person()]
+    window._fill_person_combo()
+    window._update_preview_for_selected_person()
+    QApplication.processEvents()
+    return window
+
+
+def test_a_bone_clicked_in_the_3d_view_is_selected_and_r_with_a_typed_angle_turns_it(qapp, settings):
+    """UI6: click a bone, R, Z (its own Z axis), type 30, Enter: one undo step that the spin
+    boxes show; Undo takes it back."""
+    from PySide6.QtCore import QPointF
+    from PySide6.QtTest import QTest
+
+    window = _rotation_window(settings)
+    try:
+        view = window.viewport
+        view.bone_clicked.emit("forearm.L")
+        assert window.adjust_bone_combo.currentText() == "forearm.L" and view.selected_bone == "forearm.L"
+        head = view.project_to_screen(np.array([view._joint_positions["forearm.L.head"]]))[0]
+        steps = window.undo_stack.count()
+        assert view.start_rotate(QPointF(head[0] + 80, head[1]))
+        QTest.keyClick(view, Qt.Key_Z)
+        QTest.keyClicks(view, "30")
+        assert "30.0° about its Z axis" in view._rotate_label.text()
+        QTest.keyClick(view, Qt.Key_Return)
+        x, y, z = window._person_edits(0).override_for("forearm.L")
+        assert (x, y) == pytest.approx((0.0, 0.0), abs=0.05) and abs(z) == pytest.approx(30.0, abs=0.05)
+        assert [spin.value() for spin in window.adjust_spins] == pytest.approx([x, y, z], abs=0.05)
+        assert window.undo_stack.count() == steps + 1 and not view.rotating
+        window.undo_stack.undo()
+        assert window._person_edits(0).is_empty()
+    finally:
+        window.close()
+
+
+def test_r_turns_the_bone_with_the_mouse_about_the_view_axis_and_esc_cancels(qapp, settings):
+    from PySide6.QtCore import QPointF
+    from PySide6.QtTest import QTest
+
+    window = _rotation_window(settings)
+    try:
+        view = window.viewport
+        view.bone_clicked.emit("upper_arm.R")
+        before, _ = window._current_person_document_inputs()
+        world_before = sk.world_rotations_from_local(before)["upper_arm.R"]
+        head = view.project_to_screen(np.array([view._joint_positions["upper_arm.R.head"]]))[0]
+        toward_viewer = view.view_axis_engine()
+
+        # A quarter turn counter-clockwise on screen, live, then cancelled.
+        steps = window.undo_stack.count()
+        assert view.start_rotate(QPointF(head[0] + 80, head[1]))
+        _view_move(view, head[0], head[1] - 80)
+        assert view.rotation_angle() == pytest.approx(90.0, abs=0.5)
+        assert not window._person_edits(0).is_empty()  # the live preview
+        QTest.keyClick(view, Qt.Key_Escape)
+        assert window._person_edits(0).is_empty() and window.undo_stack.count() == steps
+
+        # The same turn kept: the bone's world frame turned 90° about the axis toward the viewer.
+        assert view.start_rotate(QPointF(head[0] + 80, head[1]))
+        _view_move(view, head[0] + 57, head[1] - 57)
+        _view_move(view, head[0], head[1] - 80)
+        QTest.keyClick(view, Qt.Key_Enter)
+        after, _ = window._current_person_document_inputs()
+        world_after = sk.world_rotations_from_local(after)["upper_arm.R"]
+        expected = sk.Rotation.from_rotvec(toward_viewer * np.radians(90.0)) * world_before
+        np.testing.assert_allclose(world_after.as_matrix(), expected.as_matrix(), atol=0.02)
+        assert window.undo_stack.count() == steps + 1
     finally:
         window.close()
