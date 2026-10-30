@@ -510,6 +510,16 @@ def test_every_control_has_an_accessible_name_and_a_focus_cue(qapp, settings):
         window.close()
 
 
+def test_low_confidence_legend_swatch_has_an_accessible_name(qapp, settings):
+    window = MainWindow(settings=settings)
+    try:
+        swatch = window.legend.layout().itemAtPosition(0, 2).widget()
+        assert isinstance(swatch, QLabel)
+        assert swatch.accessibleName() == "Low confidence legend swatch"
+    finally:
+        window.close()
+
+
 def test_new_mnemonics_dont_collide_in_the_window(qapp, settings):
     window = MainWindow(settings=settings)
     try:

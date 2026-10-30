@@ -203,6 +203,7 @@ class LayoutMixin:
         for i, (color, style, text) in enumerate(legend_entries()):
             swatch = QLabel()
             swatch.setPixmap(legend_swatch(color, style))
+            swatch.setAccessibleName(f"{text} legend swatch")
             row, column = divmod(i, 2)
             layout.addWidget(swatch, row, 2 * column)
             layout.addWidget(QLabel(text), row, 2 * column + 1)
